@@ -6,6 +6,83 @@ This repository preserves the completed workstation test suite, reusable Office 
 
 Ogent is open source under the [MIT License](LICENSE).
 
+## Install Ogent
+
+Ogent is not a separate executable. It is a tested Windows workspace that connects **AionUi** (desktop interface), **Codex CLI** (AI agent), **OfficeCLI** (Office document engine), and this repository's templates and verification assets.
+
+### Option 1 — Let an AI agent install it (recommended)
+
+Paste this single sentence into Codex or another local AI agent that has permission to run PowerShell and install applications:
+
+```text
+Install and configure Ogent on this Windows PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README first; detect the machine architecture; reuse compatible tools that are already installed; install or update Git, OpenAI Codex CLI, OfficeCLI, and AionUi only from their official sources; verify published hashes or signatures before running downloaded installers; clone or update the repository; have me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; make sure AionUi detects Codex CLI; open the repository's aionui-tests folder as the workspace; select GPT-5.6-Sol with high reasoning and Agent permission mode when available, otherwise select the best available Codex model and report the fallback; run version checks; use AionUi and Codex to create smoke-test.local.docx with OfficeCLI; validate and render it; and finish only after the complete Word workflow succeeds, reporting the installed versions, paths, and any remaining limitation.
+```
+
+The prompt intentionally leaves sign-in and Windows elevation with the human. It also tells the agent to use official sources and verify installers instead of trusting an arbitrary download.
+
+### Option 2 — Human install on Windows
+
+These steps install the latest stable releases. The versions in the verified-workstation section below are the versions used for this repository's recorded test run.
+
+1. Install [Git for Windows](https://git-scm.com/install/windows), then open a new PowerShell window:
+
+   ```powershell
+   winget install --id Git.Git -e --source winget
+   git --version
+   ```
+
+2. Clone Ogent into a folder you control:
+
+   ```powershell
+   git clone https://github.com/ljdstechva/ogent-an-office-agent.git
+   Set-Location '.\ogent-an-office-agent'
+   ```
+
+3. Install [OpenAI Codex CLI](https://github.com/openai/codex), verify it, and sign in interactively with ChatGPT:
+
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
+   codex --version
+   codex
+   ```
+
+   Choose **Sign in with ChatGPT** when Codex opens. Do not put an API key or login token in this repository.
+
+4. Install [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) and verify that it is on `PATH`:
+
+   ```powershell
+   irm https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.ps1 | iex
+   officecli --version
+   ```
+
+5. Download AionUi from its [official GitHub Releases page](https://github.com/iOfficeAI/AionUi/releases). Choose the Windows `.exe` matching your computer (`x64` for most PCs or `arm64` for Windows on ARM), compare its published SHA-256 with PowerShell, and then run the installer:
+
+   ```powershell
+   Get-FileHash '.\AionUi-<version>-win-<architecture>.exe' -Algorithm SHA256
+   ```
+
+6. Launch AionUi and configure Ogent:
+
+   - Select the detected **Codex CLI** agent.
+   - Select **GPT-5.6-Sol · high** when available; otherwise use the best Codex model offered by your account.
+   - Select **Agent** permission mode.
+   - Open the cloned repository and set its `aionui-tests` folder as the workspace.
+
+7. In AionUi, send this smoke-test prompt:
+
+   ```text
+   Using OfficeCLI, create smoke-test.local.docx with a Heading 1 title named "Ogent smoke test", one short body paragraph, and a live page-number footer; then close it, validate it, check it for issues, and render a preview.
+   ```
+
+8. From the repository root, confirm the generated file independently:
+
+   ```powershell
+   officecli validate '.\aionui-tests\smoke-test.local.docx'
+   officecli view '.\aionui-tests\smoke-test.local.docx' issues
+   ```
+
+The `*.local.*` filename keeps the smoke-test file out of Git. Microsoft Office is optional for core OfficeCLI work, but Word, Excel, and PowerPoint are recommended for final native review and field refresh. If AionUi does not detect Codex, restart AionUi after confirming that `Get-Command codex` succeeds in a new PowerShell window.
+
 ## Verified workstation
 
 - Windows 11
