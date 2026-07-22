@@ -1,0 +1,13 @@
+[
+  {"command":"set","path":"/Sheet1/A1","props":{"value":"Month","bold":"true","fill":"1F4E79","font.color":"FFFFFF"}},
+  {"command":"set","path":"/Sheet1/B1","props":{"value":"Sales","bold":"true","fill":"1F4E79","font.color":"FFFFFF"}},
+  {"command":"set","path":"/Sheet1/A2","props":{"value":"Jan"}},
+  {"command":"set","path":"/Sheet1/B2","props":{"value":"100"}},
+  {"command":"set","path":"/Sheet1/A3","props":{"value":"Feb"}},
+  {"command":"set","path":"/Sheet1/B3","props":{"value":"150"}},
+  {"command":"set","path":"/Sheet1/A4","props":{"value":"Total","bold":"true"}},
+  {"command":"set","path":"/Sheet1/B4","props":{"formula":"SUM(B2:B3)","bold":"true"}},
+  {"command":"set","path":"/Sheet1/col[A]","props":{"width":"14"}},
+  {"command":"set","path":"/Sheet1/col[B]","props":{"width":"14"}},
+  {"command":"add","parent":"/Sheet1","type":"chart","props":{"chartType":"column","dataRange":"Sheet1!A1:B3","title":"Monthly Sales","anchor":"D2:L18","preset":"corporate","legend":"none","dataLabels":"value"}}
+]

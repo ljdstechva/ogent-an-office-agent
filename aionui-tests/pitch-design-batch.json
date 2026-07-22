@@ -1,0 +1,19 @@
+[
+  {
+    "command": "set",
+    "path": "/",
+    "props": {
+      "theme.font.major.latin": "Aptos Display",
+      "theme.font.minor.latin": "Aptos",
+      "theme.color.dk1": "071820",
+      "theme.color.lt1": "FFFFFF",
+      "theme.color.accent1": "2DE38C",
+      "theme.color.accent2": "4DA3FF"
+    }
+  },
+  {"command": "set", "path": "/slide[1]", "props": {"background": "071820"}},
+  {"command": "set", "path": "/slide[2]", "props": {"background": "071820"}},
+  {"command": "set", "path": "/slide[3]", "props": {"background": "071820"}},
+  {"command": "set", "path": "/slide[4]", "props": {"background": "071820"}},
+  {"command": "set", "path": "/slide[5]", "props": {"background": "071820"}}
+]

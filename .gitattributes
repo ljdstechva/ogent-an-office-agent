@@ -1,0 +1,8 @@
+*.md text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.png binary
+*.exe binary

@@ -1,0 +1,6 @@
+[
+  {"command":"add","parent":"/","type":"slide","props":{"layout":"blank","background":"1E2761"}},
+  {"command":"add","parent":"/slide[1]","type":"shape","props":{"name":"BaselineTitle","text":"Baseline Deck","x":"2cm","y":"2cm","width":"29.87cm","height":"2.5cm","font":"Georgia","size":"40","bold":"true","color":"FFFFFF","align":"center"}},
+  {"command":"add","parent":"/slide[1]","type":"shape","props":{"name":"MessageCard","preset":"roundRect","text":"Hello from officecli","x":"5cm","y":"6cm","width":"23.87cm","height":"6cm","font":"Calibri","size":"28","bold":"true","color":"1E2761","fill":"CADCFC","line":"none","align":"center","valign":"middle"}},
+  {"command":"add","parent":"/slide[1]","type":"notes","props":{"text":"This slide proves OfficeCLI can create and render a PowerPoint presentation on this workstation."}}
+]

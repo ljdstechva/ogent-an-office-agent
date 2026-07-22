@@ -1,0 +1,18 @@
+[
+  {
+    "command": "add",
+    "parent": "/Sheet1",
+    "type": "conditionalformatting",
+    "props": {
+      "type": "dataBar",
+      "ref": "D2:D6",
+      "color": "4DA3FF",
+      "negativeColor": "E05252",
+      "axisColor": "6B7280",
+      "axisPosition": "automatic",
+      "min": "0",
+      "max": "auto",
+      "showValue": "true"
+    }
+  }
+]

@@ -1,0 +1,40 @@
+# Private/local material
+/private/
+/local/
+/source-documents/
+*.local.*
+
+# Secrets and credential exports
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+*credential*.json
+*credentials*.json
+*token*.json
+
+# Installers, downloads, and diagnostics
+**/installers/
+**/downloads/
+*.exe
+*.msi
+*.msix
+*.appx
+*.log
+
+# Local agent/application state
+**/.agents/
+**/.claude/
+**/.codex/
+**/.git/
+
+# Office and OS temporary files
+~$*
+*.tmp
+Thumbs.db
+.DS_Store

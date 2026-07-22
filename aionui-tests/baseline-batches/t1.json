@@ -1,0 +1,24 @@
+[
+  {
+    "command": "add",
+    "parent": "/body",
+    "type": "paragraph",
+    "props": {
+      "text": "Baseline Test",
+      "style": "Heading1",
+      "size": "20pt",
+      "bold": "true",
+      "spaceAfter": "12pt"
+    }
+  },
+  {
+    "command": "add",
+    "parent": "/body",
+    "type": "paragraph",
+    "props": {
+      "text": "Revenue grew 25% in Q4.",
+      "style": "Normal",
+      "size": "11pt"
+    }
+  }
+]
