@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# Never commit runtime state or user documents.
+recent.json
+server.json
+work/
+*.docx
+*.xlsx
+*.pptx
+*.pdf

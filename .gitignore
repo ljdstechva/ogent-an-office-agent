@@ -46,3 +46,6 @@ Thumbs.db
 /CODEX-PLAN-PDF-FIX.md
 /CODEX-PLAN-FAST.md
 /FAST-REPORT.md
+
+# Ogent local browser-test artifacts
+/output/
