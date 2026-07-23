@@ -38,3 +38,9 @@
 *.tmp
 Thumbs.db
 .DS_Store
+
+# Local PDF conversion tests and source-derived artifacts
+/aionui-tests/pdf/
+/tmp/
+/PDF-FIX-REPORT.md
+/CODEX-PLAN-PDF-FIX.md

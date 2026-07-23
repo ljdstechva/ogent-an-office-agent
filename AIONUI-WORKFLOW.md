@@ -2,9 +2,9 @@
 
 ## Workstation setup
 
-- Launch **AionUi 2.1.39** from the Start menu.
+- Launch **AionUi 2.1.39** from a PowerShell session with `Start-Process "$env:LOCALAPPDATA\Programs\AionUi\AionUi.exe"`. On this workstation that preserves the PATH entries AionCore needs; the generic launcher environment can report a misleading incomplete installation.
 - Open the cloned repository in AionUi and set the workspace to its `aionui-tests` directory.
-- Select **Codex CLI** with **GPT-5.6-Sol · high**. The tested permission mode was **Agent** (operator-observed; no AionUi screen capture is published).
+- Select **Codex CLI** with **GPT-5.6-Sol (max)** from the model picker. The tested permission mode was **Agent**.
 - Keep the conversation and Project file panel visible together. Generated files land in the workspace unless the prompt names another path.
 
 ## Create a new Office file
@@ -54,6 +54,29 @@ Replace bracketed placeholder text after replay, then run `officecli validate '<
 - Run `officecli close '<file>'` before opening the file in Word, Excel, PowerPoint, or another non-OfficeCLI reader. This flushes resident edits and releases the file.
 - For a Word TOC or page-number fields, close the resident and run `officecli refresh '<file.docx>'` on Windows before final review.
 - Always validate and render the final artifact. A successful command alone is not visual proof.
+
+## PDF documents
+
+PDFs are never edited directly. Make an editable DOCX copy, edit that DOCX with officecli, validate and visually inspect it, and then export a new PDF:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\pdf2docx.ps1" -Pdf "<input.pdf>" -OutDocx "<working.docx>"
+$env:OFFICECLI_NO_AUTO_RESIDENT = "1"
+officecli view "<working.docx>" text
+# Edit <working.docx> with officecli in direct mode. Verify the new text exists
+# and the old text no longer exists before export.
+officecli query "<working.docx>" 'p:contains("<new text>")'
+officecli query "<working.docx>" 'p:contains("<old text>")'
+officecli close "<working.docx>"
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\docx2pdf.ps1" -Docx "<working.docx>" -OutPdf "<output.pdf>"
+```
+
+- Work on a copy when the PDF is a user original; write the edited result to a new filename.
+- Keep `OFFICECLI_NO_AUTO_RESIDENT=1` for AionUi document mutations. In the live acceptance test, auto-resident mode returned success without saving the edit; direct mode and the two verification queries exposed and avoided that false positive.
+- The default conversion engine is Word PDF Reflow. LibreOffice is the automatic fallback, but its PDF import is drawing/shape based and may not be practical for officecli text edits.
+- A scanned or image-only PDF stops with `[SCANNED_PDF]` because it needs OCR, which is outside this workflow.
+- PDF reflow can change fonts, pagination, columns, and positioned graphics. Always compare rendered DOCX and PDF pages with the source; rebuild a complex design from its source document when exact fidelity is required.
+- Prefer a single Codex agent for document tasks. Include `Work single-agent; do not spawn a team.` in the prompt.
 
 ## Common pitfalls
 

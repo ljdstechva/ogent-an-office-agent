@@ -15,7 +15,7 @@ Ogent is not a separate executable. It is a tested Windows workspace that connec
 Paste this single sentence into Codex or another local AI agent that has permission to run PowerShell and install applications:
 
 ```text
-Install and configure Ogent on this Windows PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README first; detect the machine architecture; reuse compatible tools that are already installed; install or update Git, OpenAI Codex CLI, OfficeCLI, and AionUi only from their official sources; verify published hashes or signatures before running downloaded installers; clone or update the repository; have me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; make sure AionUi detects Codex CLI; open the repository's aionui-tests folder as the workspace; select GPT-5.6-Sol with high reasoning and Agent permission mode when available, otherwise select the best available Codex model and report the fallback; run version checks; use AionUi and Codex to create smoke-test.local.docx with OfficeCLI; validate and render it; and finish only after the complete Word workflow succeeds, reporting the installed versions, paths, and any remaining limitation.
+Install and configure Ogent on this Windows PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README first; detect the machine architecture; reuse compatible tools that are already installed; install or update Git, OpenAI Codex CLI, OfficeCLI, and AionUi only from their official sources; verify published hashes or signatures before running downloaded installers; clone or update the repository; have me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; make sure AionUi detects Codex CLI; detect Microsoft Word 2016 or later for PDF Reflow and, if Word is unavailable, install LibreOffice from its official source as the PDF fallback; open the repository's aionui-tests folder as the workspace; select GPT-5.6-Sol with max reasoning and Agent permission mode when available, otherwise select the best available Codex model and report the fallback; run version checks; use AionUi and Codex to create smoke-test.local.docx with OfficeCLI; validate and render it; and finish only after the complete Word workflow succeeds, reporting the installed versions, paths, and any remaining limitation.
 ```
 
 The prompt intentionally leaves sign-in and Windows elevation with the human. It also tells the agent to use official sources and verify installers instead of trusting an arbitrary download.
@@ -61,10 +61,16 @@ These steps install the latest stable releases. The versions in the verified-wor
    Get-FileHash '.\AionUi-<version>-win-<architecture>.exe' -Algorithm SHA256
    ```
 
+   PDF conversion uses Microsoft Word 2016 or later when available. If this
+   computer does not have Word, install [LibreOffice from its official
+   download page](https://www.libreoffice.org/download/download-libreoffice/)
+   as the automatic fallback. LibreOffice PDF import is less editable than
+   Word PDF Reflow.
+
 6. Launch AionUi and configure Ogent:
 
    - Select the detected **Codex CLI** agent.
-   - Select **GPT-5.6-Sol · high** when available; otherwise use the best Codex model offered by your account.
+   - Select **GPT-5.6-Sol · max** when available; otherwise use the best Codex model offered by your account.
    - Select **Agent** permission mode.
    - Open the cloned repository and set its `aionui-tests` folder as the workspace.
 
@@ -81,7 +87,7 @@ These steps install the latest stable releases. The versions in the verified-wor
    officecli view '.\aionui-tests\smoke-test.local.docx' issues
    ```
 
-The `*.local.*` filename keeps the smoke-test file out of Git. Microsoft Office is optional for core OfficeCLI work, but Word, Excel, and PowerPoint are recommended for final native review and field refresh. If AionUi does not detect Codex, restart AionUi after confirming that `Get-Command codex` succeeds in a new PowerShell window.
+The `*.local.*` filename keeps the smoke-test file out of Git. Microsoft Office is optional for core OfficeCLI work, but Word, Excel, and PowerPoint are recommended for final native review and field refresh. Word or LibreOffice is required for the PDF conversion workflow. If AionUi does not detect Codex, restart AionUi after confirming that `Get-Command codex` succeeds in a new PowerShell window.
 
 ## Verified workstation
 
@@ -89,7 +95,7 @@ The `*.local.*` filename keeps the smoke-test file out of Git. Microsoft Office 
 - AionUi 2.1.39
 - OfficeCLI 1.0.140
 - Codex CLI 0.144.1
-- AionUi engine: GPT-5.6-Sol at high reasoning (operator-observed)
+- AionUi engine: GPT-5.6-Sol at max reasoning
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
 All 13 included Office test artifacts pass OpenXML validation. See [TEST-REPORT.md](TEST-REPORT.md) for the evidence matrix and [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md) for daily use.
@@ -101,6 +107,7 @@ All 13 included Office test artifacts pass OpenXML validation. See [TEST-REPORT.
 - PowerPoint decks with consistent themes, backgrounds, editable shapes, and charts
 - AionUi file attachment for round-trip Office editing and CSV-to-Excel conversion (operator-attested; no AionUi screen capture is published)
 - Web research converted into a concise, cited Word brief
+- Safe PDF-to-DOCX editing and PDF re-export with scanned-file detection
 - An honest Visio capability check plus a working native Word diagram alternative
 - Replayable JSON templates for common report, deck, and budget workflows
 
@@ -124,8 +131,12 @@ All 13 included Office test artifacts pass OpenXML validation. See [TEST-REPORT.
 .
 ├── README.md
 ├── LICENSE
+├── AGENTS.md
 ├── AIONUI-WORKFLOW.md
 ├── TEST-REPORT.md
+├── tools/
+│   ├── pdf2docx.ps1
+│   └── docx2pdf.ps1
 ├── templates/
 │   ├── report-with-toc.json
 │   ├── basic-deck.json
@@ -156,6 +167,30 @@ officecli validate '.\new-report.docx'
 Use `basic-deck.json` with a `.pptx` file or `budget-workbook.json` with an `.xlsx` file in the same way. Replace bracketed placeholders after replay, close the OfficeCLI resident before opening the file in Microsoft Office, and validate again after editing.
 
 Choose a new output filename. The examples intentionally avoid overwriting an existing document.
+
+## Edit a PDF safely
+
+Ogent never overwrites or edits an original PDF directly. Copy the PDF, convert
+the copy to DOCX, edit and validate the DOCX with OfficeCLI, then export a new
+PDF:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File '.\tools\pdf2docx.ps1' -Pdf '.\input-copy.pdf' -OutDocx '.\working.docx'
+$env:OFFICECLI_NO_AUTO_RESIDENT = '1'
+officecli view '.\working.docx' text
+# Make the requested OfficeCLI edit, then verify both the new and old text.
+officecli query '.\working.docx' 'p:contains("<new text>")'
+officecli query '.\working.docx' 'p:contains("<old text>")'
+officecli validate '.\working.docx'
+powershell -NoProfile -ExecutionPolicy Bypass -File '.\tools\docx2pdf.ps1' -Docx '.\working.docx' -OutPdf '.\edited.pdf'
+```
+
+Word PDF Reflow is the preferred conversion engine. LibreOffice is the
+automatic fallback. Image-only PDFs stop with `[SCANNED_PDF]` because they
+need OCR. Complex columns, embedded fonts, and floating graphics can reflow,
+so render and compare every output page; edit the original design file when
+pixel-perfect fidelity is required. See [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md)
+for the complete agent workflow.
 
 ## Visio note
 
