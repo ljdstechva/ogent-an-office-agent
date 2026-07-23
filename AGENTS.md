@@ -1,11 +1,27 @@
 # Ogent workspace instructions
 
+## Speed rules for document tasks (mandatory)
+- Document tasks are SINGLE-AGENT. Never spawn a team, teammate, or subagent for
+  creating/editing docx/xlsx/pptx/pdf. Reviews happen as a second sequential message
+  in the same conversation, after the artifact exists.
+- Never use Start-Sleep / sleep / polling loops. Check outputs directly.
+- PDF is never edited directly. Pipeline: tools\pdf2docx.ps1 (Word COM first) ->
+  edit the .docx with officecli -> tools\docx2pdf.ps1. Scanned/image PDFs: stop and
+  report "needs OCR" honestly.
+- Verify content with `officecli view <file> text` or `officecli get --json`.
+  Do NOT render page images to check work; render at most once at final delivery,
+  only if the user asks.
+- officecli syntax unsure? Run `officecli help <format> <element>` — never guess.
+- Prefer one atomic `officecli batch` over many single edits.
+- Never commit or push personal documents; pushes to public repos require the
+  user's explicit yes.
+
 ## Office document work
 
 - Work single-agent for document tasks. Do not spawn a team.
 - Use officecli for editable Word, Excel, and PowerPoint files. Inspect the relevant `officecli help` entry before guessing a command.
 - Preserve user originals. Unless the user explicitly requests an in-place edit, create a clearly named working copy and a new final output.
-- Close an officecli resident before another application reads the file. Validate and visually inspect final Office files and PDFs before reporting success.
+- Close an officecli resident before another application reads the file. Validate final Office files and PDFs before reporting success; render once only when the user requests a final visual check.
 
 ## PDF workflow
 
@@ -27,4 +43,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\docx2pdf.ps1" -Docx
 - In AionUi, set `OFFICECLI_NO_AUTO_RESIDENT=1` before officecli mutations. The live acceptance test found that auto-resident mode could report success without persisting the change; direct mode plus old/new queries prevented a false positive.
 - If conversion reports `[SCANNED_PDF]`, stop and explain that OCR is required; do not pretend the image-only PDF is editable.
 - Word PDF Reflow is the preferred engine. LibreOffice is an emergency fallback whose PDF import is shape based and may not expose normal paragraphs to officecli.
-- Reflow is not pixel-perfect for complex columns, floating graphics, or embedded fonts. Render and compare every page with the source before delivery.
+- Reflow is not pixel-perfect for complex columns, floating graphics, or embedded fonts. Verify content and structure by default; if exact visual fidelity matters, ask the user for one final rendered comparison or rebuild from the source document.

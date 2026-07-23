@@ -1,21 +1,37 @@
 # AionUi + OfficeCLI Daily Workflow
 
+## Speed rules for document tasks (mandatory)
+- Document tasks are SINGLE-AGENT. Never spawn a team, teammate, or subagent for
+  creating/editing docx/xlsx/pptx/pdf. Reviews happen as a second sequential message
+  in the same conversation, after the artifact exists.
+- Never use Start-Sleep / sleep / polling loops. Check outputs directly.
+- PDF is never edited directly. Pipeline: tools\pdf2docx.ps1 (Word COM first) ->
+  edit the .docx with officecli -> tools\docx2pdf.ps1. Scanned/image PDFs: stop and
+  report "needs OCR" honestly.
+- Verify content with `officecli view <file> text` or `officecli get --json`.
+  Do NOT render page images to check work; render at most once at final delivery,
+  only if the user asks.
+- officecli syntax unsure? Run `officecli help <format> <element>` — never guess.
+- Prefer one atomic `officecli batch` over many single edits.
+- Never commit or push personal documents; pushes to public repos require the
+  user's explicit yes.
+
 ## Workstation setup
 
 - Launch **AionUi 2.1.39** from a PowerShell session with `Start-Process "$env:LOCALAPPDATA\Programs\AionUi\AionUi.exe"`. On this workstation that preserves the PATH entries AionCore needs; the generic launcher environment can report a misleading incomplete installation.
 - Open the cloned repository in AionUi and set the workspace to its `aionui-tests` directory.
-- Select **Codex CLI** with **GPT-5.6-Sol (max)** from the model picker. The tested permission mode was **Agent**.
+- Select **Codex CLI** with **GPT-5.6-Sol · medium** from the model picker for normal document work. Use **max** manually only for genuinely difficult reasoning. The tested permission mode was **Agent**.
 - Keep the conversation and Project file panel visible together. Generated files land in the workspace unless the prompt names another path.
 
 ## Create a new Office file
 
-Tell Codex the exact filename, required structure, source data, formulas, and visual rules. Ask it to validate and render the result before it finishes.
+Tell Codex the exact filename, required structure, source data, formulas, and visual rules. Ask it to validate the result and inspect text or issues before it finishes.
 
 Example prompts:
 
-- Word: `Create status-report.docx: one page, Heading1 title, Overview, a four-risk table, and Next Steps. Bold every occurrence of "critical". Validate it and render a preview.`
+- Word: `Create status-report.docx: one page, Heading1 title, Overview, a four-risk table, and Next Steps. Bold every occurrence of "critical". Validate it and inspect its text and issues.`
 - Excel: `Create budget.xlsx with Item, Qty, Unit Price, formula-based Total, a SUM grand total, a styled header, conditional formatting, and a Totals by Item chart. Validate it.`
-- PowerPoint: `Create pitch.pptx with five widescreen slides, a consistent dark background, white text, and a real bar chart on slide 4. Validate it and render every slide.`
+- PowerPoint: `Create pitch.pptx with five widescreen slides, a consistent dark background, white text, and a real bar chart on slide 4. Validate it and inspect its text and issues.`
 - Research: `Research three current community-solar trends using authoritative sources, then create a one-page research-brief.docx with a Heading1 title, three Heading2 sections, and linked sources.`
 
 ## Receive and edit files
@@ -53,11 +69,11 @@ Replace bracketed placeholder text after replay, then run `officecli validate '<
 - `officecli watch '<file>'` starts a live browser preview. One watch is allowed per file, and it stops after an idle timeout; restart it when needed.
 - Run `officecli close '<file>'` before opening the file in Word, Excel, PowerPoint, or another non-OfficeCLI reader. This flushes resident edits and releases the file.
 - For a Word TOC or page-number fields, close the resident and run `officecli refresh '<file.docx>'` on Windows before final review.
-- Always validate and render the final artifact. A successful command alone is not visual proof.
+- Always validate the final artifact and inspect its text or issues. Render at most once, only when the user requests a final visual check.
 
 ## PDF documents
 
-PDFs are never edited directly. Make an editable DOCX copy, edit that DOCX with officecli, validate and visually inspect it, and then export a new PDF:
+PDFs are never edited directly. Make an editable DOCX copy, edit that DOCX with officecli, validate and inspect its text, and then export a new PDF:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\pdf2docx.ps1" -Pdf "<input.pdf>" -OutDocx "<working.docx>"
@@ -75,7 +91,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\docx2pdf.ps1" -Docx
 - Keep `OFFICECLI_NO_AUTO_RESIDENT=1` for AionUi document mutations. In the live acceptance test, auto-resident mode returned success without saving the edit; direct mode and the two verification queries exposed and avoided that false positive.
 - The default conversion engine is Word PDF Reflow. LibreOffice is the automatic fallback, but its PDF import is drawing/shape based and may not be practical for officecli text edits.
 - A scanned or image-only PDF stops with `[SCANNED_PDF]` because it needs OCR, which is outside this workflow.
-- PDF reflow can change fonts, pagination, columns, and positioned graphics. Always compare rendered DOCX and PDF pages with the source; rebuild a complex design from its source document when exact fidelity is required.
+- PDF reflow can change fonts, pagination, columns, and positioned graphics. Verify text and structure by default; if exact visual fidelity matters, ask for one final rendered comparison or rebuild a complex design from its source document.
 - Prefer a single Codex agent for document tasks. Include `Work single-agent; do not spawn a team.` in the prompt.
 
 ## Common pitfalls
