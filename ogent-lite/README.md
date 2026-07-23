@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/ogent-logo.svg" alt="Ogent" width="360">
+</p>
+
 # Ogent Lite
 
 Ogent Lite is a featherweight, local document workspace: OfficeCLI keeps a live
@@ -16,6 +20,35 @@ Office file is copied to `%LOCALAPPDATA%\OgentLite\work\` first.
 
 If Ogent is already running, another launch opens the existing browser page
 instead of starting a second server.
+
+## Right-click integration
+
+Register the per-user Windows Explorer command from this folder:
+
+```powershell
+py -3 .\ogent.py --register-shell
+```
+
+You can then right-click any `.docx`, `.xlsx`, or `.pptx` and choose
+**Show more options → Open in Ogent**. Pressing **Shift+F10** opens the same
+classic menu. Windows 11 does not allow an unpackaged desktop script to appear
+in the compact modern menu; that requires MSIX packaging and is intentionally
+outside Ogent Lite's current scope.
+
+The command starts Ogent when necessary or switches the running session to the
+selected file. It always opens a browser tab; any Ogent tab that was already
+open also updates through the live event stream, so the extra tab can be closed.
+The original document is still protected by Ogent's working-copy workflow.
+
+Remove the integration cleanly at any time:
+
+```powershell
+py -3 .\ogent.py --unregister-shell
+```
+
+Registration is limited to your Windows account and does not need administrator
+rights. If Explorer keeps an older icon, run `ie4uinit.exe -show` or restart
+Explorer to refresh its icon cache.
 
 ## Daily recipe
 
@@ -64,6 +97,21 @@ The recommended defaults are GPT-5.6 Sol and Medium. Ogent remembers the selecte
 combination in the local browser, restores it after a reload, and disables both
 controls while a run is active. The server validates every selection before
 starting Codex.
+
+## Brand assets
+
+The Ogent identity is built from the **Quiet Signal** mark: a navy
+`#17324d` to teal `#0d9488` field, a white continuity ring, and a live-document
+dot in `#14b8a6`.
+
+| Asset | Purpose |
+|---|---|
+| `assets/ogent-mark.svg` | Font-independent master mark |
+| `assets/ogent-logo.svg` | Mark and Ogent wordmark for documentation |
+| `assets/png/ogent-*.png` | Seven rendered icon sizes from 16–256 px |
+| `assets/ogent.ico` | Multi-size Windows app, shortcut, and context-menu icon |
+| `assets/render-icon.html` | Dependency-free Edge rendering surface |
+| `assets/make_ico.py` | Standard-library ICO assembler |
 
 ## Troubleshooting
 

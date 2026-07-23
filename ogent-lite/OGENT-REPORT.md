@@ -121,3 +121,70 @@ this measurement.
 
 1. Run `ogent`, paste the absolute Office-document path, and click **Open**.
 2. Describe the change in chat and review it live on the left; run `ogent stop` when finished.
+
+## v0.4.0 - shell integration + brand
+
+![Approved Ogent mark](assets/png/ogent-256.png)
+
+### Approved identity
+
+- Badge: 240 x 240 at `(8, 8)`, corner radius 56
+- Gradient: navy `#17324d` to teal `#0d9488`
+- White ring: center `(128, 120)`, radius 66, stroke 30
+- Live dot: center `(175, 167)`, radius 16, fill `#14b8a6`, white stroke 3
+- Master assets: `ogent-mark.svg` and `ogent-logo.svg`
+- Runtime assets: 16, 24, 32, 48, 64, 128, and 256 px PNGs plus a
+  seven-frame `ogent.ico`
+- Applied to the browser favicon, live-document toolbar, empty-document state,
+  Windows shell verb, Desktop shortcut, and README
+
+The mark was rendered with Microsoft Edge headless and assembled into the ICO by
+the standard-library-only `make_ico.py`. Every PNG reported its intended pixel
+size, the ICO directory contained all seven PNG frames, and
+`System.Drawing.Icon` loaded the final file successfully.
+
+### Shell test matrix
+
+| Test | Result | Live evidence |
+|---|---|---|
+| S1 - Word right-click | PASS | Windows 11 classic menu displayed **Open in Ogent** with the approved icon. It opened `S1 Word.docx` as a protected working copy through `pythonw.exe`; no console window appeared. |
+| S2 - Excel and PowerPoint right-click | PASS | Both entries appeared with the icon and switched the live preview to protected `.xlsx` and `.pptx` working copies. |
+| S3 - warm switch | PASS | Existing-server Word, Excel, and PowerPoint switches completed in 2.63-2.89 seconds. The already-open tab updated through SSE; the documented extra tab also opened. |
+| S4 - active Codex run | PASS | The exact registered `pythonw --open` command was invoked while GPT-5.6 Sol was working. `/open` returned HTTP 409, the source stayed on `S1 Word.docx`, and the transcript showed `Ogent is still working. Stop that run or wait for it to finish.` |
+| S5 - spaces and accents | PASS | Explorer opened `résumé test file.docx` with both accents preserved in the source path, proving quoted `%1` and Unicode handling. |
+| S6 - PDF negative control | PASS | The PDF classic menu contained no Ogent entry. Direct `--open` PDF routing was separately exercised: the source PDF remained unchanged and its converted working DOCX opened live. |
+| S7 - reversible uninstall | PASS | `--unregister-shell` removed all six verb/command keys and a refresh showed all three base keys absent. `--register-shell` then restored exact label, icon, and command values and was left enabled. |
+| S8 - regressions | PASS | Paste-path open, GPT-5.6 Sol chat edit, live preview refresh, Stop, model/reasoning selectors, favicon, and toolbar mark all passed. The edit changed Heading 1 to `1. Project Context — OGENT VERIFIED` and OfficeCLI validation returned no errors. The Browse picker was not part of the v0.2.0 baseline, so that sub-check was not applicable. |
+
+### Additional live checks
+
+- Cold Explorer launch started Ogent v0.4.0 on port 8765, opened the requested
+  Word file, and started a healthy OfficeCLI watch without a console flash.
+- PDF `--open` returned `action=pdf_import`; an immediate Office open was
+  rejected with HTTP 409; the conversion then completed with a searchable,
+  editable working DOCX.
+- The controlled browser inspection found one visible toolbar brand mark with
+  inline SVG, an inline SVG favicon, a connected live preview, GPT-5.6 Sol plus
+  all six reasoning choices, and zero browser console messages.
+- Stop changed the active run to `stopped`, restored Send, disabled Stop, and
+  added `Stopped. No further agent work is running.` to the transcript.
+- SHA-256 comparisons confirmed that the Word, Unicode Word, Excel,
+  PowerPoint, and PDF source fixtures were byte-for-byte unchanged after all
+  live tests.
+- The Desktop shortcut targets `ogent.cmd`, uses the Ogent working directory,
+  and references `assets\ogent.ico,0`.
+
+### Issues found and resolved
+
+- A first watch-switch implementation performed a redundant readiness probe and
+  missed the three-second warm-switch goal. The watch lifecycle was tightened
+  to trust OfficeCLI's ready marker and terminate owned watch processes
+  directly; all three formats then passed under three seconds.
+- Windows 11 exposes classic registered verbs under **Show more options**, not
+  in the compact menu without MSIX packaging. The implementation and README
+  state this accurately.
+- The PDF and Codex busy paths were both exercised so a shell launch cannot
+  replace the document during an active operation.
+
+Final state: Ogent v0.4.0 is running, the per-user shell integration is enabled
+for `.docx`, `.xlsx`, and `.pptx`, and no public push was performed.

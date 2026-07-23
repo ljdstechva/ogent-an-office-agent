@@ -35,13 +35,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+try:
+    import winreg
+except ImportError:  # pragma: no cover - Ogent is a Windows app.
+    winreg = None  # type: ignore[assignment]
+
 
 APP_NAME = "Ogent Lite"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.4.0"
 HOST = "127.0.0.1"
 BASE_PORT = 8765
 WATCH_PORT = 26315
 SUPPORTED_OFFICE = {".docx", ".xlsx", ".pptx"}
+SHELL_EXTENSIONS = (".docx", ".xlsx", ".pptx")
+ACTIVE_RUN_STATUSES = {"starting", "working", "stopping"}
 MAX_BODY_BYTES = 64 * 1024
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING = "medium"
@@ -50,6 +57,8 @@ ALLOWED_REASONING = ("low", "medium", "high", "xhigh", "max", "ultra")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+ASSETS_DIR = SCRIPT_DIR / "assets"
+ICON_PATH = ASSETS_DIR / "ogent.ico"
 PDF_TO_DOCX = REPO_ROOT / "tools" / "pdf2docx.ps1"
 LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "OgentLite"
 WORK_ROOT = LOCAL_DATA / "work"
@@ -375,10 +384,18 @@ def stop_watch(*, clear_document: bool = False) -> None:
                 STATE.active_source = None
                 STATE.codex_thread_id = None
 
-        if document:
+        if process and process.poll() is None:
+            # The watch is an owned process tree; stopping it directly releases
+            # the port faster than launching a second OfficeCLI command.
+            with contextlib.suppress(OSError):
+                process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(process)
+        elif document:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 run_quiet(["officecli", "unwatch", str(document)], cwd=document.parent, timeout=12)
-        terminate_process_tree(process)
         if process:
             STATE.emit("watch", {"status": "stopped", "port": WATCH_PORT})
         if clear_document:
@@ -462,7 +479,9 @@ def start_watch(document: Path) -> None:
                     f"OfficeCLI watch exited before it became ready (exit {value}). {last_line}",
                     500,
                 )
-            if kind == "ready" and watch_http_alive():
+            if kind == "ready":
+                # OfficeCLI emits its URL only after the preview listener has
+                # been created; avoid a redundant HTTP round trip here.
                 STATE.emit(
                     "watch",
                     {"status": "ready", "port": WATCH_PORT, "document": str(document)},
@@ -702,7 +721,7 @@ def _pdf_import_worker(source: Path, request_text: str) -> None:
 
 def start_pdf_import(source: Path, request_text: str) -> None:
     with STATE.lock:
-        if STATE.run_status in {"starting", "working", "stopping"}:
+        if STATE.run_status in ACTIVE_RUN_STATUSES:
             raise UserFacingError("Ogent is still working. Stop that run or wait for it to finish.", 409)
         STATE.run_status = "starting"
         STATE.run_id = uuid.uuid4().hex
@@ -718,6 +737,27 @@ def start_pdf_import(source: Path, request_text: str) -> None:
     with STATE.lock:
         STATE.run_thread = thread
     thread.start()
+
+
+def dispatch_open_path(raw_path: str) -> dict[str, Any]:
+    source = normalize_existing_path(raw_path)
+    if source.suffix.lower() == ".pdf":
+        start_pdf_import(source, f"Open this PDF in Ogent: {source}")
+        message = (
+            "Preparing a protected PDF working copy. The original PDF will remain untouched."
+        )
+        STATE.add_message("assistant", message)
+        with STATE.lock:
+            run_id = STATE.run_id
+        return {
+            "action": "pdf_import",
+            "message": message,
+            "source": str(source),
+            "run_id": run_id,
+        }
+    result = open_document(str(source))
+    result["action"] = "document_opened"
+    return result
 
 
 def agent_prompt(message: str, document: Path, source: Path | None) -> str:
@@ -1052,7 +1092,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%230d9488'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-family='Segoe UI,sans-serif' font-size='34' font-weight='700' fill='white'%3EO%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2317324d'/%3E%3Cstop offset='1' stop-color='%230d9488'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='8' y='8' width='240' height='240' rx='56' fill='url(%23g)'/%3E%3Ccircle cx='128' cy='120' r='66' fill='none' stroke='white' stroke-width='30'/%3E%3Ccircle cx='175' cy='167' r='16' fill='%2314b8a6' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
   <title>Ogent Lite</title>
   <style>
     :root {
@@ -1124,14 +1164,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     .brand-mark {
       width: 28px;
       height: 28px;
-      display: grid;
-      place-items: center;
-      border-radius: 9px;
-      background: linear-gradient(145deg, var(--teal-2), var(--teal));
-      font-weight: 800;
-      color: #fff;
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,.26);
+      flex: 0 0 28px;
+      display: block;
     }
+    .brand-mark svg, .empty-document .symbol svg { display: block; width: 100%; height: 100%; }
     .doc-title {
       min-width: 0;
       overflow: hidden;
@@ -1185,9 +1221,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       box-shadow: var(--shadow);
     }
     .empty-document .symbol {
-      width: 70px; height: 70px; margin: 0 auto 18px; border-radius: 22px;
-      display: grid; place-items: center; font-size: 30px; font-weight: 800; color: #fff;
-      background: linear-gradient(145deg, var(--navy), var(--teal));
+      width: 70px; height: 70px; margin: 0 auto 18px; display: block;
     }
     .empty-document h1 { font-size: 26px; margin: 0 0 8px; letter-spacing: -.02em; }
     .empty-document p { color: var(--muted); margin: 0; line-height: 1.6; }
@@ -1310,7 +1344,19 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="workspace" id="workspace">
     <section class="document-pane" id="documentPane" aria-label="Live document">
       <header class="document-toolbar">
-        <div class="brand-mark" aria-hidden="true">O</div>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 256 256" focusable="false">
+            <defs>
+              <linearGradient id="toolbar-mark-gradient" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#17324d"/>
+                <stop offset="1" stop-color="#0d9488"/>
+              </linearGradient>
+            </defs>
+            <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#toolbar-mark-gradient)"/>
+            <circle cx="128" cy="120" r="66" fill="none" stroke="#fff" stroke-width="30"/>
+            <circle cx="175" cy="167" r="16" fill="#14b8a6" stroke="#fff" stroke-width="3"/>
+          </svg>
+        </div>
         <div class="doc-title">
           <small>Live working copy</small>
           <span id="documentName">No document open</span>
@@ -1323,7 +1369,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       </header>
       <div class="preview-shell">
         <div class="empty-document" id="emptyDocument">
-          <div class="symbol" aria-hidden="true">O</div>
+          <div class="symbol" aria-hidden="true">
+            <svg viewBox="0 0 256 256" focusable="false">
+              <defs>
+                <linearGradient id="empty-mark-gradient" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0" stop-color="#17324d"/>
+                  <stop offset="1" stop-color="#0d9488"/>
+                </linearGradient>
+              </defs>
+              <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#empty-mark-gradient)"/>
+              <circle cx="128" cy="120" r="66" fill="none" stroke="#fff" stroke-width="30"/>
+              <circle cx="175" cy="167" r="16" fill="#14b8a6" stroke="#fff" stroke-width="3"/>
+            </svg>
+          </div>
           <h1>Your document, live.</h1>
           <p>Paste a Word, Excel, or PowerPoint path on the right. Ogent creates a protected working copy, opens it here, and keeps every AI edit visible.</p>
         </div>
@@ -1565,6 +1623,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       try {
         elements.open.disabled = true;
         const result = await api("/open", { method: "POST", body: JSON.stringify({ path }) });
+        if (result.action === "pdf_import") {
+          showToast(result.message || "Preparing a protected PDF working copy.");
+          return;
+        }
         state.active_document = result.active_document;
         state.watch_alive = true;
         setPreview(result.active_document, `${result.watch_url}?v=${Date.now()}`);
@@ -1810,8 +1872,15 @@ class OgentHandler(BaseHTTPRequestHandler):
             return
         try:
             if parsed.path == "/open":
+                with STATE.lock:
+                    busy = STATE.run_status in ACTIVE_RUN_STATUSES
+                if busy:
+                    raise UserFacingError(
+                        "Ogent is still working. Stop that run or wait for it to finish.",
+                        409,
+                    )
                 payload = self._read_json()
-                result = open_document(str(payload.get("path", "")))
+                result = dispatch_open_path(str(payload.get("path", "")))
                 self._send_json(200, result)
                 return
             if parsed.path == "/chat":
@@ -1840,10 +1909,16 @@ class OgentHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(404, {"error": "Not found."})
         except UserFacingError as exc:
+            if parsed.path == "/open":
+                STATE.last_error = str(exc)
+                STATE.add_message("assistant", str(exc))
             self._send_json(exc.status, {"error": str(exc)})
         except Exception as exc:
             STATE.last_error = str(exc)
-            self._send_json(500, {"error": f"Internal error: {exc}"})
+            message = f"Internal error: {exc}"
+            if parsed.path == "/open":
+                STATE.add_message("assistant", message)
+            self._send_json(500, {"error": message})
 
 
 class OgentServer(ThreadingHTTPServer):
@@ -1857,6 +1932,126 @@ def find_existing_server() -> tuple[int, dict[str, Any]] | None:
         if data and data.get("app") == APP_NAME:
             return port, data
     return None
+
+
+def post_open_to_existing_server(port: int, raw_path: str) -> dict[str, Any]:
+    try:
+        info = json.loads(SERVER_INFO_PATH.read_text(encoding="utf-8"))
+        recorded_port = int(info["port"])
+        token = str(info["token"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise UserFacingError(
+            "Ogent is running, but its local connection record is missing or invalid.",
+            500,
+        ) from exc
+    if recorded_port != port:
+        raise UserFacingError(
+            "Ogent's local connection record does not match the running server. "
+            "Run `ogent stop`, then try again.",
+            409,
+        )
+
+    request = urllib.request.Request(
+        f"http://{HOST}:{port}/open",
+        data=json_bytes({"path": raw_path}),
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Ogent-Token": token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+            message = str(payload.get("error", "")).strip()
+        except (UnicodeDecodeError, ValueError, AttributeError):
+            message = ""
+        raise UserFacingError(
+            message or f"Ogent could not open the file (HTTP {exc.code}).",
+            exc.code,
+        ) from None
+    except (OSError, urllib.error.URLError) as exc:
+        raise UserFacingError(f"Could not contact the running Ogent server: {exc}", 503) from exc
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise UserFacingError("The running Ogent server returned an invalid response.", 502) from exc
+    if not isinstance(payload, dict):
+        raise UserFacingError("The running Ogent server returned an invalid response.", 502)
+    return payload
+
+
+def _registry_module() -> Any:
+    if os.name != "nt" or winreg is None:
+        raise UserFacingError("Windows Explorer integration is available only on Windows.", 501)
+    return winreg
+
+
+def shell_registry_path(extension: str) -> str:
+    return (
+        rf"Software\Classes\SystemFileAssociations\{extension}"
+        r"\shell\OgentLite"
+    )
+
+
+def resolve_shell_interpreter() -> tuple[Path, bool]:
+    executable = Path(sys.executable).resolve()
+    pythonw = executable.with_name("pythonw.exe")
+    if pythonw.is_file():
+        return pythonw, False
+    return executable, True
+
+
+def register_shell_integration() -> None:
+    registry = _registry_module()
+    if not ICON_PATH.is_file():
+        raise UserFacingError(f"Ogent icon not found: {ICON_PATH}", 500)
+    interpreter, console_fallback = resolve_shell_interpreter()
+    command = f'"{interpreter}" "{Path(__file__).resolve()}" --open "%1"'
+    for extension in SHELL_EXTENSIONS:
+        key_path = shell_registry_path(extension)
+        with registry.CreateKeyEx(
+            registry.HKEY_CURRENT_USER,
+            key_path,
+            0,
+            registry.KEY_WRITE,
+        ) as key:
+            registry.SetValueEx(key, None, 0, registry.REG_SZ, "Open in Ogent")
+            registry.SetValueEx(key, "Icon", 0, registry.REG_SZ, str(ICON_PATH.resolve()))
+        command_path = key_path + r"\command"
+        with registry.CreateKeyEx(
+            registry.HKEY_CURRENT_USER,
+            command_path,
+            0,
+            registry.KEY_WRITE,
+        ) as command_key:
+            registry.SetValueEx(command_key, None, 0, registry.REG_SZ, command)
+        print(rf"Wrote HKCU\{key_path}")
+        print(rf"Wrote HKCU\{command_path}")
+    if console_fallback:
+        print(
+            "Note: pythonw.exe was not found beside the active interpreter; "
+            "Explorer will use python.exe and may briefly show a console window."
+        )
+
+
+def unregister_shell_integration() -> None:
+    registry = _registry_module()
+    for extension in SHELL_EXTENSIONS:
+        key_path = shell_registry_path(extension)
+        removed = False
+        for candidate in (key_path + r"\command", key_path):
+            try:
+                registry.DeleteKey(registry.HKEY_CURRENT_USER, candidate)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise UserFacingError(
+                    rf"Could not remove HKCU\{candidate}: {exc}",
+                    500,
+                ) from exc
+            print(rf"Removed HKCU\{candidate}")
+            removed = True
+        if not removed:
+            print(rf"Already absent: HKCU\{key_path}")
 
 
 def stop_existing_server() -> bool:
@@ -1906,11 +2101,37 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Ogent Lite local document workspace")
     parser.add_argument("--port", type=int, default=BASE_PORT, help="Preferred localhost port")
     parser.add_argument("--no-browser", action="store_true", help="Start without opening a browser")
-    parser.add_argument("--stop", action="store_true", help="Stop a running Ogent Lite server")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--open", dest="open_path", metavar="FILE", help="Open a file in Ogent")
+    action.add_argument("--stop", action="store_true", help="Stop a running Ogent Lite server")
+    action.add_argument(
+        "--register-shell",
+        action="store_true",
+        help="Add per-user Explorer 'Open in Ogent' entries",
+    )
+    action.add_argument(
+        "--unregister-shell",
+        action="store_true",
+        help="Remove per-user Explorer 'Open in Ogent' entries",
+    )
     args = parser.parse_args()
 
     LOCAL_DATA.mkdir(parents=True, exist_ok=True)
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    if args.register_shell:
+        try:
+            register_shell_integration()
+        except UserFacingError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+    if args.unregister_shell:
+        try:
+            unregister_shell_integration()
+        except UserFacingError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
     if args.stop:
         if stop_existing_server():
             print("Ogent Lite stopped.")
@@ -1922,6 +2143,16 @@ def main() -> int:
     if existing:
         port, _ = existing
         url = f"http://{HOST}:{port}/"
+        if args.open_path:
+            try:
+                result = post_open_to_existing_server(port, args.open_path)
+            except UserFacingError as exc:
+                webbrowser.open(url)
+                print(str(exc), file=sys.stderr)
+                return 1
+            webbrowser.open(url)
+            print(f"{result.get('message', 'File sent to Ogent')} {url}")
+            return 0
         if not args.no_browser:
             webbrowser.open(url)
         print(f"Ogent Lite is already running at {url}")
@@ -1932,6 +2163,13 @@ def main() -> int:
     server = OgentServer((HOST, port), OgentHandler)
     write_server_info(port)
     atexit.register(cleanup)
+    if args.open_path:
+        try:
+            dispatch_open_path(args.open_path)
+        except UserFacingError as exc:
+            STATE.last_error = str(exc)
+            STATE.add_message("assistant", str(exc))
+            print(str(exc), file=sys.stderr)
 
     def request_shutdown(*_: Any) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -1944,7 +2182,7 @@ def main() -> int:
     print(f"Ogent Lite {APP_VERSION} listening on {url}")
     print(f"Live document preview uses http://{HOST}:{WATCH_PORT}/")
     print("Press Ctrl+C to stop.")
-    if not args.no_browser:
+    if args.open_path or not args.no_browser:
         webbrowser.open(url)
     try:
         server.serve_forever(poll_interval=0.5)
