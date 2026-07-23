@@ -12,11 +12,16 @@ It runs entirely on `127.0.0.1`, uses the existing Codex CLI login, and does not
 need a new API key. Source documents are never edited directly. Every opened
 Office file is copied to `%LOCALAPPDATA%\OgentLite\work\` first.
 
+For the AI-agent installation sentence and complete human setup, see the
+[repository README](../README.md).
+
 ## Start
 
-- Double-click the **Ogent** desktop shortcut.
-- Or run `ogent` from PowerShell.
-- Or double-click `ogent.cmd` in this folder.
+- Double-click `ogent.cmd` in this folder.
+- Or double-click the optional **Ogent** desktop shortcut after creating it
+  with the instructions in the repository README.
+- Or right-click a supported Office file and select **Open in Ogent** after
+  registering the Explorer integration below.
 
 If Ogent is already running, another launch opens the existing browser page
 instead of starting a second server.

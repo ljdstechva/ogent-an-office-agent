@@ -1,34 +1,41 @@
+<p align="center">
+  <img src="ogent-lite/assets/ogent-logo.svg" alt="Ogent" width="420">
+</p>
+
 # Ogent — an office agent
 
-Ogent is a tested Windows desktop workflow for creating and editing real Word, Excel, and PowerPoint files through **AionUi**, **Codex CLI**, and **OfficeCLI**.
+Ogent is a local Windows workspace for editing real Word, Excel, and PowerPoint
+files with plain-language instructions. It places an OfficeCLI live preview
+beside a Codex chat, runs on `127.0.0.1`, and creates a protected working copy
+before any edit touches a document.
 
-This repository preserves the completed workstation test suite, reusable Office document templates, native-render QA evidence, and the exact operating workflow used to validate the setup.
-
-Ogent is open source under the [MIT License](LICENSE).
+The current app is **Ogent Lite 0.4.0**. It uses your existing Codex CLI login,
+so it does not require a separate OpenAI API key. Ogent is open source under the
+[MIT License](LICENSE).
 
 ## Install Ogent
 
-Ogent is not a separate executable. It is a tested Windows workspace that connects **AionUi** (desktop interface), **Codex CLI** (AI agent), **OfficeCLI** (Office document engine), and this repository's templates and verification assets.
-
 ### Option 1 — Let an AI agent install it (recommended)
 
-Paste this single sentence into Codex or another local AI agent that has permission to run PowerShell and install applications:
+Copy and paste this one sentence into Codex or another local AI agent that can
+run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; detect the machine architecture; reuse compatible tools that are already installed; install or update Git, OpenAI Codex CLI, OfficeCLI, and AionUi only from their official sources; verify published hashes or signatures before running downloaded installers; clone or update the repository; have me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; make sure AionUi detects Codex CLI; detect Microsoft Word 2016 or later for PDF Reflow and, if Word is unavailable, install LibreOffice from its official source as the PDF fallback; open the repository's aionui-tests folder as the workspace; configure a single Codex CLI conversation using GPT-5.6-Sol with medium reasoning and Agent permission mode when available, keep max reasoning as a manual option only for difficult work, and otherwise select the best available Codex model and report the fallback; never create a team or subagent for document work; run version checks; use AionUi and Codex to create smoke-test.local.docx with OfficeCLI; validate it and inspect its text and issues without rendering; and finish only after the complete Word workflow succeeds, reporting the installed versions, paths, and any remaining limitation.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.4.0 and that a disposable DOCX opens as a protected working copy while the original file hash remains unchanged; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
 ```
 
-The prompt intentionally leaves sign-in and Windows elevation with the human. It also tells the agent to use official sources and verify installers instead of trusting an arbitrary download.
+The prompt deliberately leaves sign-in and elevation with the human and never
+asks for a password, token, or API key.
 
 ### Option 2 — Human install on Windows
 
-These steps install the latest stable releases. The versions in the verified-workstation section below are the versions used for this repository's recorded test run.
-
-1. Install [Git for Windows](https://git-scm.com/install/windows), then open a new PowerShell window:
+1. Install [Git for Windows](https://git-scm.com/install/windows) and
+   [Python 3](https://www.python.org/downloads/windows/), then open a new
+   PowerShell window:
 
    ```powershell
-   winget install --id Git.Git -e --source winget
    git --version
+   py -3 --version
    ```
 
 2. Clone Ogent into a folder you control:
@@ -38,7 +45,8 @@ These steps install the latest stable releases. The versions in the verified-wor
    Set-Location '.\ogent-an-office-agent'
    ```
 
-3. Install [OpenAI Codex CLI](https://github.com/openai/codex), verify it, and sign in interactively with ChatGPT:
+3. Install [OpenAI Codex CLI](https://github.com/openai/codex), then sign in
+   interactively with ChatGPT:
 
    ```powershell
    powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
@@ -46,66 +54,178 @@ These steps install the latest stable releases. The versions in the verified-wor
    codex
    ```
 
-   Choose **Sign in with ChatGPT** when Codex opens. Do not put an API key or login token in this repository.
-
-4. Install [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) and verify that it is on `PATH`:
+4. Install [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI):
 
    ```powershell
    irm https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.ps1 | iex
    officecli --version
    ```
 
-5. Download AionUi from its [official GitHub Releases page](https://github.com/iOfficeAI/AionUi/releases). Choose the Windows `.exe` matching your computer (`x64` for most PCs or `arm64` for Windows on ARM), compare its published SHA-256 with PowerShell, and then run the installer:
+5. Register **Open in Ogent** for your Windows account and launch the app:
 
    ```powershell
-   Get-FileHash '.\AionUi-<version>-win-<architecture>.exe' -Algorithm SHA256
+   Set-Location '.\ogent-lite'
+   py -3 .\ogent.py --register-shell
+   .\ogent.cmd
    ```
 
-   PDF conversion uses Microsoft Word 2016 or later when available. If this
-   computer does not have Word, install [LibreOffice from its official
-   download page](https://www.libreoffice.org/download/download-libreoffice/)
-   as the automatic fallback. LibreOffice PDF import is less editable than
-   Word PDF Reflow.
+   Your browser opens the local app, normally at
+   `http://127.0.0.1:8765/`. No AionUi installation or OfficeCLI MCP call is
+   required: Ogent invokes Codex CLI and OfficeCLI automatically.
 
-6. Launch AionUi and configure Ogent:
+The Explorer command appears under **Right-click > Show more options > Open in
+Ogent** for `.docx`, `.xlsx`, and `.pptx`. It is installed only for the current
+Windows account and does not require administrator rights.
 
-   - Select the detected **Codex CLI** agent.
-   - Select **GPT-5.6-Sol · medium** when available; use **max** manually only for genuinely difficult reasoning. Otherwise use the best Codex model offered by your account.
-   - Select **Agent** permission mode.
-   - Open the cloned repository and set its `aionui-tests` folder as the workspace.
+Microsoft Office is optional for normal DOCX/XLSX/PPTX editing. PDF import uses
+Microsoft Word 2016 or later when available, with
+[LibreOffice](https://www.libreoffice.org/download/download-libreoffice/) as a
+less precise fallback.
 
-7. In AionUi, send this smoke-test prompt:
+### Optional desktop shortcut
 
-   ```text
-   Work single-agent; do not spawn a team or subagent. Using OfficeCLI, create smoke-test.local.docx with a Heading 1 title named "Ogent smoke test", one short body paragraph, and a live page-number footer; then close it, validate it, and inspect its text and issues without rendering.
-   ```
+Run this once from the `ogent-lite` folder:
 
-8. From the repository root, confirm the generated file independently:
+```powershell
+$ogentDir = (Resolve-Path '.').Path
+$desktopDir = [Environment]::GetFolderPath('Desktop')
+$shortcutShell = New-Object -ComObject WScript.Shell
+$shortcut = $shortcutShell.CreateShortcut((Join-Path $desktopDir 'Ogent.lnk'))
+$shortcut.TargetPath = Join-Path $ogentDir 'ogent.cmd'
+$shortcut.WorkingDirectory = $ogentDir
+$shortcut.IconLocation = (Join-Path $ogentDir 'assets\ogent.ico') + ',0'
+$shortcut.Save()
+```
 
-   ```powershell
-   officecli validate '.\aionui-tests\smoke-test.local.docx'
-   officecli view '.\aionui-tests\smoke-test.local.docx' issues
-   ```
+After that, double-click **Ogent** on the desktop whenever you want to start or
+return to the app.
 
-The `*.local.*` filename keeps the smoke-test file out of Git. Microsoft Office is optional for core OfficeCLI work, but Word, Excel, and PowerPoint are recommended for final native review and field refresh. Word or LibreOffice is required for the PDF conversion workflow. If AionUi does not detect Codex, restart AionUi after confirming that `Get-Command codex` succeeds in a new PowerShell window.
+## Use Ogent
+
+### Edit an existing document
+
+1. Right-click a `.docx`, `.xlsx`, or `.pptx` and select **Open in Ogent**.
+   You can also launch `ogent.cmd`, paste the document's absolute path, and
+   click **Open**.
+2. Choose the model and reasoning effort above the message box. The recommended
+   day-to-day setting is **GPT-5.6 Sol + Medium**.
+3. Describe the change in plain language and press **Enter**.
+4. Review each change in the live preview. Ogent asks Codex to use OfficeCLI,
+   read the result back, and validate the working document.
+
+### Start a new document
+
+Create a blank file first in Word, Excel, PowerPoint, or OfficeCLI, then open it
+in Ogent:
+
+```powershell
+$newDocument = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'new-report.docx'
+officecli create $newDocument
+```
+
+Use `.xlsx` or `.pptx` instead when starting a workbook or presentation.
+
+### Switch to another document
+
+Open the next file from Explorer or paste its path into Ogent. The running
+session switches to that file automatically. All open Ogent browser tabs show
+the same active document.
+
+Ogent currently supports **one active document and one Codex run per server**.
+It does not create independent parallel workspaces for multiple browser tabs.
+Finish or stop the current run before switching documents.
+
+### Keep the finished file
+
+Ogent edits a timestamped copy under
+`%LOCALAPPDATA%\OgentLite\work\`; the source file remains untouched. Once the
+result is approved, stop Ogent and copy the working file to the final location
+and filename you want. Validate that final copy before delivery.
+
+### Edit a PDF
+
+Start Ogent, type `Edit my PDF`, and paste the PDF's absolute path. Ogent copies
+the PDF, converts the copy to a working DOCX, and opens that DOCX for editing.
+The original PDF is never edited. Image-only PDFs stop honestly because they
+need OCR; complex layouts may require cleanup after Word PDF Reflow.
+
+## Start, stop, update, and uninstall
+
+From the `ogent-lite` folder:
+
+```powershell
+# Start or return to the existing app
+.\ogent.cmd
+
+# Stop Ogent, its OfficeCLI preview, and any Codex process it owns
+.\ogent.cmd stop
+```
+
+To update:
+
+```powershell
+.\ogent.cmd stop
+Set-Location '..'
+git pull --ff-only
+Set-Location '.\ogent-lite'
+py -3 .\ogent.py --register-shell
+.\ogent.cmd
+```
+
+Re-register after moving or renaming the cloned repository because the Explorer
+command stores the absolute Ogent path.
+
+To remove the Explorer integration:
+
+```powershell
+.\ogent.cmd stop
+py -3 .\ogent.py --unregister-shell
+```
+
+You may then delete the desktop shortcut and cloned repository. Local working
+copies and recent-path history remain under `%LOCALAPPDATA%\OgentLite` until you
+remove them.
+
+## How it works
+
+```text
+Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected working copy
+                                      \-> OfficeCLI live preview -> Browser UI
+```
+
+- Ogent owns the local web server, document session, working-copy creation,
+  OfficeCLI preview, and Codex process lifecycle.
+- Codex receives the selected model and reasoning level with document-specific,
+  single-agent editing instructions.
+- OfficeCLI performs and validates the actual Office-file changes.
+- AionUi is optional. The earlier AionUi workflow remains documented in
+  [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md), but it is not required to run the
+  Ogent app.
 
 ## Verified workstation
 
 - Windows 11
-- AionUi 2.1.39
+- Ogent Lite 0.4.0
 - OfficeCLI 1.0.140
 - Codex CLI 0.144.1
-- AionUi engine: GPT-5.6-Sol; medium is the recommended day-to-day default, with max available manually
+- GPT-5.6 Sol with selectable Low, Medium, High, XHigh, Max, and Ultra reasoning
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
-All 13 included Office test artifacts pass OpenXML validation. See [TEST-REPORT.md](TEST-REPORT.md) for the evidence matrix and [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md) for daily use.
+The app's launch, protected-copy workflow, live preview, Codex edit, model and
+reasoning selectors, Stop control, PDF import, Explorer integration, desktop
+shortcut, and reversible unregister flow were exercised end to end. See
+[ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for the app evidence.
+The repository's 13 original Office test artifacts also pass OpenXML validation;
+see [TEST-REPORT.md](TEST-REPORT.md).
 
 ## What Ogent demonstrates
 
+- A local two-pane Ogent app with live Office preview, Codex chat, model and
+  reasoning controls, and Windows Explorer integration
 - Word reports with cover pages, live tables of contents, styles, headers, footers, page fields, tables, charts, and equations
 - Excel workbooks with real formulas, evaluated totals, formatting, conditional formatting, and native charts
 - PowerPoint decks with consistent themes, backgrounds, editable shapes, and charts
-- AionUi file attachment for round-trip Office editing and CSV-to-Excel conversion (operator-attested; no AionUi screen capture is published)
+- An optional AionUi workflow for round-trip Office editing and CSV-to-Excel conversion (operator-attested; no AionUi screen capture is published)
 - Web research converted into a concise, cited Word brief
 - Safe PDF-to-DOCX editing and PDF re-export with scanned-file detection
 - An honest Visio capability check plus a working native Word diagram alternative
@@ -134,6 +254,11 @@ All 13 included Office test artifacts pass OpenXML validation. See [TEST-REPORT.
 ├── AGENTS.md
 ├── AIONUI-WORKFLOW.md
 ├── TEST-REPORT.md
+├── ogent-lite/
+│   ├── ogent.py
+│   ├── ogent.cmd
+│   ├── OGENT-REPORT.md
+│   └── assets/
 ├── tools/
 │   ├── pdf2docx.ps1
 │   └── docx2pdf.ps1
