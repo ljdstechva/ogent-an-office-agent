@@ -9,7 +9,9 @@ param(
     [ValidateSet('Auto', 'Word', 'LibreOffice')]
     [string]$Engine = 'Auto',
 
-    [switch]$Force
+    [switch]$Force,
+
+    [string]$WordPidFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +55,19 @@ function Release-ComObject {
     }
 }
 
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class OgentWordWindow {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindow(string className, string windowName);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}
+'@
+
 function Remove-GeneratedOutput {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -93,16 +108,39 @@ function Assert-ValidPdf {
 function Invoke-WordDocxToPdf {
     param(
         [Parameter(Mandatory = $true)][string]$InputPath,
-        [Parameter(Mandatory = $true)][string]$OutputPath
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [string]$PidFilePath
     )
 
     $word = $null
     $document = $null
+    $wordQuitCleanly = $false
     try {
         $word = New-Object -ComObject Word.Application
+        if (-not [string]::IsNullOrWhiteSpace($PidFilePath)) {
+            $resolvedPidFile = Get-AbsoluteOutputPath -Path $PidFilePath
+            $wordCaption = 'OgentWordPid-' + [System.Guid]::NewGuid().ToString('N')
+            $word.Caption = $wordCaption
+            $wordWindow = [OgentWordWindow]::FindWindow('OpusApp', $wordCaption)
+            if ($wordWindow -eq [IntPtr]::Zero) {
+                throw 'Could not locate the Word automation window.'
+            }
+            $wordPid = [uint32]0
+            [void][OgentWordWindow]::GetWindowThreadProcessId(
+                $wordWindow,
+                [ref]$wordPid
+            )
+            if ($wordPid -eq 0) {
+                throw 'Could not determine the Word automation process id.'
+            }
+            [System.IO.File]::WriteAllText(
+                $resolvedPidFile,
+                $wordPid.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+            )
+        }
+
         $word.Visible = $false
         $word.DisplayAlerts = 0
-
         $document = $word.Documents.Open($InputPath, $false, $true)
         $document.SaveAs2($OutputPath, 17) # wdFormatPDF
     }
@@ -122,6 +160,7 @@ function Invoke-WordDocxToPdf {
         if ($null -ne $word) {
             try {
                 $word.Quit()
+                $wordQuitCleanly = $true
             }
             catch {
                 Write-Warning "Word could not quit cleanly: $($_.Exception.Message)"
@@ -133,6 +172,13 @@ function Invoke-WordDocxToPdf {
 
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
+        if (
+            $wordQuitCleanly -and
+            -not [string]::IsNullOrWhiteSpace($PidFilePath) -and
+            (Test-Path -LiteralPath $PidFilePath -PathType Leaf)
+        ) {
+            Remove-Item -LiteralPath $PidFilePath -Force
+        }
     }
 }
 
@@ -218,7 +264,10 @@ if (Test-Path -LiteralPath $resolvedOutPdf) {
 $wordFailure = $null
 if ($Engine -in @('Auto', 'Word')) {
     try {
-        Invoke-WordDocxToPdf -InputPath $resolvedDocx -OutputPath $resolvedOutPdf
+        Invoke-WordDocxToPdf `
+            -InputPath $resolvedDocx `
+            -OutputPath $resolvedOutPdf `
+            -PidFilePath $WordPidFile
         Assert-ValidPdf -Path $resolvedOutPdf
 
         [pscustomobject]@{

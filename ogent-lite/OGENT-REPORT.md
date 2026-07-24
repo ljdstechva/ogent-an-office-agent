@@ -1,7 +1,7 @@
 # Ogent Lite Verification Report
 
-Date: 2026-07-23
-Status: T1–T7 pass
+Date: 2026-07-24
+Status: T1-T7, S1-S8, and M1-M12 pass
 
 ## Runtime and architecture
 
@@ -10,12 +10,12 @@ Status: T1–T7 pass
 - Dependencies: Python standard library only
 - Server bind: `127.0.0.1` only
 - Preferred app port: 8765, with automatic upward fallback
-- OfficeCLI watch port: 26315
+- OfficeCLI watch ports: one per session, allocated from 26320-26380
 - Agent backend: Codex CLI 0.144.1
 - Models: selectable `gpt-5.6-sol` or `gpt-5.6-terra`
 - Reasoning effort: selectable low, medium, high, xhigh, max, or ultra
 - Recommended defaults: `gpt-5.6-sol` with medium reasoning
-- OfficeCLI: 1.0.140
+- OfficeCLI: 1.0.141
 - Browser test engine: Playwright with installed Microsoft Edge
 
 The direct Codex preflight returned `READY` in 15.724 seconds. The global Codex
@@ -77,7 +77,8 @@ the existing document's visual system, and the design-matched rerun above passed
   “still working” message.
 - Moving a working copy now clears the browser document state immediately and
   gives one actionable error.
-- `ogent stop` left no server-owned process and released watch port 26315.
+- `ogent stop` left no server-owned process and released the legacy
+  single-session watch port.
 
 ## Memory comparison
 
@@ -108,7 +109,7 @@ this measurement.
 
 ## Known limitations
 
-- One Codex run at a time.
+- One Codex run at a time per session; different sessions can run concurrently.
 - Excel watch does not support click-to-select paths.
 - PDF editing occurs in a converted working DOCX, never directly in the PDF.
 - PDF Reflow can preserve editable text while changing complex layout; the
@@ -188,3 +189,142 @@ size, the ICO directory contained all seven PNG frames, and
 
 Final state: Ogent v0.4.0 is running, the per-user shell integration is enabled
 for `.docx`, `.xlsx`, and `.pptx`, and no public push was performed.
+
+## v0.5.0 - multi-session, lifecycle, and Word view
+
+Verified on 2026-07-24 with Python 3.14.3, Codex CLI 0.144.1,
+OfficeCLI 1.0.141, Microsoft Word, and installed Microsoft Edge. This section
+supersedes the v0.4.0 single-session architecture notes above while preserving
+the earlier test history.
+
+### Architecture delivered
+
+- One localhost server owns a registry of independent workspace sessions. A
+  fresh browser workspace creates a session; reconnecting or deduplicating can
+  attach more than one tab to that same session.
+- Each session owns one protected working document, transcript, Codex context,
+  run state, event stream, and OfficeCLI watch port from 26320-26380.
+- Different sessions can edit different files concurrently. One session still
+  allows only one Codex run at a time.
+- Same-source opens are atomically deduplicated to the existing session.
+- Stable browser-client IDs make SSE disconnects and close beacons idempotent,
+  including two tabs viewing one deduplicated session.
+- An idle disconnected session reaps after 120 seconds. A session that is still
+  opening, generating Word view, or running Codex is protected and receives a
+  fresh grace window when the operation finishes.
+- The backend exits 10 minutes after the final session is gone by default.
+  `--idle-exit-minutes 0` keeps it resident.
+- DOCX sessions have an on-demand **Word view** that calls
+  `tools\docx2pdf.ps1 -Engine Word -Force` and streams the resulting PDF. A
+  session-owned PID sidecar identifies the exact Word automation process for
+  safe forced cleanup without touching pre-existing Word windows.
+- Explorer registration writes `Position=Top` for DOCX, XLSX, and PPTX.
+
+### M1-M12 live matrix
+
+| Test | Result | Observed time | Evidence |
+|---|---|---:|---|
+| M1 - three sessions | PASS | 4.5 s concurrent open | Alpha, Beta, and Gamma used ports 26321, 26320, and 26322. Edge/Playwright captures showed the correct unique text in each iframe, all three items in every switcher, and no console errors. |
+| M2 - concurrent edits | PASS | 60.64 s to both terminal events | Two `gpt-5.6-sol` medium-reasoning runs finished independently. `OGENT_ALPHA_PARALLEL_20260724` appeared only in Alpha and `OGENT_BETA_PARALLEL_20260724` only in Beta; both working DOCX files validated and both source hashes were unchanged. |
+| M3 - same-file dedupe | PASS | 0.6 s warm dispatch | A second Alpha open returned `focus_session` with the original session id and port. Transient CLI-created sessions are now removed immediately; health remained at one Alpha session. |
+| M4 - close one tab | PASS | 3.91 s with a 3 s test grace | The closed test session disappeared only after its OfficeCLI process stopped; a socket probe then returned connection refused. The other session and preview stayed live. |
+| M5 - close during run | PASS | 69.0 s test | The orphaned session survived beyond grace while Codex worked, completed successfully, reopened with its finished transcript, then reaped only after that reopened client closed. |
+| M6 - close all / self-exit | PASS | 62.68 s with `--idle-exit-minutes 1` | Backend exited cleanly after the one-minute empty window. Port 8765 and all watch ports were closed, stderr was empty, and zero Ogent-owned OfficeCLI/Codex processes remained. |
+| M7 - cold right-click | PASS | 4.3 s | `--open` started v0.5.0, created the first session before serving, opened Alpha as a protected copy, and started a healthy watch. |
+| M8 - warm right-click | PASS | 4.12 s | A second file created a second live session beside the first with a distinct port. |
+| M9 - `00 FS.docx` Word view | PASS | 12.48 s open; 25.46 s snapshot | Complex-layout detection found 107 textboxes, 284 shapes, and 14 drawings. The endpoint returned a valid 1,596,187-byte, 38-page searchable PDF. Visual comparison matched Word's cover: logo, title, plant image, icon list, labels, and geometry were intact. |
+| M10 - menu position | PASS | <1 s registry check | `reg query` confirmed `Position REG_SZ Top` under all three per-user Ogent shell keys. Windows still controls ordering among Top entries. |
+| M11 - regressions | PASS | mixed | Native Browse returned an existing DOCX path; paste-path open passed; PDF conversion completed in 8.72 s with unchanged source hash; Stop reached `stopped` in 0.41 s with no Codex child; model/reasoning controls, favicon, branding, and `ogent.cmd stop` passed. |
+| M12 - idle footprint | PASS | measured | Three sessions: server 36.5 MB working set, three OfficeCLI watches 174.5 MB, 211.0 MB combined. |
+
+The duplicate-tab extension to M3/M4 also passed: one session had two stable SSE
+client IDs; closing one and waiting beyond grace left one client and a healthy
+preview. Closing the second client started normal reap and backend-idle timing.
+
+### Fidelity baseline and renderer decision
+
+- The protected local copy of `00 FS.docx` reported 296 paragraphs, 6,818
+  words, 50,364 characters, and 114 OfficeCLI issues (112 generic first-line
+  indent warnings plus two consecutive-space warnings).
+- OfficeCLI was upgraded from 1.0.140 to 1.0.141 through its official installer.
+- The 1.0.141 HTML renderer materially improved the designed cover and did not
+  justify destructive reconstruction. Its structured query still identified
+  107 textboxes, 284 shapes, 14 drawings, and 10 pictures.
+- Microsoft Word remains the canonical renderer for exact floating-object
+  placement. The new Word view matched the native Word baseline at the same
+  page aspect and visual geometry.
+- The Codex agent brief now warns that HTML preview alone cannot prove floating
+  content is missing and requires OfficeCLI get/query verification before any
+  restore, delete, or rebuild action.
+
+### Defects found and resolved during the matrix
+
+- Reaper could race a long document open; `opening_source` now protects it.
+- A tab closed during a long run could consume its grace before completion;
+  terminal operations now start a fresh reconnect grace.
+- Deduplicated CLI opens left empty transient sessions; those are now removed
+  immediately, including failed new-session opens.
+- Two tabs sharing one session could race beacon/disconnect ordering; stable
+  client IDs now make presence removal idempotent.
+- Registry removal could be broadcast before a child watch released its socket;
+  cleanup and registry visibility are now atomic.
+- Graceful OfficeCLI termination could leave its listener accepting briefly;
+  Ogent now terminates the complete tree, issues `officecli unwatch` and
+  `officecli close`, and waits for bounded port closure before announcing
+  removal.
+- Native Browse launched without a reliable foreground owner from a hidden
+  backend; it now uses an explicit topmost WinForms owner.
+- Expected SSE connection resets printed a Python traceback during self-exit;
+  the server now suppresses only expected broken-pipe/reset disconnects.
+- Simultaneous different-file opens in one session could interleave; a
+  per-session opening claim now rejects the second request with HTTP 409.
+- A failed PDF copy could strand a claimed session, and Stop during late PDF
+  preparation could be overwritten; all preparation now runs inside guaranteed
+  cleanup and preserves cancellation until the worker finishes.
+- A vanished working file could leave stale dedupe keys; clearing a broken
+  document now releases every registry key before reopening.
+- Shutdown could race PDF, Browse, reaper, or Word-view startup. Process
+  registration and close completion are now serialized, Browse is tracked, and
+  shutdown waits for in-progress Word export to release COM cleanly.
+- Forced cancellation of the Word converter could leave a hidden
+  `WINWORD.EXE /Automation -Embedding` instance. The converter now records its
+  exact PID, removes the sidecar after a clean quit, and Ogent validates and
+  terminates only that tracked automation process on forced fallback.
+
+### Post-review hardening evidence
+
+- Two concurrent `/open` requests for different DOCX files in one session
+  returned HTTP 200 and 409. The winner alone owned port 26320, its watch was
+  healthy, and both source hashes were unchanged.
+- After deliberately moving a disposable working copy away, `/watch/restart`
+  returned 404, health showed no active/source document, and reopening the same
+  source returned `document_opened` with a healthy watch rather than stale
+  dedupe.
+- While Word view was active, a competing `/open` returned 409 and the snapshot
+  completed with HTTP 200. SSE header-reset cleanup, overlapping same-client
+  streams, shutdown/create exclusion, concurrent close serialization, failed
+  PDF-copy cleanup, and PDF stop-state preservation also passed targeted tests.
+- An intentional shutdown during Word view left port 8765 and the session watch
+  port closed, no session-owned OfficeCLI process, no Word process, no PID
+  sidecar, no server record, and an empty stderr log.
+- The forced-cleanup fallback was exercised with a disposable automation
+  instance: it terminated both the PowerShell wrapper and its exact tracked
+  Word PID. A standalone Word conversion then produced a valid 52,680-byte PDF
+  in 4.99 seconds, removed its PID sidecar, left no new Word process, and
+  preserved the DOCX source hash.
+
+### Honest remaining limits
+
+- Word view is DOCX-only and requires desktop Microsoft Word.
+- The live HTML view remains an approximation for some floating Word objects;
+  use Word view before judging designed pages.
+- Windows exposes only Top/Bottom placement for classic verbs. Ogent cannot
+  dictate exact ordering among other Top-positioned entries.
+- Excel live preview still does not support click-to-select paths.
+- PDF editing still happens through a protected converted DOCX, and image-only
+  PDFs still require OCR.
+
+Final v0.5.0 state: implementation and documentation are locally committed,
+the per-user shell integration is enabled, the backend is stopped after the
+clean self-exit test, personal/source-derived documents remain untracked, and
+no public push was performed.

@@ -23,8 +23,8 @@ For the AI-agent installation sentence and complete human setup, see the
 - Or right-click a supported Office file and select **Open in Ogent** after
   registering the Explorer integration below.
 
-If Ogent is already running, another launch opens the existing browser page
-instead of starting a second server.
+If Ogent is already running, another launch creates a fresh browser workspace
+inside the existing server instead of starting a second backend process.
 
 ## Right-click integration
 
@@ -40,10 +40,10 @@ classic menu. Windows 11 does not allow an unpackaged desktop script to appear
 in the compact modern menu; that requires MSIX packaging and is intentionally
 outside Ogent Lite's current scope.
 
-The command starts Ogent when necessary or switches the running session to the
-selected file. It always opens a browser tab; any Ogent tab that was already
-open also updates through the live event stream, so the extra tab can be closed.
-The original document is still protected by Ogent's working-copy workflow.
+The command starts Ogent when necessary or creates a new independent session
+for the selected file. If that exact source is already open, Ogent focuses the
+existing session instead of starting a duplicate OfficeCLI watch. The original
+document is still protected by Ogent's working-copy workflow.
 
 Remove the integration cleanly at any time:
 
@@ -52,13 +52,19 @@ py -3 .\ogent.py --unregister-shell
 ```
 
 Registration is limited to your Windows account and does not need administrator
-rights. If Explorer keeps an older icon, run `ie4uinit.exe -show` or restart
-Explorer to refresh its icon cache.
+rights. The registration asks Windows to place the verb in the **Top** cluster
+of the classic menu. Windows controls ordering inside that cluster, so Ogent
+cannot guarantee an exact position between two specific apps. If Explorer keeps
+an older icon, run `ie4uinit.exe -show` or restart Explorer to refresh its cache.
 
 ## Daily recipe
 
 1. Start Ogent, paste the absolute `.docx`, `.xlsx`, or `.pptx` path, and click **Open**.
 2. Choose the model and reasoning effort, describe the change, and review it live on the left.
+3. Use **+ New window** for another document. The session dropdown switches
+   among open workspaces without merging their documents or chats.
+4. For a complex DOCX, use **Word view** when exact floating-shape placement
+   matters. It opens a Microsoft Word-rendered PDF in a new browser tab.
 
 For PDFs, start with “Edit my PDF,” then paste its absolute path. Ogent copies the
 PDF, converts the copy to a working DOCX through the Word-first pipeline, and
@@ -71,6 +77,35 @@ image-only PDFs require OCR.
 - Or from this folder: `ogent.cmd stop`
 
 Stopping Ogent also stops its OfficeCLI watch and any Codex process it owns.
+
+## Sessions and automatic cleanup
+
+Each fresh browser workspace creates one Ogent session. Each session has its own
+protected working copy, transcript, Codex thread, run state, and OfficeCLI watch
+port from 26320-26380. Different sessions may edit different files concurrently;
+one individual session allows one Codex run at a time. Tabs that navigate to the
+same deduplicated session share that workspace.
+
+Closing the final connected tab starts a 120-second grace window; closing one of
+several tabs attached to the same session does not. Refreshing or reopening the
+same session URL reconnects it. An active run is never reaped; after the run
+finishes the session receives a fresh grace window so its result can be
+collected.
+
+When all sessions have been reaped, the backend exits after 10 minutes. Override
+that delay when launching Python directly:
+
+```powershell
+# Keep the backend resident
+py -3 .\ogent.py --idle-exit-minutes 0
+
+# Exit 30 minutes after the final session is gone
+py -3 .\ogent.py --idle-exit-minutes 30
+```
+
+`ogent.cmd stop` shuts down every session immediately. If Word view is active,
+Ogent gives the Word converter a bounded clean-exit window and tracks its exact
+automation process for forced cleanup if that window expires.
 
 ## Local data
 
@@ -88,8 +123,8 @@ Recent paths and working documents stay local and are excluded from Git.
 - OfficeCLI (`officecli --version`)
 - Codex CLI signed in (`codex --version`)
 
-Ogent currently uses `gpt-5.6-sol` with medium reasoning and allows one document
-run at a time by default.
+Ogent defaults to `gpt-5.6-sol` with medium reasoning and allows one document
+run at a time per session.
 
 ## Model and reasoning
 
@@ -125,7 +160,9 @@ dot in `#14b8a6`.
 | Preferred port 8765 is busy | Ogent automatically tries 8766 and higher. Launch again and use the browser page it opens. |
 | Preview says reconnecting | Click the reload icon. Ogent also restarts the OfficeCLI watch before the next chat run. |
 | Codex is not logged in | Open PowerShell, run `codex`, complete sign-in, then restart Ogent. |
-| “Port 26315 is already in use” | Stop the stale OfficeCLI watch using that port, then click the reload icon. |
+| No preview port is available | Ogent allocates one port per session from 26320-26380. Close unused sessions or stale manual OfficeCLI watches, then retry. |
+| A closed tab still appears briefly | The 120-second grace absorbs refreshes and accidental closes. Reopen its `/?s=<id>` URL to reconnect or let it reap automatically. |
+| Complex DOCX preview looks incomplete | The live HTML view approximates some floating shapes. Click **Word view** and verify before concluding content is missing. |
 | PDF opens with broken spacing | PDF Reflow preserved editable content but not exact layout; clean up the working DOCX or use the original source document. |
 | PDF reports that OCR is needed | The PDF is image-only. Run OCR first, then import the searchable PDF. |
 | A run is taking too long | Click **Stop**; Ogent terminates the active Codex child process tree. |
@@ -134,6 +171,7 @@ dot in `#14b8a6`.
 
 - Localhost only; no telemetry or external web assets.
 - No direct edits to source documents.
-- One active document and one Codex run at a time.
+- One active document and one Codex run per session; sessions are independent.
 - Excel live preview does not support click-to-select paths.
 - PDF editing happens in a converted DOCX, never in the PDF itself.
+- Word view currently supports DOCX only and requires Microsoft Word.
