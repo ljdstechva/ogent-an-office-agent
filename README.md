@@ -9,7 +9,7 @@ files with plain-language instructions. It places an OfficeCLI live preview
 beside a Codex chat, runs on `127.0.0.1`, and creates a protected working copy
 before any edit touches a document.
 
-The current app is **Ogent Lite 0.6.0**. It uses your existing Codex CLI login,
+The current app is **Ogent Lite 0.7.0**. It uses your existing Codex CLI login,
 so it does not require a separate OpenAI API key. Ogent is open source under the
 [MIT License](LICENSE).
 
@@ -21,7 +21,7 @@ Copy and paste this one sentence into Codex or another local AI agent that can
 run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.6.0, that three disposable DOCX files open as three independent sessions with distinct preview ports, and that every source-file hash remains unchanged; confirm the session switcher, model and reasoning selectors, Word view button, and automatic tab cleanup; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.7.0; drag disposable DOCX, XLSX, PPTX, and searchable PDF files into the browser and one DOCX onto the desktop shortcut; confirm protected import and working copies, live previews, valid Office output, and unchanged source hashes; verify the session switcher, model and reasoning selectors, Word view button, and automatic tab cleanup; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
 ```
 
 The prompt deliberately leaves sign-in and elevation with the human and never
@@ -100,16 +100,18 @@ $shortcut.IconLocation = (Join-Path $ogentDir 'assets\ogent.ico') + ',0'
 $shortcut.Save()
 ```
 
-After that, double-click **Ogent** on the desktop whenever you want to start or
-return to the app.
+After that, double-click **Ogent** whenever you want to start or return to the
+app. You can also drag one supported file onto the shortcut to launch
+Ogent with that file immediately.
 
 ## Use Ogent
 
 ### Edit an existing document
 
-1. Right-click a `.docx`, `.xlsx`, or `.pptx` and select **Open in Ogent**.
-   You can also launch `ogent.cmd`, paste the document's absolute path, and
-   click **Open**.
+1. Drag a `.docx`, `.xlsx`, `.pptx`, or `.pdf` anywhere into the Ogent window.
+   You can also click the drop area to choose a file, drag a supported
+   file onto the desktop shortcut, right-click an Office file and select
+   **Open in Ogent**, or paste its absolute path and click **Open**.
 2. Choose the model and reasoning effort above the message box. The recommended
    day-to-day setting is **GPT-5.6 Sol + Medium**.
 3. Describe the change in plain language and press **Enter**.
@@ -151,9 +153,11 @@ closing only one of them does not orphan the session.
 ### Keep the finished file
 
 Ogent edits a timestamped copy under
-`%LOCALAPPDATA%\OgentLite\work\`; the source file remains untouched. Once the
-result is approved, stop Ogent and copy the working file to the final location
-and filename you want. Validate that final copy before delivery.
+`%LOCALAPPDATA%\OgentLite\work\`; the source file remains untouched. Browser
+drag/drop first saves the exact uploaded bytes under
+`%LOCALAPPDATA%\OgentLite\imports\`, then creates the separate working copy.
+Once the result is approved, stop Ogent and copy the working file to the final
+location and filename you want. Validate that final copy before delivery.
 
 ### Close tabs and stop the backend
 
@@ -240,16 +244,17 @@ Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected wo
 ## Verified workstation
 
 - Windows 11
-- Ogent Lite 0.6.0
+- Ogent Lite 0.7.0
 - OfficeCLI 1.0.141
 - Codex CLI 0.144.1
 - GPT-5.6 Sol with selectable Low, Medium, High, XHigh, Max, and Ultra reasoning
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
-The app's multi-session launch, concurrent protected-copy edits, live previews,
-same-file dedupe, tab reaping, automatic backend exit, Word view, model and
-reasoning selectors, Stop control, PDF import, Explorer integration, desktop
-shortcut, and reversible unregister flow were exercised end to end. See
+The app's browser and full-window drag/drop, desktop-shortcut drop, multi-session
+launch, concurrent protected-copy edits, live previews, same-file dedupe, tab
+reaping, automatic backend exit, Word view, model and reasoning selectors, Stop
+control, PDF import, Explorer integration, desktop shortcut, and reversible
+unregister flow were exercised end to end. See
 [ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for the app evidence.
 The repository's 13 original Office test artifacts also pass OpenXML validation;
 see [TEST-REPORT.md](TEST-REPORT.md).

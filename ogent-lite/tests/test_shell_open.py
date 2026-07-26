@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ class ShellOpenTests(unittest.TestCase):
         self.original_state = ogent.STATE
         self.original_dispatch = ogent.dispatch_open_path
         self.original_server_info = ogent.SERVER_INFO_PATH
+        self.original_import_root = ogent.IMPORT_ROOT
         self.original_port_available = ogent.port_available
         self.state = ogent.OgentState()
         ogent.STATE = self.state
@@ -38,6 +40,7 @@ class ShellOpenTests(unittest.TestCase):
         self.thread.start()
         self.temp_dir = tempfile.TemporaryDirectory()
         ogent.SERVER_INFO_PATH = Path(self.temp_dir.name) / "server.json"
+        ogent.IMPORT_ROOT = Path(self.temp_dir.name) / "imports"
         ogent.SERVER_INFO_PATH.write_text(
             json.dumps(
                 {
@@ -60,6 +63,7 @@ class ShellOpenTests(unittest.TestCase):
         ogent.STATE = self.original_state
         ogent.dispatch_open_path = self.original_dispatch
         ogent.SERVER_INFO_PATH = self.original_server_info
+        ogent.IMPORT_ROOT = self.original_import_root
         ogent.port_available = self.original_port_available
 
     def test_shell_selection_prefers_latest_connected_focus(self) -> None:
@@ -151,6 +155,58 @@ class ShellOpenTests(unittest.TestCase):
         self.assertEqual(result["session_id"], target.session_id)
         self.assertEqual(calls, [(target, r"C:\test\warm switch.docx")])
         self.assertEqual(len(self.state.sessions), 2)
+
+    def test_upload_preserves_bytes_and_dispatches_import_copy(self) -> None:
+        session = self.state.create_session()
+        session.connect_sse("upload-client")
+        content = b"fake-office-package"
+        calls: list[tuple[Any, str, bytes]] = []
+
+        def fake_dispatch(current: Any, raw_path: str) -> dict[str, Any]:
+            path = Path(raw_path)
+            calls.append((current, raw_path, path.read_bytes()))
+            return {
+                "action": "document_opened",
+                "session_id": current.session_id,
+                "message": "Working copy opened.",
+            }
+
+        ogent.dispatch_open_path = fake_dispatch
+        filename = "résumé test.docx"
+        request = urllib.request.Request(
+            f"http://{ogent.HOST}:{self.port}/upload",
+            data=content,
+            headers={
+                "X-Ogent-Token": self.state.token,
+                "X-Ogent-Session": session.session_id,
+                "X-Ogent-Filename": urllib.parse.quote(filename, safe=""),
+                "Content-Type": "application/octet-stream",
+            },
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["uploaded_name"], filename)
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0], session)
+        self.assertEqual(calls[0][2], content)
+        imported = Path(calls[0][1])
+        self.assertEqual(imported.name, filename)
+        self.assertTrue(imported.is_relative_to(ogent.IMPORT_ROOT))
+        self.assertEqual(Path(result["import_source"]), imported)
+
+    def test_safe_upload_filename_blocks_traversal_and_unsupported_types(self) -> None:
+        self.assertEqual(
+            ogent.safe_upload_filename(r"..\..\Quarterly Report.XLSX"),
+            "Quarterly Report.xlsx",
+        )
+        self.assertEqual(ogent.safe_upload_filename("CON.pdf"), "_CON.pdf")
+        with self.assertRaises(ogent.UserFacingError) as caught:
+            ogent.safe_upload_filename("notes.txt")
+        self.assertEqual(caught.exception.status, 415)
 
 
 if __name__ == "__main__":

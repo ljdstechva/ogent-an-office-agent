@@ -378,3 +378,54 @@ confirm the icon and no-console behavior for one Word, Excel, and PowerPoint
 right-click. The same registered `pythonw.exe` command and icon passed the
 earlier v0.4.0 human matrix; the v0.6 command path and all downstream behavior
 have been revalidated above.
+
+## v0.7.0 - drag-and-drop reference workflow
+
+Verified on 2026-07-26 with Python 3.14.3, OfficeCLI 1.0.141, Microsoft Word,
+Chrome, and Playwright CLI. This release makes drag-and-drop the primary
+document-entry workflow while retaining the v0.6 right-click behavior.
+
+### Behavior delivered
+
+- A file can be dropped on the visible drop target or anywhere in the Ogent
+  browser window. Clicking the target opens the native file chooser.
+- DOCX, XLSX, PPTX, and PDF are accepted one at a time up to 128 MB.
+- Browser security does not expose the original Windows path. Ogent therefore
+  preserves the exact received bytes under
+  `%LOCALAPPDATA%\OgentLite\imports\`, then creates the independently editable
+  working copy under `%LOCALAPPDATA%\OgentLite\work\`.
+- The full-window drop overlay explains the action and source-file protection.
+  Busy runs, snapshots, and uploads disable competing document opens.
+- Dropping a supported file onto the Ogent desktop shortcut now forwards that
+  file to `ogent.py --open`; normal double-click launch and `ogent.cmd stop`
+  remain unchanged.
+- Right-click **Open in Ogent** remains enabled for DOCX, XLSX, and PPTX.
+
+### v0.7 acceptance evidence
+
+| Check | Result |
+|---|---|
+| Browser chooser | PASS: a real Word file was selected through the file chooser, imported, copied to the session work folder, and rendered with `Baseline Test v2`, `Revenue grew 25% in Q4.`, and `LIVE-EDIT-MARKER-777`. |
+| Drop target | PASS: Playwright's native file-drop action opened the Excel and PowerPoint fixtures. The live previews showed the monthly-sales sheet/chart and the `Baseline Deck` slide respectively. |
+| Full-window drop | PASS: dropping `résumé test file.docx` on the page body preserved the Unicode display name and opened the correct Word content. |
+| PDF drop | PASS: a 664,625-byte searchable PDF was imported and converted through the Word-first pipeline in about 9.1 seconds. The resulting 320,683-byte DOCX opened with a healthy preview and exposed searchable resume text. |
+| Office validity | PASS: OfficeCLI validation reported no errors for the Word, Excel, PowerPoint, and PDF-derived working files; `officecli view ... text` returned the expected content for all four. |
+| Byte preservation | PASS: SHA-256 hashes for all four source fixtures were unchanged after testing, and every browser import copy hash exactly matched its source fixture. |
+| Native desktop gesture | PASS: Windows Computer Use dragged `OGENT-NATIVE-DROP-TEST.docx` from Explorer onto the real `Ogent.lnk`. Ogent v0.7.0 launched on port 8765, opened the exact source in session `62091768`, produced a valid working DOCX, and preserved the source hash. |
+| Browser quality | PASS: the 1440 × 900 visual inspection showed a clean two-pane layout with the first-class drop target, no clipping or overlap, and a connected live preview. Browser console inspection returned zero errors and warnings. |
+| Protocol regressions | PASS: eight stdlib unit tests covered session selection, replacement watch allocation, direct OfficeCLI mode, busy targeting, warm reuse, upload-byte preservation, Unicode upload names, path traversal, reserved names, and unsupported extensions. Python compilation also passed. |
+
+The temporary Explorer test tab was closed without disturbing the user's four
+existing tabs. The disposable desktop source was moved back into the ignored
+workspace test area after validation. Both production and isolated test servers
+were stopped, the right-click registration remains enabled, and no public push
+was performed.
+
+### Honest remaining limits
+
+- Browser imports are retained locally until the user removes the Ogent local
+  data; there is no automatic import-pruning control yet.
+- Browser and shortcut drops intentionally accept one file at a time.
+- Image-only PDFs still stop with `needs OCR`; PDF editing still occurs in a
+  converted DOCX.
+- Word view remains the fidelity check for complex floating Word layouts.

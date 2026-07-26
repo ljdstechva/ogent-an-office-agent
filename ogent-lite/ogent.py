@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - Ogent is a Windows app.
 
 
 APP_NAME = "Ogent Lite"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 HOST = "127.0.0.1"
 BASE_PORT = 8765
 WATCH_PORT_FIRST = 26320
@@ -53,10 +53,12 @@ DEFAULT_REAPER_TICK_SECONDS = 30.0
 DEFAULT_IDLE_EXIT_MINUTES = 10.0
 SNAPSHOT_SHUTDOWN_GRACE_SECONDS = 55.0
 SUPPORTED_OFFICE = {".docx", ".xlsx", ".pptx"}
+SUPPORTED_UPLOADS = {*SUPPORTED_OFFICE, ".pdf"}
 SHELL_EXTENSIONS = (".docx", ".xlsx", ".pptx")
 ACTIVE_RUN_STATUSES = {"starting", "working", "stopping"}
 REAPABLE_RUN_STATUSES = {"idle", "error", "stopped"}
 MAX_BODY_BYTES = 64 * 1024
+MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING = "medium"
 ALLOWED_MODELS = ("gpt-5.6-sol", "gpt-5.6-terra")
@@ -70,6 +72,7 @@ PDF_TO_DOCX = REPO_ROOT / "tools" / "pdf2docx.ps1"
 DOCX_TO_PDF = REPO_ROOT / "tools" / "docx2pdf.ps1"
 LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "OgentLite"
 WORK_ROOT = LOCAL_DATA / "work"
+IMPORT_ROOT = LOCAL_DATA / "imports"
 RECENT_PATH = LOCAL_DATA / "recent.json"
 SERVER_INFO_PATH = LOCAL_DATA / "server.json"
 
@@ -102,6 +105,30 @@ def json_bytes(value: Any) -> bytes:
 def safe_name(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
     return cleaned[:80] or "document"
+
+
+def safe_upload_filename(value: str) -> str:
+    leaf = Path(value.replace("\\", "/")).name.strip()
+    suffix = Path(leaf).suffix.lower()
+    if suffix not in SUPPORTED_UPLOADS:
+        raise UserFacingError(
+            "Drop a .docx, .xlsx, .pptx, or .pdf file.",
+            415,
+        )
+    stem = leaf[: -len(suffix)] if suffix else leaf
+    stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "-", stem).strip(" .")
+    if not stem:
+        stem = "document"
+    if stem.casefold() in {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }:
+        stem = f"_{stem}"
+    return f"{stem[:160]}{suffix}"
 
 
 def path_is_within(path: Path, root: Path) -> bool:
@@ -2427,6 +2454,27 @@ HTML_TEMPLATE = r"""<!doctype html>
       letter-spacing: .08em;
     }
     .open-panel { padding: 12px 14px; border-bottom: 1px solid var(--line); background: var(--soft); }
+    .drop-target {
+      width: 100%; display: flex; align-items: center; justify-content: center; gap: 7px;
+      margin: 0 0 9px; padding: 10px 12px; border: 1.5px dashed color-mix(in srgb, var(--teal) 58%, var(--line));
+      border-radius: 10px; background: color-mix(in srgb, var(--teal) 7%, var(--panel));
+      color: var(--ink); text-align: center;
+    }
+    .drop-target strong { color: var(--teal); font-size: 12px; }
+    .drop-target span { color: var(--muted); font-size: 10px; }
+    .drop-target:hover, .drop-target:focus-visible {
+      border-color: var(--teal); background: color-mix(in srgb, var(--teal) 13%, var(--panel));
+      outline: none;
+    }
+    .drop-target:disabled { opacity: .52; cursor: default; }
+    .file-input { display: none; }
+    .open-divider {
+      display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
+      color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .06em;
+    }
+    .open-divider::before, .open-divider::after {
+      content: ""; height: 1px; flex: 1; background: var(--line);
+    }
     .open-line { display: flex; gap: 7px; }
     .path-field, .recent-select {
       width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 9px;
@@ -2503,6 +2551,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       pointer-events: none; transition: .18s ease;
     }
     .toast.show { opacity: 1; transform: translateY(0); }
+    .drop-overlay {
+      position: fixed; inset: 12px; z-index: 40; display: none; place-items: center;
+      border: 3px dashed #5eead4; border-radius: 22px;
+      background: rgba(14,34,53,.91); color: #fff; pointer-events: none;
+      box-shadow: 0 24px 80px rgba(0,0,0,.35);
+    }
+    .drop-overlay.visible { display: grid; }
+    .drop-overlay-card { text-align: center; padding: 32px; }
+    .drop-overlay-card strong { display: block; font-size: 26px; margin-bottom: 8px; }
+    .drop-overlay-card span { color: #c8f7f1; font-size: 13px; }
     @media (max-width: 820px) {
       :root { --left: 58%; }
       .chat-pane { min-width: 300px; }
@@ -2561,7 +2619,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             </svg>
           </div>
           <h1>Your document, live.</h1>
-          <p>Paste a Word, Excel, or PowerPoint path on the right. Ogent creates a protected working copy, opens it here, and keeps every AI edit visible.</p>
+          <p>Drag a Word, Excel, PowerPoint, or PDF file anywhere into Ogent. A protected local copy opens here while your original stays untouched.</p>
         </div>
         <iframe id="preview" title="OfficeCLI live preview"></iframe>
       </div>
@@ -2576,6 +2634,12 @@ HTML_TEMPLATE = r"""<!doctype html>
         <span class="lite-badge">LITE</span>
       </header>
       <section class="open-panel" aria-label="Open document">
+        <button class="drop-target" id="dropTarget" type="button">
+          <strong>Drop a file here</strong>
+          <span>or click to choose · DOCX, XLSX, PPTX, PDF</span>
+        </button>
+        <input class="file-input" id="fileInput" type="file" accept=".docx,.xlsx,.pptx,.pdf">
+        <div class="open-divider">or open by path</div>
         <div class="open-line">
           <input class="path-field" id="pathInput" type="text" placeholder="D:\Reports\document.docx" autocomplete="off">
           <button class="secondary" id="browseButton" type="button">Browse…</button>
@@ -2620,10 +2684,17 @@ HTML_TEMPLATE = r"""<!doctype html>
       </section>
     </aside>
   </main>
+  <div class="drop-overlay" id="dropOverlay" aria-hidden="true">
+    <div class="drop-overlay-card">
+      <strong>Drop to open in Ogent</strong>
+      <span>Your original file will remain untouched.</span>
+    </div>
+  </div>
   <div class="toast" id="toast" role="status"></div>
   <script nonce="__NONCE__">
     const TOKEN = "__TOKEN__";
     const SESSION_ID = "__SESSION_ID__";
+    const MAX_UPLOAD_SIZE = 128 * 1024 * 1024;
     const CLIENT_ID =
       (globalThis.crypto && crypto.randomUUID)
         ? crypto.randomUUID()
@@ -2633,6 +2704,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       path: document.getElementById("pathInput"),
       open: document.getElementById("openButton"),
       browse: document.getElementById("browseButton"),
+      drop: document.getElementById("dropTarget"),
+      file: document.getElementById("fileInput"),
+      dropOverlay: document.getElementById("dropOverlay"),
       recent: document.getElementById("recentSelect"),
       session: document.getElementById("sessionSelect"),
       newWindow: document.getElementById("newWindowButton"),
@@ -2666,6 +2740,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       transcript: []
     };
     let repairing = false;
+    let uploadBusy = false;
+    let dragDepth = 0;
     let toastTimer = null;
     let closeSent = false;
 
@@ -2793,15 +2869,18 @@ HTML_TEMPLATE = r"""<!doctype html>
       state.run_status = status;
       const busy = ["starting", "working", "stopping"].includes(status);
       const snapshotBusy = Boolean(state.snapshot_in_progress);
+      const interactionBusy = busy || snapshotBusy || uploadBusy;
       elements.stop.disabled = !busy;
-      elements.send.disabled = busy || snapshotBusy;
-      elements.open.disabled = busy || snapshotBusy;
-      elements.browse.disabled = busy || snapshotBusy;
-      elements.model.disabled = busy;
-      elements.reasoning.disabled = busy;
-      elements.wordView.disabled = busy || snapshotBusy;
+      elements.send.disabled = interactionBusy;
+      elements.open.disabled = interactionBusy;
+      elements.browse.disabled = interactionBusy;
+      elements.drop.disabled = interactionBusy;
+      elements.model.disabled = busy || uploadBusy;
+      elements.reasoning.disabled = busy || uploadBusy;
+      elements.wordView.disabled = interactionBusy;
       elements.statusDot.className = `status-dot ${busy ? "busy" : status === "error" ? "error" : state.watch_alive ? "ready" : ""}`;
       elements.statusText.textContent =
+        uploadBusy ? "Importing file…" :
         snapshotBusy ? "Rendering Word view…" :
         status === "working" ? "Codex is editing…" :
         status === "starting" ? "Starting Codex…" :
@@ -2879,32 +2958,116 @@ HTML_TEMPLATE = r"""<!doctype html>
       setRunStatus(state.run_status || "idle");
     };
 
+    function applyOpenResult(result) {
+      if (result.action === "focus_session" && result.session_id) {
+        window.location.assign(`/?s=${encodeURIComponent(result.session_id)}`);
+        return;
+      }
+      if (result.action === "pdf_import") {
+        showToast(result.message || "Preparing a protected PDF working copy.");
+        return;
+      }
+      state.active_document = result.active_document;
+      state.watch_url = result.watch_url || null;
+      state.complex_layout = Boolean(result.complex_layout);
+      state.complex_layout_detail = result.complex_layout_detail || null;
+      state.watch_alive = true;
+      setPreview(result.active_document, `${result.watch_url}?v=${Date.now()}`);
+      showToast(
+        result.uploaded
+          ? `${result.uploaded_name} opened from a protected local copy.`
+          : "Working copy opened. The source remains untouched."
+      );
+    }
+
     async function openDocument() {
       const path = elements.path.value.trim();
       if (!path) return showToast("Paste an absolute document path.");
       try {
         elements.open.disabled = true;
-        const result = await api("/open", { method: "POST", body: JSON.stringify({ path }) });
-        if (result.action === "focus_session" && result.session_id) {
-          window.location.assign(`/?s=${encodeURIComponent(result.session_id)}`);
-          return;
-        }
-        if (result.action === "pdf_import") {
-          showToast(result.message || "Preparing a protected PDF working copy.");
-          return;
-        }
-        state.active_document = result.active_document;
-        state.watch_url = result.watch_url || null;
-        state.complex_layout = Boolean(result.complex_layout);
-        state.complex_layout_detail = result.complex_layout_detail || null;
-        state.watch_alive = true;
-        setPreview(result.active_document, `${result.watch_url}?v=${Date.now()}`);
-        showToast("Working copy opened. The source remains untouched.");
+        const result = await api("/open", {
+          method: "POST",
+          body: JSON.stringify({ path })
+        });
+        applyOpenResult(result);
       } catch (error) {
         showToast(error.message);
       } finally {
         setRunStatus(state.run_status || "idle");
       }
+    }
+
+    function supportedDrop(file) {
+      return /\.(docx|xlsx|pptx|pdf)$/i.test(file.name || "");
+    }
+
+    async function uploadFile(file) {
+      if (!file) return;
+      if (!supportedDrop(file)) {
+        showToast("Drop a .docx, .xlsx, .pptx, or .pdf file.");
+        return;
+      }
+      if (!file.size) {
+        showToast("The dropped file is empty.");
+        return;
+      }
+      if (file.size > MAX_UPLOAD_SIZE) {
+        showToast("The dropped file exceeds Ogent's 128 MB limit.");
+        return;
+      }
+      if (uploadBusy) {
+        showToast("Ogent is already importing a file.");
+        return;
+      }
+      uploadBusy = true;
+      setRunStatus(state.run_status || "idle");
+      showToast(`Importing ${file.name}…`);
+      try {
+        const result = await api("/upload", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Ogent-Filename": encodeURIComponent(file.name)
+          },
+          body: file
+        });
+        applyOpenResult(result);
+      } catch (error) {
+        showToast(error.message);
+      } finally {
+        uploadBusy = false;
+        elements.file.value = "";
+        setRunStatus(state.run_status || "idle");
+      }
+    }
+
+    function filesFromDrag(event) {
+      return Array.from(event.dataTransfer?.files || []);
+    }
+
+    function hasDraggedFiles(event) {
+      return Array.from(event.dataTransfer?.types || []).includes("Files");
+    }
+
+    function showDropOverlay() {
+      if (uploadBusy) return;
+      elements.dropOverlay.classList.add("visible");
+      elements.dropOverlay.setAttribute("aria-hidden", "false");
+    }
+
+    function hideDropOverlay() {
+      dragDepth = 0;
+      elements.dropOverlay.classList.remove("visible");
+      elements.dropOverlay.setAttribute("aria-hidden", "true");
+    }
+
+    function acceptDroppedFiles(files) {
+      if (!files.length) return;
+      if (files.length > 1) {
+        showToast("Drop one document at a time.");
+        return;
+      }
+      uploadFile(files[0]);
     }
 
     async function browseDocument() {
@@ -3000,6 +3163,43 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     elements.open.addEventListener("click", openDocument);
     elements.browse.addEventListener("click", browseDocument);
+    elements.drop.addEventListener("click", () => elements.file.click());
+    elements.drop.addEventListener("dragover", event => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    });
+    elements.drop.addEventListener("drop", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      hideDropOverlay();
+      acceptDroppedFiles(filesFromDrag(event));
+    });
+    elements.file.addEventListener("change", () => {
+      acceptDroppedFiles(Array.from(elements.file.files || []));
+    });
+    window.addEventListener("dragenter", event => {
+      if (!hasDraggedFiles(event)) return;
+      event.preventDefault();
+      dragDepth += 1;
+      showDropOverlay();
+    });
+    window.addEventListener("dragover", event => {
+      if (!hasDraggedFiles(event)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      showDropOverlay();
+    });
+    window.addEventListener("dragleave", event => {
+      if (!hasDraggedFiles(event)) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) hideDropOverlay();
+    });
+    window.addEventListener("drop", event => {
+      if (!hasDraggedFiles(event)) return;
+      event.preventDefault();
+      hideDropOverlay();
+      acceptDroppedFiles(filesFromDrag(event));
+    });
     elements.send.addEventListener("click", sendMessage);
     elements.stop.addEventListener("click", stopRun);
     elements.wordView.addEventListener("click", openWordView);
@@ -3115,6 +3315,54 @@ class OgentHandler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise UserFacingError("Request body must be a JSON object.")
         return value
+
+    def _read_upload(self, session: SessionState) -> tuple[Path, str]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise UserFacingError("Invalid upload size.") from None
+        if length <= 0:
+            raise UserFacingError("The dropped file is empty.")
+        if length > MAX_UPLOAD_BYTES:
+            raise UserFacingError(
+                f"The dropped file exceeds Ogent's {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+                413,
+            )
+
+        encoded_name = self.headers.get("X-Ogent-Filename", "").strip()
+        if not encoded_name or len(encoded_name) > 2048:
+            raise UserFacingError("The dropped file has no valid filename.")
+        try:
+            original_name = urllib.parse.unquote(
+                encoded_name,
+                encoding="utf-8",
+                errors="strict",
+            )
+        except UnicodeError:
+            raise UserFacingError("The dropped filename is not valid UTF-8.") from None
+        filename = safe_upload_filename(original_name)
+
+        import_dir = IMPORT_ROOT / session.session_id / uuid.uuid4().hex
+        import_dir.mkdir(parents=True, exist_ok=False)
+        target = import_dir / filename
+        temporary = import_dir / f".{filename}.uploading"
+        remaining = length
+        try:
+            with temporary.open("xb") as output:
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise UserFacingError("The file upload ended unexpectedly.", 400)
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            os.replace(temporary, target)
+        except Exception:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            with contextlib.suppress(OSError):
+                import_dir.rmdir()
+            raise
+        return target, Path(original_name.replace("\\", "/")).name
 
     def _authorized(self) -> bool:
         token = self.headers.get("X-Ogent-Token", "")
@@ -3287,6 +3535,7 @@ class OgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        document_open_route = parsed.path in {"/open", "/upload"}
         if parsed.path == "/session/close":
             query = urllib.parse.parse_qs(parsed.query)
             token = str((query.get("token") or [""])[0])
@@ -3317,8 +3566,8 @@ class OgentHandler(BaseHTTPRequestHandler):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             session, created_for_request = self._session_for_post()
-            created_for_open = parsed.path == "/open" and created_for_request
-            if parsed.path == "/open":
+            created_for_open = document_open_route and created_for_request
+            if document_open_route:
                 with session.lock:
                     busy = session.run_status in ACTIVE_RUN_STATUSES
                     snapshot_busy = session.snapshot_in_progress
@@ -3332,8 +3581,22 @@ class OgentHandler(BaseHTTPRequestHandler):
                         "Word view is still being generated. Wait for it to finish.",
                         409,
                     )
-                payload = self._read_json()
-                result = dispatch_open_path(session, str(payload.get("path", "")))
+                if parsed.path == "/open":
+                    payload = self._read_json()
+                    result = dispatch_open_path(
+                        session,
+                        str(payload.get("path", "")),
+                    )
+                else:
+                    uploaded_path, original_name = self._read_upload(session)
+                    result = dispatch_open_path(session, str(uploaded_path))
+                    result.update(
+                        {
+                            "uploaded": True,
+                            "uploaded_name": original_name,
+                            "import_source": str(uploaded_path),
+                        }
+                    )
                 if created_for_open and result.get("action") == "focus_session":
                     close_session(session)
                 self._send_json(200, result)
@@ -3392,7 +3655,7 @@ class OgentHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(404, {"error": "Not found."})
         except UserFacingError as exc:
-            if parsed.path == "/open" and session is not None:
+            if document_open_route and session is not None:
                 if created_for_open:
                     close_session(session)
                 else:
@@ -3401,7 +3664,7 @@ class OgentHandler(BaseHTTPRequestHandler):
                     session.add_message("assistant", str(exc))
             error_payload = {"error": str(exc)}
             if (
-                parsed.path == "/open"
+                document_open_route
                 and session is not None
                 and not created_for_open
             ):
@@ -3415,7 +3678,7 @@ class OgentHandler(BaseHTTPRequestHandler):
                 else:
                     with session.lock:
                         session.last_error = str(exc)
-                if parsed.path == "/open" and not created_for_open:
+                if document_open_route and not created_for_open:
                     session.add_message("assistant", message)
             self._send_json(500, {"error": message})
 
@@ -3671,6 +3934,7 @@ def main() -> int:
 
     LOCAL_DATA.mkdir(parents=True, exist_ok=True)
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    IMPORT_ROOT.mkdir(parents=True, exist_ok=True)
     if args.register_shell:
         try:
             register_shell_integration()

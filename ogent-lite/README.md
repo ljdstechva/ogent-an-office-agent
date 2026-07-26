@@ -10,16 +10,21 @@ editing requests in the chat pane on the right.
 
 It runs entirely on `127.0.0.1`, uses the existing Codex CLI login, and does not
 need a new API key. Source documents are never edited directly. Every opened
-Office file is copied to `%LOCALAPPDATA%\OgentLite\work\` first.
+Office file is copied to `%LOCALAPPDATA%\OgentLite\work\` first. Files dropped
+into the browser are also preserved byte-for-byte under
+`%LOCALAPPDATA%\OgentLite\imports\` before the working copy is created.
 
 For the AI-agent installation sentence and complete human setup, see the
 [repository README](../README.md).
 
 ## Start
 
+- Drag a `.docx`, `.xlsx`, `.pptx`, or `.pdf` anywhere into the running Ogent
+  window. The drop area can also be clicked to choose a file.
 - Double-click `ogent.cmd` in this folder.
 - Or double-click the optional **Ogent** desktop shortcut after creating it
-  with the instructions in the repository README.
+  with the instructions in the repository README. You can drag one supported
+  file onto that shortcut to launch and open it immediately.
 - Or right-click a supported Office file and select **Open in Ogent** after
   registering the Explorer integration below.
 
@@ -63,17 +68,18 @@ an older icon, run `ie4uinit.exe -show` or restart Explorer to refresh its cache
 
 ## Daily recipe
 
-1. Start Ogent, paste the absolute `.docx`, `.xlsx`, or `.pptx` path, and click **Open**.
+1. Start Ogent and drag a `.docx`, `.xlsx`, `.pptx`, or `.pdf` anywhere into
+   the window. You can still paste an absolute path and click **Open**.
 2. Choose the model and reasoning effort, describe the change, and review it live on the left.
 3. Use **+ New window** for another document. The session dropdown switches
    among open workspaces without merging their documents or chats.
 4. For a complex DOCX, use **Word view** when exact floating-shape placement
    matters. It opens a Microsoft Word-rendered PDF in a new browser tab.
 
-For PDFs, start with “Edit my PDF,” then paste its absolute path. Ogent copies the
-PDF, converts the copy to a working DOCX through the Word-first pipeline, and
-opens that DOCX for editing. Complex PDF reflow may still need layout cleanup;
-image-only PDFs require OCR.
+For PDFs, drag the PDF into Ogent or start with “Edit my PDF,” then paste its
+absolute path. Ogent copies the PDF, converts the copy to a working DOCX through
+the Word-first pipeline, and opens that DOCX for editing. Complex PDF reflow may
+still need layout cleanup; image-only PDFs require OCR.
 
 ## Stop
 
@@ -116,6 +122,7 @@ automation process for forced cleanup if that window expires.
 | Item | Location |
 |---|---|
 | Recent paths | `%LOCALAPPDATA%\OgentLite\recent.json` |
+| Browser drag/drop imports | `%LOCALAPPDATA%\OgentLite\imports\` |
 | Protected working copies | `%LOCALAPPDATA%\OgentLite\work\` |
 | Running-server record | `%LOCALAPPDATA%\OgentLite\server.json` |
 
@@ -175,6 +182,8 @@ dot in `#14b8a6`.
 
 - Localhost only; no telemetry or external web assets.
 - No direct edits to source documents.
+- Browser drag/drop accepts one DOCX, XLSX, PPTX, or PDF at a time, up to
+  128 MB, and retains a local import copy until the user removes it.
 - One active document and one Codex run per session; sessions are independent.
 - Excel live preview does not support click-to-select paths.
 - PDF editing happens in a converted DOCX, never in the PDF itself.
