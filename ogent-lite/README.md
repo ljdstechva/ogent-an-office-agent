@@ -4,7 +4,7 @@
 
 # Ogent Lite
 
-Ogent Lite is a featherweight, local document workspace: OfficeCLI keeps a live
+Ogent Lite 0.8.0 is a featherweight, local document workspace: OfficeCLI keeps a live
 Word, Excel, or PowerPoint preview on the left, while Codex handles plain-language
 editing requests in the chat pane on the right.
 
@@ -13,6 +13,8 @@ need a new API key. Source documents are never edited directly. Every opened
 Office file is copied to `%LOCALAPPDATA%\OgentLite\work\` first. Files dropped
 into the browser are also preserved byte-for-byte under
 `%LOCALAPPDATA%\OgentLite\imports\` before the working copy is created.
+Files attached at the chat composer follow a separate, temporary read-only
+reference lifecycle and never become active documents.
 
 For the AI-agent installation sentence and complete human setup, see the
 [repository README](../README.md).
@@ -75,11 +77,45 @@ an older icon, run `ie4uinit.exe -show` or restart Explorer to refresh its cache
    among open workspaces without merging their documents or chats.
 4. For a complex DOCX, use **Word view** when exact floating-shape placement
    matters. It opens a Microsoft Word-rendered PDF in a new browser tab.
+5. To analyze supporting material, click the paperclip or drop files on the
+   composer. A composer drop attaches a temporary reference; a drop elsewhere
+   opens a protected working document.
 
 For PDFs, drag the PDF into Ogent or start with “Edit my PDF,” then paste its
 absolute path. Ogent copies the PDF, converts the copy to a working DOCX through
 the Word-first pipeline, and opens that DOCX for editing. Complex PDF reflow may
 still need layout cleanup; image-only PDFs require OCR.
+
+## Temporary read-only references
+
+The chat composer accepts multiple DOCX, XLSX, PPTX, PDF, TXT, Markdown, CSV,
+PNG, JPEG, WebP, BMP, and TIFF references. Limits are five files per run,
+50 MB per file, 100 MB combined, and 25 pages per PDF. Ogent validates file
+content and signatures; it rejects empty, malformed, mismatched, executable,
+archive, legacy Office, and over-limit inputs with an actionable Failed state.
+
+References may be sent with typed instructions or by pressing **Send** with an
+empty message. The latter uses: `Read and analyze the attached reference files.
+Summarize the important findings.` Once sent, those chips are locked to that
+run. New attachments remain removable and belong to the next run.
+
+OfficeCLI performs only read operations on Office references. Searchable PDF
+text is extracted with page headings. Scanned or low-text PDF pages, supported
+images, and visually requested Office content are normalized into bounded
+temporary images and passed through Codex's image interface for OCR and visual
+interpretation. Ogent does not use an external OCR service.
+
+Every upload, extraction, rendered page, and manifest stays under
+`%LOCALAPPDATA%\OgentLite\temporary-references\`. Ogent deletes a claimed run
+directory after success, Codex error, Stop, or preparation failure; Remove,
+Clear all, session cleanup, and backend shutdown delete their corresponding
+files. Startup removes abandoned contents after a prior crash. Cleanup happens
+only after owned preprocessing, Office, or Codex processes release the files.
+
+This is ordinary best-effort local deletion, not secure forensic erasure on
+NTFS, SSDs, backups, antivirus caches, or synchronized storage. **References
+are temporary local copies and are deleted after this run. Their contents are
+sent to Codex for analysis and may remain in the Codex conversation context.**
 
 ## Stop
 
@@ -124,15 +160,25 @@ automation process for forced cleanup if that window expires.
 | Recent paths | `%LOCALAPPDATA%\OgentLite\recent.json` |
 | Browser drag/drop imports | `%LOCALAPPDATA%\OgentLite\imports\` |
 | Protected working copies | `%LOCALAPPDATA%\OgentLite\work\` |
+| Temporary chat references | `%LOCALAPPDATA%\OgentLite\temporary-references\` |
 | Running-server record | `%LOCALAPPDATA%\OgentLite\server.json` |
 
 Recent paths and working documents stay local and are excluded from Git.
+Temporary references are not written to recents or the active-document index.
 
 ## Requirements
 
 - Windows 11 with Python 3 (`py -3 --version`)
 - OfficeCLI (`officecli --version`)
 - Codex CLI signed in (`codex --version`)
+- Pinned Python packages:
+
+  ```powershell
+  py -3 -m pip install -r '.\requirements.txt'
+  ```
+
+  The tested pins are pypdfium2 5.12.1 for PDF inspection/rendering and
+  Pillow 12.1.1 for image validation/normalization.
 
 Ogent defaults to `gpt-5.6-sol` with medium reasoning and allows one document
 run at a time per session.
@@ -176,14 +222,24 @@ dot in `#14b8a6`.
 | Complex DOCX preview looks incomplete | The live HTML view approximates some floating shapes. Click **Word view** and verify before concluding content is missing. |
 | PDF opens with broken spacing | PDF Reflow preserved editable content but not exact layout; clean up the working DOCX or use the original source document. |
 | PDF reports that OCR is needed | The PDF is image-only. Run OCR first, then import the searchable PDF. |
+| A reference says Failed | Check the extension and file content, then confirm the 50 MB/file, 100 MB/run, five-file, and 25-page PDF limits. Rejected uploads are removed. |
+| Reference PDF/image preparation is unavailable | Run `py -3 -m pip install -r .\requirements.txt`, restart Ogent, and attach the file again. |
+| A visual Office reference cannot render | Text extraction can still work. Microsoft Office or LibreOffice is required for the optional temporary visual export; attach a PDF export if exact visual analysis is essential. |
+| Files remain after an abnormal crash | Restart Ogent once. Startup clears the abandoned temporary-reference root before accepting sessions. |
 | A run is taking too long | Click **Stop**; Ogent terminates the active Codex child process tree. |
 
 ## Privacy and limits
 
 - Localhost only; no telemetry or external web assets.
 - No direct edits to source documents.
+- Composer references never become active documents, watches, recents, dedupe
+  entries, or final outputs. Their browser metadata contains no temporary path.
+- Reference contents are sent to Codex. Local deletion does not remove facts
+  already present in the Codex conversation context.
 - Browser drag/drop accepts one DOCX, XLSX, PPTX, or PDF at a time, up to
   128 MB, and retains a local import copy until the user removes it.
+- Composer references accept up to five supported files per run, 50 MB each,
+  100 MB combined, and 25 pages per PDF.
 - One active document and one Codex run per session; sessions are independent.
 - Excel live preview does not support click-to-select paths.
 - PDF editing happens in a converted DOCX, never in the PDF itself.

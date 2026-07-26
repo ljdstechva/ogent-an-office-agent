@@ -429,3 +429,141 @@ was performed.
 - Image-only PDFs still stop with `needs OCR`; PDF editing still occurs in a
   converted DOCX.
 - Word view remains the fidelity check for complex floating Word layouts.
+
+## v0.8.0 - temporary read-only chat references
+
+Verified on 2026-07-26 with Windows 11, Python 3.14.3, pypdfium2 5.12.1,
+Pillow 12.1.1, OfficeCLI 1.0.142, Codex CLI 0.145.0, Microsoft Office,
+Microsoft Edge, Playwright CLI, and GPT-5.6 Sol with Max reasoning.
+
+### Architecture delivered
+
+- Composer references use dedicated `/reference/upload`, `/reference/remove`,
+  and `/reference/clear` routes. They do not reuse the active-document
+  `/upload` route.
+- Every session owns an isolated pending set. Send atomically moves that set
+  from a random pending directory into one random run directory; uploads made
+  while the run works remain pending for the next run.
+- Browser state exposes only attachment ID, sanitized filename, byte size,
+  detected kind, status, and safe error text. Temporary absolute paths remain
+  server-side.
+- Upload reservations make the five-file and 100 MB combined limits atomic
+  under concurrent requests. Inspection runs in a killable Python helper so
+  native ZIP, PDFium, and image decoders do not execute inside the HTTP server.
+- The validator checks actual PDF, OOXML, text-encoding, and image content. It
+  also rejects ZIP prefix tricks, traversal or duplicate members, embedded
+  executables, macros, ActiveX/OLE payloads, excessive expansion, oversized
+  images, unsupported types, empty files, and extension/signature mismatches.
+- `ogent_references.py` performs bounded extraction and rendering. OfficeCLI is
+  restricted to read-only `view ... text`; searchable PDF text is grouped under
+  page headings; scanned/low-text pages and images become normalized PNG inputs.
+  Visually requested Office files export only inside the run directory, then
+  render to PNG.
+- Codex receives repeated image arguments before positional arguments, with an
+  explicit `--` boundary for the installed CLI's variadic new-run image option.
+  Reference runs use a fresh thread, workspace-write only inside the temporary
+  run, and a prompt that treats all reference content as untrusted evidence.
+- One path-contained, idempotent deletion primitive removes uploads and every
+  derived artifact. Terminal cleanup runs after owned preprocessing, Office,
+  and Codex processes release their files. Startup clears crash leftovers only
+  after Ogent owns the selected listener.
+
+### Automated verification
+
+`py -3 -m unittest discover -s ogent-lite/tests -v` passed all 26 tests in
+15.8 seconds. The reference coverage includes:
+
+- active-document isolation, no recents/dedupe/watch changes, safe browser
+  metadata, filename normalization, and manual Remove/Clear;
+- empty, malformed, mismatched, embedded-OLE, prefixed-ZIP, oversized,
+  over-page-limit, traversal-name, unsupported, and truncated upload rejection;
+- five simultaneous successful reservations with the sixth rejected;
+- frozen-run versus next-run attachment ownership;
+- two-session metadata, preparation, findings, and transcript isolation;
+- analysis-only success, direct image/PDF rendering, Codex failure,
+  preprocessing failure, Stop, close, retryable cleanup failure, crash-root
+  reset, and outside-root deletion refusal;
+- correct new/resumed Codex image argument placement; and
+- the eight pre-existing shell/open/upload regressions.
+
+The following checks also passed:
+
+```text
+py -3 -m py_compile ogent-lite\ogent.py ogent-lite\ogent_references.py
+py -3 -m ruff check ogent-lite/ogent.py ogent-lite/ogent_references.py ogent-lite/tests
+PowerShell parse of tools\office-reference-to-pdf.ps1
+git diff --check
+```
+
+### Edge and live GPT acceptance
+
+| Check | Result |
+|---|---|
+| Composer DOCX drop | PASS: `marker-reference.docx` produced a Ready chip while the left pane remained `No document open`; recents, dedupe state, and preview were unchanged. |
+| Paperclip and multiple files | PASS: the native browser file chooser attached a long TXT filename; a three-file composer drop produced five Ready chips total. The long name ellipsized without hiding its accessible full name. |
+| Drag isolation | PASS: a synthetic file drag set `defaultPrevented=true`, added the composer highlight, suppressed the whole-page overlay, and displayed `Drop to attach as temporary references`. |
+| Error state | PASS: a false `.pdf` displayed a red Failed chip with `The file extension does not match a PDF with a valid %PDF signature.` The server left no rejected upload artifact. |
+| Responsive themes | PASS: 1440 × 900 light, 760 × 900 narrow, and 1440 × 900 dark captures showed no clipping, overlap, blank panel, or broken control. |
+| Active document + DOCX reference | PASS: GPT-5.6 Sol Max read `DOCX-REFERENCE-MARKER-7429` and appended only `ACTIVE-DOC-EDIT-FROM-REFERENCE-7429` to the protected working DOCX. OfficeCLI readback found the exact final paragraph and validation returned no errors. The original DOCX and reference hashes were unchanged. |
+| Empty-message searchable PDF | PASS: Ogent supplied the documented default request. GPT-5.6 Sol Max reported both unique markers from `searchable-reference.pdf`, cited page 1, and stated that searchable extracted text—not OCR—was used. No Office document was created. |
+| Scanned PDF OCR | PASS: GPT-5.6 Sol Max read `Intake Review Process Flow` from page 1 of an image-only PDF and explicitly identified it as OCR with no searchable extracted text. |
+| Direct image vision | PASS: from `process-flow-qa.png`, GPT-5.6 Sol Max inferred Yes → Archive and No → Revise → Review again. |
+| Frozen versus next run | PASS: the scanned PDF and PNG chips were locked as OCR/vision during their run. A TXT attached while they worked stayed Ready and removable; terminal cleanup deleted only the frozen run. |
+| Stop | PASS: Stop terminated a real Codex reference run, produced `Stopped. No further agent work is running.`, then `Temporary references deleted.`, with an empty reference root and no Codex child. |
+| Crash recovery | PASS: a force-killed isolated server left one pending upload. Restarting v0.8.0 recreated an empty reference root before accepting sessions. |
+| Shutdown and reap | PASS: shutdown deleted a pending reference. A four-second test grace reaped a disconnected session, stopped its exact OfficeCLI watch, and left an empty reference root. |
+| Office visual reference | PASS: a disposable PPTX copy produced OfficeCLI-labeled extracted text, a temporary PDF, and one visually correct rendered slide. Source and temporary-copy SHA-256 hashes matched, and PowerPoint exited. |
+
+The local, Git-ignored visual evidence is under
+`output\ogent-reference-acceptance\` with descriptive light, dark, narrow,
+drag-highlight, error-state, and frozen-run filenames.
+
+The first scanned-PDF/image attempt found a real installed-CLI edge case:
+`codex exec -i <file>...` greedily consumed the positional prompt. The command
+builder now inserts `--` before a new-run prompt. Targeted tests and the repeated
+live vision run passed after that correction.
+
+### Existing-workflow regression evidence
+
+- Whole-page drop still opened a protected Word working copy with its connected
+  preview; composer drop of the same document type did not open it.
+- Paste-path open displayed the expected Word fixture. Word view produced a
+  Microsoft Word-rendered PDF tab.
+- Whole-page drop of the searchable PDF preserved the source, converted it to a
+  validated working DOCX, and exposed both unique text markers through
+  `officecli view`.
+- The native Browse button launched the topmost `Open in Ogent` Windows picker;
+  the current automation capture canceled it after verifying the dialog. The
+  earlier v0.5 matrix remains the full file-selection baseline.
+- The registered DOCX/XLSX/PPTX commands still contain the exact Python,
+  `ogent.py --open "%1"`, icon, and `Position=Top` values. A warm shell-route
+  call opened the PowerPoint fixture as a protected document.
+- Model and all six reasoning choices remained present; the live reference runs
+  used GPT-5.6 Sol Max.
+- A short isolated idle timeout exited the empty backend, removed
+  `server.json`, and closed port 8765.
+
+### Integrity and process evidence
+
+Pre/post SHA-256 hashes matched for the Word, Excel, PowerPoint, PNG, DOCX
+reference, searchable PDF, and scanned PDF fixtures. The final process audit
+found no Ogent server, Codex run, OfficeCLI watch, Office-reference helper,
+Word, Excel, PowerPoint, PDF-rendering, or OCR process owned by the test.
+
+### Privacy and remaining limits
+
+- Reference deletion is best-effort local deletion, not forensic erasure from
+  NTFS, SSDs, backups, antivirus caches, or synchronized storage.
+- Deleting local reference files does not remove their contents from an
+  existing Codex conversation context.
+- OCR and visual findings are model interpretations. Ogent labels them and
+  requires the answer not to claim unreadable or unprocessed content was read.
+- Visual Office reference export requires Microsoft Office or LibreOffice.
+  Text-only Office extraction remains available through OfficeCLI.
+- PDF references stop at 25 pages and image/renderer limits are intentionally
+  conservative; Ogent rejects over-limit material instead of truncating it.
+
+Final v0.8.0 acceptance state: all isolated test servers and owned child
+processes are stopped, the right-click registration remains enabled, sources
+are unchanged, unrelated worktree files remain untouched, and no public push
+was performed.

@@ -9,7 +9,7 @@ files with plain-language instructions. It places an OfficeCLI live preview
 beside a Codex chat, runs on `127.0.0.1`, and creates a protected working copy
 before any edit touches a document.
 
-The current app is **Ogent Lite 0.7.0**. It uses your existing Codex CLI login,
+The current app is **Ogent Lite 0.8.0**. It uses your existing Codex CLI login,
 so it does not require a separate OpenAI API key. Ogent is open source under the
 [MIT License](LICENSE).
 
@@ -21,7 +21,7 @@ Copy and paste this one sentence into Codex or another local AI agent that can
 run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.7.0; drag disposable DOCX, XLSX, PPTX, and searchable PDF files into the browser and one DOCX onto the desktop shortcut; confirm protected import and working copies, live previews, valid Office output, and unchanged source hashes; verify the session switcher, model and reasoning selectors, Word view button, and automatic tab cleanup; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.8.0; drag disposable DOCX, XLSX, PPTX, and searchable PDF files into the browser and one DOCX onto the desktop shortcut; attach disposable Office, PDF, text, and image files at the chat composer and confirm they remain read-only, work with and without an active document, and are deleted after each run; confirm protected import and working copies, live previews, valid Office output, unchanged source hashes, the session switcher, model and reasoning selectors, Word view button, Stop, and automatic tab cleanup; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
 ```
 
 The prompt deliberately leaves sign-in and elevation with the human and never
@@ -45,7 +45,13 @@ asks for a password, token, or API key.
    Set-Location '.\ogent-an-office-agent'
    ```
 
-3. Install [OpenAI Codex CLI](https://github.com/openai/codex), then sign in
+3. Install the pinned PDF and image packages:
+
+   ```powershell
+   py -3 -m pip install -r '.\ogent-lite\requirements.txt'
+   ```
+
+4. Install [OpenAI Codex CLI](https://github.com/openai/codex), then sign in
    interactively with ChatGPT:
 
    ```powershell
@@ -54,14 +60,14 @@ asks for a password, token, or API key.
    codex
    ```
 
-4. Install [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI):
+5. Install [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI):
 
    ```powershell
    irm https://d.officecli.ai/install.ps1 | iex
    officecli --version
    ```
 
-5. Register **Open in Ogent** for your Windows account and launch the app:
+6. Register **Open in Ogent** for your Windows account and launch the app:
 
    ```powershell
    Set-Location '.\ogent-lite'
@@ -120,6 +126,35 @@ Ogent with that file immediately.
 5. For a DOCX with floating shapes or textboxes, click **Word view** for an
    on-demand PDF rendered by Microsoft Word. The normal live preview stays
    faster and editable; Word view is the layout-accurate verification surface.
+
+### Analyze temporary chat references
+
+Use the paperclip or drop files directly on the chat composer to attach
+temporary, read-only evidence. This is intentionally different from dropping a
+file elsewhere in Ogent: a whole-page drop opens a protected editable working
+copy, while a composer drop never replaces the active document, changes the
+preview, starts an OfficeCLI watch, or enters recent-document history.
+
+One run can use up to five references, 50 MB each and 100 MB combined. Supported
+types are DOCX, XLSX, PPTX, PDF, TXT, Markdown, CSV, PNG, JPEG, WebP, BMP, and
+TIFF; each PDF is limited to 25 pages. Ogent validates actual content, not just
+the extension. Empty, malformed, mismatched, executable, archive, legacy Office,
+or over-limit files are rejected without leaving a usable attachment.
+
+Send references with a request, or press **Send** with an empty message to ask
+for a summary. The selected set is frozen into that run; references attached
+while it works stay in the tray for the next run. Searchable PDF text retains
+page headings. Scanned or low-text PDF pages, images, and visually requested
+Office content are supplied to Codex as bounded image inputs for OCR and visual
+interpretation.
+
+References and derived text, page images, and manifests live only under
+`%LOCALAPPDATA%\OgentLite\temporary-references\`. Ogent normally deletes the
+run directory after success, error, Stop, preparation failure, session cleanup,
+or shutdown, and clears abandoned files on the next startup after a crash.
+Deletion is best-effort local deletion, not forensic erasure. **References are
+temporary local copies and are deleted after this run. Their contents are sent
+to Codex for analysis and may remain in the Codex conversation context.**
 
 ### Start a new document
 
@@ -205,6 +240,7 @@ To update:
 Set-Location '..'
 git pull --ff-only
 Set-Location '.\ogent-lite'
+py -3 -m pip install -r '.\requirements.txt'
 py -3 .\ogent.py --register-shell
 .\ogent.cmd
 ```
@@ -229,6 +265,7 @@ remove them.
 Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected working copy
        one tab/session -----------^        \-> its own live preview port
        another tab/session ------^
+       composer references -> temporary validation/extraction/images -> Codex
 ```
 
 - Ogent owns one local server and a registry of independent tab sessions.
@@ -236,6 +273,9 @@ Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected wo
   and OfficeCLI preview on a port allocated from 26320-26380.
 - Codex receives the selected model and reasoning level with document-specific,
   single-agent editing instructions.
+- Composer references use a separate per-session, per-run store. Only safe
+  metadata reaches the browser; paths and derived artifacts stay local and are
+  deleted at the terminal boundary.
 - OfficeCLI performs and validates the actual Office-file changes.
 - AionUi is optional. The earlier AionUi workflow remains documented in
   [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md), but it is not required to run the
@@ -244,17 +284,19 @@ Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected wo
 ## Verified workstation
 
 - Windows 11
-- Ogent Lite 0.7.0
-- OfficeCLI 1.0.141
-- Codex CLI 0.144.1
+- Ogent Lite 0.8.0
+- Python 3.14.3 with pypdfium2 5.12.1 and Pillow 12.1.1
+- OfficeCLI 1.0.142
+- Codex CLI 0.145.0
 - GPT-5.6 Sol with selectable Low, Medium, High, XHigh, Max, and Ultra reasoning
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
-The app's browser and full-window drag/drop, desktop-shortcut drop, multi-session
+The app's browser and full-window drag/drop, composer references, searchable and
+scanned PDF analysis, direct image vision, desktop-shortcut drop, multi-session
 launch, concurrent protected-copy edits, live previews, same-file dedupe, tab
-reaping, automatic backend exit, Word view, model and reasoning selectors, Stop
-control, PDF import, Explorer integration, desktop shortcut, and reversible
-unregister flow were exercised end to end. See
+reaping, crash cleanup, automatic backend exit, Word view, model and reasoning
+selectors, Stop control, PDF import, Explorer integration, desktop shortcut, and
+reversible unregister flow were exercised end to end. See
 [ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for the app evidence.
 The repository's 13 original Office test artifacts also pass OpenXML validation;
 see [TEST-REPORT.md](TEST-REPORT.md).
@@ -298,12 +340,15 @@ see [TEST-REPORT.md](TEST-REPORT.md).
 ├── TEST-REPORT.md
 ├── ogent-lite/
 │   ├── ogent.py
+│   ├── ogent_references.py
 │   ├── ogent.cmd
+│   ├── requirements.txt
 │   ├── OGENT-REPORT.md
 │   └── assets/
 ├── tools/
 │   ├── pdf2docx.ps1
-│   └── docx2pdf.ps1
+│   ├── docx2pdf.ps1
+│   └── office-reference-to-pdf.ps1
 ├── templates/
 │   ├── report-with-toc.json
 │   ├── basic-deck.json
