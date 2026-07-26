@@ -40,10 +40,14 @@ classic menu. Windows 11 does not allow an unpackaged desktop script to appear
 in the compact modern menu; that requires MSIX packaging and is intentionally
 outside Ogent Lite's current scope.
 
-The command starts Ogent when necessary or creates a new independent session
-for the selected file. If that exact source is already open, Ogent focuses the
-existing session instead of starting a duplicate OfficeCLI watch. The original
-document is still protected by Ogent's working-copy workflow.
+The command starts Ogent when necessary or reuses the most recently focused
+connected workspace. Its already-open tab updates through SSE, and Ogent also
+opens the selected workspace in a predictable extra tab; that extra tab can be
+closed. If the selected workspace is running Codex, Ogent leaves its document
+unchanged and shows the busy message in that workspace. If that exact source is
+already open elsewhere, Ogent focuses the existing session instead of starting
+a duplicate OfficeCLI watch. Other independent sessions remain untouched, and
+the original document is still protected by Ogent's working-copy workflow.
 
 Remove the integration cleanly at any time:
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import collections
+import concurrent.futures
 import contextlib
 import datetime as dt
 import hashlib
@@ -42,7 +43,7 @@ except ImportError:  # pragma: no cover - Ogent is a Windows app.
 
 
 APP_NAME = "Ogent Lite"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 HOST = "127.0.0.1"
 BASE_PORT = 8765
 WATCH_PORT_FIRST = 26320
@@ -78,9 +79,16 @@ WINDOWS_CHILD_FLAGS = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 
 
 class UserFacingError(RuntimeError):
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int = 400,
+        *,
+        session_id: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.session_id = session_id
 
 
 def now_iso() -> str:
@@ -106,6 +114,7 @@ def path_is_within(path: Path, root: Path) -> bool:
 
 def command_env() -> dict[str, str]:
     env = os.environ.copy()
+    env["OFFICECLI_NO_AUTO_RESIDENT"] = "1"
     env["OFFICECLI_RESIDENT_FLUSH"] = "each"
     env["PYTHONIOENCODING"] = "utf-8"
     return env
@@ -325,6 +334,7 @@ class SessionState:
         self.session_id = session_id
         self.created_at = time.time()
         self.created_at_iso = now_iso()
+        self.last_browser_activity = self.created_at
         self.lock = threading.RLock()
         self.watch_lock = threading.RLock()
         self.close_lock = threading.Lock()
@@ -338,6 +348,9 @@ class SessionState:
         self.opening_source: Path | None = None
         self.watch_process: subprocess.Popen[str] | None = None
         self.watch_port: int | None = None
+        self.retired_watches: list[
+            tuple[Path | None, subprocess.Popen[str] | None, int | None]
+        ] = []
         self.watch_tail: collections.deque[str] = collections.deque(maxlen=40)
         self.run_process: subprocess.Popen[str] | None = None
         self.run_thread: threading.Thread | None = None
@@ -438,6 +451,13 @@ class SessionState:
             self.sse_client_refs[client_id] += 1
             self.sse_clients = sum(self.sse_client_refs.values())
             self.orphan_since = None
+            self.last_browser_activity = time.time()
+
+    def touch_browser_activity(self) -> None:
+        with self.lock:
+            if self.closed:
+                raise UserFacingError("This Ogent session has closed.", 410)
+            self.last_browser_activity = time.time()
 
     def disconnect_sse(self, client_id: str) -> None:
         with self.lock:
@@ -503,6 +523,32 @@ class OgentState:
         if session is None or session.closed:
             raise UserFacingError("This Ogent session no longer exists.", 410)
         return session
+
+    def select_shell_session(self) -> tuple[SessionState, bool]:
+        """Return the browser workspace Explorer should open into.
+
+        Shell opens reuse the most recently focused connected workspace so its
+        SSE stream updates immediately and its busy guard remains authoritative.
+        If the backend is resident without a workspace, create one.
+        """
+        with self.registry_lock:
+            sessions = [
+                session
+                for session in self.sessions.values()
+                if not session.closed
+            ]
+        if not sessions:
+            return self.create_session(), True
+
+        def shell_priority(session: SessionState) -> tuple[bool, float, float]:
+            with session.lock:
+                return (
+                    session.sse_clients > 0,
+                    session.last_browser_activity,
+                    session.created_at,
+                )
+
+        return max(sessions, key=shell_priority), False
 
     def summaries(self) -> list[dict[str, Any]]:
         with self.registry_lock:
@@ -694,16 +740,24 @@ class OgentState:
         session.emit("snapshot", self.snapshot_for(session, include_watch_probe=False))
         self.broadcast_sessions()
 
-    def allocate_watch_port(self, session: SessionState) -> int:
+    def allocate_watch_port(
+        self,
+        session: SessionState,
+        *,
+        replace: bool = False,
+    ) -> int:
         with self.registry_lock:
             with session.lock:
-                if session.watch_port is not None:
+                if session.watch_port is not None and not replace:
                     return session.watch_port
+                previous_port = session.watch_port
             used = {
                 item.watch_port
                 for item in self.sessions.values()
                 if item.watch_port is not None and item is not session
             }
+            if previous_port is not None:
+                used.add(previous_port)
             for port in range(WATCH_PORT_FIRST, WATCH_PORT_LAST + 1):
                 if port in used or not port_available(port):
                     continue
@@ -768,6 +822,56 @@ class OgentState:
 STATE = OgentState()
 
 
+def _cleanup_watch_resources(
+    document: Path | None,
+    process: subprocess.Popen[str] | None,
+    port: int | None,
+) -> None:
+    if process and process.poll() is None:
+        terminate_process_tree(process)
+    if document:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            run_quiet(
+                ["officecli", "unwatch", str(document)],
+                cwd=document.parent,
+                timeout=12,
+            )
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            run_quiet(
+                ["officecli", "close", str(document)],
+                cwd=document.parent,
+                timeout=12,
+            )
+    wait_for_port_closed(port)
+
+
+def retire_watch(
+    session: SessionState,
+    document: Path | None,
+    process: subprocess.Popen[str] | None,
+    port: int | None,
+) -> None:
+    if process is None and document is None and port is None:
+        return
+    retired = (document, process, port)
+    with session.lock:
+        session.retired_watches.append(retired)
+
+    def cleanup_retired() -> None:
+        try:
+            _cleanup_watch_resources(document, process, port)
+        finally:
+            with session.lock:
+                with contextlib.suppress(ValueError):
+                    session.retired_watches.remove(retired)
+
+    threading.Thread(
+        target=cleanup_retired,
+        name=f"ogent-watch-retire-{session.session_id}",
+        daemon=True,
+    ).start()
+
+
 def stop_watch(
     session: SessionState,
     *,
@@ -779,26 +883,19 @@ def stop_watch(
             document = session.active_doc
             process = session.watch_process
             port = session.watch_port
+            retired_watches = list(session.retired_watches)
+            session.retired_watches.clear()
             session.watch_process = None
         if clear_document:
             STATE.clear_document(session)
 
-        if process and process.poll() is None:
-            terminate_process_tree(process)
-        if document:
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                run_quiet(
-                    ["officecli", "unwatch", str(document)],
-                    cwd=document.parent,
-                    timeout=12,
-                )
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                run_quiet(
-                    ["officecli", "close", str(document)],
-                    cwd=document.parent,
-                    timeout=12,
-                )
-        wait_for_port_closed(port)
+        _cleanup_watch_resources(document, process, port)
+        for retired_document, retired_process, retired_port in retired_watches:
+            _cleanup_watch_resources(
+                retired_document,
+                retired_process,
+                retired_port,
+            )
         if release_port:
             STATE.release_watch_port(session, port)
         if process or port:
@@ -842,14 +939,31 @@ def _watch_output_reader(
 
 def start_watch(session: SessionState, document: Path) -> None:
     with session.watch_lock:
-        stop_watch(session, clear_document=False, release_port=False)
         if not document.exists():
             raise UserFacingError(f"The working document no longer exists: {document}", 404)
 
-        port = STATE.allocate_watch_port(session)
+        with session.lock:
+            previous_document = session.active_doc
+            previous_process = session.watch_process
+            previous_port = session.watch_port
+        same_document = (
+            previous_document is not None
+            and previous_document.resolve() == document.resolve()
+        )
+        if (
+            same_document
+            and previous_process is not None
+            and previous_process.poll() is None
+        ):
+            stop_watch(session, clear_document=False, release_port=False)
+            previous_process = None
+            previous_port = None
+        retired_document = None if same_document else previous_document
+        replacing = previous_process is not None or previous_port is not None
+        port = STATE.allocate_watch_port(session, replace=replacing)
         if not port_available(port):
             STATE.release_watch_port(session, port)
-            port = STATE.allocate_watch_port(session)
+            port = STATE.allocate_watch_port(session, replace=True)
 
         ready_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         process = subprocess.Popen(
@@ -870,6 +984,26 @@ def start_watch(session: SessionState, document: Path) -> None:
                 raise UserFacingError("This Ogent session has closed.", 410)
             session.watch_process = process
             session.watch_tail.clear()
+
+        def restore_previous_watch() -> None:
+            previous_alive = (
+                previous_process is not None
+                and previous_process.poll() is None
+            )
+            with session.lock:
+                if session.closed:
+                    return
+                if (
+                    session.watch_process is process
+                    or session.watch_process is None
+                ):
+                    session.watch_process = (
+                        previous_process if previous_alive else None
+                    )
+                    session.watch_port = (
+                        previous_port if previous_alive else None
+                    )
+
         reader = threading.Thread(
             target=_watch_output_reader,
             args=(session, process, ready_queue, port),
@@ -891,11 +1025,8 @@ def start_watch(session: SessionState, document: Path) -> None:
             last_line = value or last_line
             if kind == "exit":
                 terminate_process_tree(process)
-                with session.lock:
-                    if session.watch_process is process:
-                        session.watch_process = None
+                restore_previous_watch()
                 if "port" in last_line.casefold() and "use" in last_line.casefold():
-                    STATE.release_watch_port(session, port)
                     raise UserFacingError(
                         f"Preview port {port} was claimed by another process. Try again.",
                         409,
@@ -906,6 +1037,12 @@ def start_watch(session: SessionState, document: Path) -> None:
                     500,
                 )
             if kind == "ready":
+                retire_watch(
+                    session,
+                    retired_document,
+                    previous_process,
+                    previous_port,
+                )
                 session.emit(
                     "watch",
                     {"status": "ready", "port": port, "document": str(document)},
@@ -914,6 +1051,12 @@ def start_watch(session: SessionState, document: Path) -> None:
                 return
 
         if watch_http_alive(port):
+            retire_watch(
+                session,
+                retired_document,
+                previous_process,
+                previous_port,
+            )
             session.emit(
                 "watch",
                 {"status": "ready", "port": port, "document": str(document)},
@@ -921,9 +1064,7 @@ def start_watch(session: SessionState, document: Path) -> None:
             STATE.broadcast_sessions()
             return
         terminate_process_tree(process)
-        with session.lock:
-            if session.watch_process is process:
-                session.watch_process = None
+        restore_previous_watch()
         raise UserFacingError(f"OfficeCLI watch did not become ready. {last_line}", 504)
 
 
@@ -1055,9 +1196,15 @@ def open_document(
         previous_complex_layout = session.complex_layout
         previous_complex_detail = session.complex_layout_detail
     try:
-        start_watch(session, working)
+        if extension == ".docx":
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                layout_future = executor.submit(detect_complex_layout, working)
+                start_watch(session, working)
+                complex_layout, complex_detail = layout_future.result()
+        else:
+            start_watch(session, working)
+            complex_layout, complex_detail = False, None
         protected_source = state_source.resolve() if state_source else source
-        complex_layout, complex_detail = detect_complex_layout(working)
         STATE.commit_document(
             session,
             protected_source,
@@ -2879,6 +3026,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
     });
 
+    function announceFocus() {
+      api("/session/focus", { method: "POST", body: "{}" }).catch(() => {});
+    }
+    window.addEventListener("focus", announceFocus);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") announceFocus();
+    });
+
     let dragging = false;
     elements.splitter.addEventListener("pointerdown", event => {
       dragging = true;
@@ -2977,13 +3132,15 @@ class OgentHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         return str((query.get("s") or [""])[0]).strip()
 
-    def _session_for_post(self) -> SessionState:
+    def _session_for_post(self) -> tuple[SessionState, bool]:
         session_id = self.headers.get("X-Ogent-Session", "").strip()
         if session_id == "new":
-            return STATE.create_session()
+            return STATE.create_session(), True
+        if session_id == "shell":
+            return STATE.select_shell_session()
         if not session_id:
             raise UserFacingError("Missing Ogent session.", 400)
-        return STATE.get_session(session_id)
+        return STATE.get_session(session_id), False
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -3159,11 +3316,8 @@ class OgentHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"message": "Ogent Lite is stopping."})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            session = self._session_for_post()
-            created_for_open = (
-                parsed.path == "/open"
-                and self.headers.get("X-Ogent-Session", "").strip() == "new"
-            )
+            session, created_for_request = self._session_for_post()
+            created_for_open = parsed.path == "/open" and created_for_request
             if parsed.path == "/open":
                 with session.lock:
                     busy = session.run_status in ACTIVE_RUN_STATUSES
@@ -3183,6 +3337,11 @@ class OgentHandler(BaseHTTPRequestHandler):
                 if created_for_open and result.get("action") == "focus_session":
                     close_session(session)
                 self._send_json(200, result)
+                return
+            if parsed.path == "/session/focus":
+                self._read_json()
+                session.touch_browser_activity()
+                self._send_bytes(204, b"", "text/plain; charset=utf-8")
                 return
             if parsed.path == "/chat":
                 payload = self._read_json()
@@ -3240,7 +3399,14 @@ class OgentHandler(BaseHTTPRequestHandler):
                     with session.lock:
                         session.last_error = str(exc)
                     session.add_message("assistant", str(exc))
-            self._send_json(exc.status, {"error": str(exc)})
+            error_payload = {"error": str(exc)}
+            if (
+                parsed.path == "/open"
+                and session is not None
+                and not created_for_open
+            ):
+                error_payload["session_id"] = session.session_id
+            self._send_json(exc.status, error_payload)
         except Exception as exc:
             message = f"Internal error: {exc}"
             if session is not None:
@@ -3302,7 +3468,7 @@ def post_open_to_existing_server(port: int, raw_path: str) -> dict[str, Any]:
         headers={
             "Content-Type": "application/json",
             "X-Ogent-Token": token,
-            "X-Ogent-Session": "new",
+            "X-Ogent-Session": "shell",
         },
     )
     try:
@@ -3312,11 +3478,14 @@ def post_open_to_existing_server(port: int, raw_path: str) -> dict[str, Any]:
         try:
             payload = json.loads(exc.read().decode("utf-8"))
             message = str(payload.get("error", "")).strip()
+            session_id = str(payload.get("session_id", "")).strip() or None
         except (UnicodeDecodeError, ValueError, AttributeError):
             message = ""
+            session_id = None
         raise UserFacingError(
             message or f"Ogent could not open the file (HTTP {exc.code}).",
             exc.code,
+            session_id=session_id,
         ) from None
     except (OSError, urllib.error.URLError) as exc:
         raise UserFacingError(f"Could not contact the running Ogent server: {exc}", 503) from exc
@@ -3531,7 +3700,12 @@ def main() -> int:
             try:
                 result = post_open_to_existing_server(port, args.open_path)
             except UserFacingError as exc:
-                webbrowser.open(url)
+                error_url = (
+                    f"{url}?s={urllib.parse.quote(exc.session_id)}"
+                    if exc.session_id
+                    else url
+                )
+                webbrowser.open(error_url)
                 print(str(exc), file=sys.stderr)
                 return 1
             session_id = str(result.get("session_id", "")).strip()

@@ -9,7 +9,7 @@ files with plain-language instructions. It places an OfficeCLI live preview
 beside a Codex chat, runs on `127.0.0.1`, and creates a protected working copy
 before any edit touches a document.
 
-The current app is **Ogent Lite 0.5.0**. It uses your existing Codex CLI login,
+The current app is **Ogent Lite 0.6.0**. It uses your existing Codex CLI login,
 so it does not require a separate OpenAI API key. Ogent is open source under the
 [MIT License](LICENSE).
 
@@ -21,7 +21,7 @@ Copy and paste this one sentence into Codex or another local AI agent that can
 run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.5.0, that three disposable DOCX files open as three independent sessions with distinct preview ports, and that every source-file hash remains unchanged; confirm the session switcher, model and reasoning selectors, Word view button, and automatic tab cleanup; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.6.0, that three disposable DOCX files open as three independent sessions with distinct preview ports, and that every source-file hash remains unchanged; confirm the session switcher, model and reasoning selectors, Word view button, and automatic tab cleanup; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
 ```
 
 The prompt deliberately leaves sign-in and elevation with the human and never
@@ -135,9 +135,11 @@ Use `.xlsx` or `.pptx` instead when starting a workbook or presentation.
 
 Each newly created Ogent browser workspace gets an independent session with its
 own document, OfficeCLI preview port, transcript, Codex context, and run state.
-Use **+ New window**, launch `ogent.cmd` again, or right-click another file to
-create a second workspace. The session dropdown switches among every live
-workspace.
+Use **+ New window** or launch `ogent.cmd` again to create a second workspace.
+Explorer's **Open in Ogent** command targets the most recently focused connected
+workspace so its existing tab updates immediately; Ogent also opens that
+workspace in a predictable extra tab. The session dropdown switches among every
+live workspace.
 
 Different sessions can run Codex edits at the same time. Each individual
 session still allows only one active run, which prevents two agents from
@@ -238,7 +240,7 @@ Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected wo
 ## Verified workstation
 
 - Windows 11
-- Ogent Lite 0.5.0
+- Ogent Lite 0.6.0
 - OfficeCLI 1.0.141
 - Codex CLI 0.144.1
 - GPT-5.6 Sol with selectable Low, Medium, High, XHigh, Max, and Ultra reasoning

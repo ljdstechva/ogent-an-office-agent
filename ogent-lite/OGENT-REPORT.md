@@ -328,3 +328,53 @@ Final v0.5.0 state: implementation and documentation are locally committed,
 the per-user shell integration is enabled, the backend is stopped after the
 clean self-exit test, personal/source-derived documents remain untracked, and
 no public push was performed.
+
+## v0.6.0 - focused shell open and seamless preview handoff
+
+The user approved the existing Quiet Signal mark on 2026-07-26. Its approved
+parameters remain the 240 x 240 rounded badge at `(8, 8)` with radius 56, navy
+`#17324d` to teal `#0d9488`, a white ring centered at `(128, 120)` with radius
+66 and stroke 30, and the `#14b8a6` live dot at `(175, 167)` with radius 16 and
+white stroke 3. Revalidation confirmed all seven PNG dimensions and a
+Windows-loadable 44,813-byte ICO.
+
+### Shell behavior restored on the v0.5 session architecture
+
+- Explorer opens now select the most recently focused connected workspace
+  rather than silently creating a new session. Browser focus is recorded by
+  `POST /session/focus`; the initial SSE connection also establishes activity.
+- The selected workspace's SSE stream receives the document switch, while the
+  CLI still opens the predictable extra tab required by the shell contract.
+- A busy selected workspace returns HTTP 409, records the exact message in that
+  workspace, and returns its session id so the extra tab opens on the visible
+  error instead of an unrelated new workspace.
+- Independent sessions created through **+ New window** or a normal second
+  launch remain intact. Same-source dedupe still focuses the owning session.
+- Warm switching now starts the replacement OfficeCLI watch on a new port,
+  publishes it when ready, and retires the previous watch in the background.
+  DOCX complex-layout inspection runs concurrently with watch startup.
+- Ogent-owned OfficeCLI work now uses the workspace's validated direct mode,
+  `OFFICECLI_NO_AUTO_RESIDENT=1`, with per-mutation flushing retained.
+
+### v0.6 live evidence
+
+| Check | Result |
+|---|---|
+| Cold `--open` | A clean backend started v0.6.0 on port 8900, opened the Word fixture in session `a2a0c28c`, launched a healthy protected watch, and emitted the exact browser session URL. |
+| Warm Word | PASS in 2.919 seconds; the existing Playwright tab updated through SSE and displayed the complete Word fixture. |
+| Warm Excel | PASS in 2.976 seconds. |
+| Warm PowerPoint | PASS in 2.839 seconds. |
+| Unicode path | `résumé test file.docx` opened in 2.907 seconds; the source name remained Unicode in session state and the live preview rendered correctly. |
+| Busy guard | A real GPT-5.6 Sol read-only run was started, an immediate shell open returned exit 1 / HTTP 409, the document remained unchanged, the exact busy message appeared in the live transcript, and Stop ended the run. |
+| PDF direct open | Returned `pdf_import`, completed via SSE without polling, produced a validated searchable working DOCX with a healthy watch, and preserved the PDF hash. |
+| Same-source dedupe | A duplicate PDF open focused the existing session and left one session plus one isolated OfficeCLI watch. |
+| Source preservation | SHA-256 hashes for Word, Unicode Word, Excel, PowerPoint, and PDF fixtures were identical before and after the matrix. |
+| Browser brand | Inline SVG favicon present; toolbar mark measured 28 x 28; empty-state SVG present; zero browser console errors or warnings. |
+| Shell registry | Unregister removed all six verb/command keys; absence was verified; register restored exact label, icon, `pythonw.exe` command, and quoted `%1` for `.docx`, `.xlsx`, and `.pptx`; `.pdf` remained absent; Explorer icon cache was refreshed. |
+| Protocol regressions | Six stdlib unit tests passed: connected-focus selection, resident-backend session creation, replacement-port reservation, direct-mode environment, busy 409 transcript/session targeting, and warm workspace reuse. Python compilation, Ruff, and `git diff --check` also passed. |
+
+The final Windows Explorer gesture checks for v0.6.0 remain human-operated:
+confirm the icon and no-console behavior for one Word, Excel, and PowerPoint
+right-click. The same registered `pythonw.exe` command and icon passed the
+earlier v0.4.0 human matrix; the v0.6 command path and all downstream behavior
+have been revalidated above.
