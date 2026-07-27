@@ -4,19 +4,19 @@
 
 # Ogent Lite
 
-Ogent Lite 0.9.0 is a featherweight, local document workspace: OfficeCLI keeps a
+Ogent Lite 0.10.0 is a featherweight, local document workspace: OfficeCLI keeps a
 live Word, Excel, or PowerPoint preview on the left, while either Codex or
 Claude Code handles plain-language editing requests in the chat pane on the
 right.
 
 It runs entirely on `127.0.0.1`, uses the selected CLI's existing sign-in, and
-never asks for an OpenAI or Anthropic API key. Source documents are never edited
-directly. Every opened Office file is copied to
-`%LOCALAPPDATA%\OgentLite\work\` first. Files dropped into the browser are also
-preserved byte-for-byte under
-`%LOCALAPPDATA%\OgentLite\imports\` before the working copy is created.
-Files attached at the chat composer follow a separate, temporary read-only
-reference lifecycle and never become active documents.
+never asks for an OpenAI or Anthropic API key. A DOCX, XLSX, or PPTX opened by
+local path is edited directly only after a physical recovery copy is created
+and SHA-256 verified. Browser uploads are preserved byte-for-byte under
+`%LOCALAPPDATA%\OgentLite\imports\` and edited there. PDFs are copied and
+converted to working DOCX files under `%LOCALAPPDATA%\OgentLite\work\`.
+Composer attachments follow a retained, read-only session lifecycle and never
+become active documents.
 
 For the AI-agent installation sentence and complete human setup, see the
 [repository README](../README.md).
@@ -66,7 +66,7 @@ closed. If the selected workspace is running an agent, Ogent leaves its document
 unchanged and shows the busy message in that workspace. If that exact source is
 already open elsewhere, Ogent focuses the existing session instead of starting
 a duplicate OfficeCLI watch. Other independent sessions remain untouched, and
-the original document is still protected by Ogent's working-copy workflow.
+the original document remains protected by its recovery backup.
 
 Remove the integration cleanly at any time:
 
@@ -92,55 +92,84 @@ an older icon, run `ie4uinit.exe -show` or restart Explorer to refresh its cache
 5. For a complex DOCX, use **Word view** when exact floating-shape placement
    matters. It opens a Microsoft Word-rendered PDF in a new browser tab.
 6. To analyze supporting material, click the paperclip or drop files on the
-   composer. A composer drop attaches a temporary reference; a drop elsewhere
-   opens a protected working document.
+   composer. A composer drop retains a read-only attachment for this workspace;
+   a drop elsewhere opens a browser-imported editable copy.
+7. Click a preview element to create a focused target chip. Supported targets
+   are Word paragraphs/table cells, PowerPoint shapes, and Excel cells/ranges.
+   Multi-select retains up to 20 targets. A document revision makes old targets
+   visibly stale and blocks Send.
+
+The per-turn icon distinguishes **working**, **completed**, **error**, and
+**stopped**. Agent Activity shows provider/model/effort, preparation and tool
+phases, OfficeCLI call counts, and elapsed time. The gear opens recovery,
+retention, and session-memory settings.
 
 For PDFs, drag the PDF into Ogent or start with “Edit my PDF,” then paste its
 absolute path. Ogent copies the PDF, converts the copy to a working DOCX through
 the Word-first pipeline, and opens that DOCX for editing. Complex PDF reflow may
 still need layout cleanup; image-only PDFs require OCR.
 
-## Temporary read-only references
+## Retained read-only attachments
 
 The chat composer accepts multiple DOCX, XLSX, PPTX, PDF, TXT, Markdown, CSV,
-PNG, JPEG, WebP, BMP, and TIFF references. Limits are five files per run,
-50 MB per file, 100 MB combined, and 25 pages per PDF. Ogent validates file
+PNG, JPEG, WebP, BMP, and TIFF attachments. Limits are 20 files per Send,
+50 MB per file, 100 MB combined per Send, 100 retained files and 500 MB per
+workspace, three concurrent uploads, and 25 pages per PDF. Ogent validates file
 content and signatures; it rejects empty, malformed, mismatched, executable,
 archive, legacy Office, and over-limit inputs with an actionable Failed state.
 
-References may be sent with typed instructions or by pressing **Send** with an
+Attachments may be sent with typed instructions or by pressing **Send** with an
 empty message. The latter uses: `Read and analyze the attached reference files.
-Summarize the important findings.` Once sent, those chips are locked to that
-run. New attachments remain removable and belong to the next run.
+Summarize the important findings.` Submitted cards stay in the chat and remain
+available in this workspace. New attachments belong to the next Send. A later
+request can name one or more retained filenames; only those named files and the
+new batch are materialized for the provider, subject to per-Send limits.
 
-OfficeCLI performs only read operations on Office references. Searchable PDF
+OfficeCLI performs only read operations on Office attachments. Searchable PDF
 text is extracted with page headings. Scanned or low-text PDF pages, supported
 images, and visually requested Office content are normalized into bounded
-temporary images and supplied only to the selected provider for that run.
+temporary images and supplied only to the selected provider for that turn.
 Ogent does not use an external OCR service.
 
-Every upload, extraction, rendered page, and manifest stays under
-`%LOCALAPPDATA%\OgentLite\temporary-references\`. Ogent deletes a claimed run
-directory after success, provider error, Stop, or preparation failure; Remove,
-Clear all, session cleanup, and backend shutdown delete their corresponding
-files. Startup removes abandoned contents after a prior crash. Cleanup happens
-only after owned preprocessing, Office, or provider processes release the files.
+Canonical retained copies live in launch-scoped session memory. Every provider
+turn gets isolated materialized copies, extraction, rendered pages, and
+manifests under `%LOCALAPPDATA%\OgentLite\temporary-references\`. Ogent deletes
+that run directory after success, provider error, Stop, or preparation failure.
+**Forget** removes one canonical attachment. **Settings > Clear session memory**
+removes all retained files and transcript turns in that workspace. Session
+reaping, shutdown, and startup clear launch-scoped memory after owned processes
+release the files.
 
 This is ordinary best-effort local deletion, not secure forensic erasure on
-NTFS, SSDs, backups, antivirus caches, or synchronized storage. **References
-are temporary local copies and are deleted after this run. Their contents are
-sent to the selected AI provider. Ogent uses a non-resumable provider context
-for that run and does not carry it into the next normal chat; the provider's
-own data-handling policy still applies.**
+NTFS, SSDs, backups, antivirus caches, or synchronized storage. Attachment
+contents are sent to the selected AI provider only for requested turns. The
+provider's own data-handling and retention policy still applies.
+
+## Direct edits and recovery
+
+Opening DOCX/XLSX/PPTX through an absolute local path, Explorer, or the desktop
+shortcut edits that exact file. Before the first mutation, Ogent creates a
+byte-for-byte physical copy under `%LOCALAPPDATA%\OgentLite\backups\`, verifies
+its size and SHA-256 digest, and records a manifest. It never uses a hardlink.
+Browser uploads are edited under `imports`; PDF-derived DOCX files are edited
+under `work`; neither mode overwrites the user's browser source or PDF.
+
+A backup expires exactly 30 x 24 hours after creation and is removed by the
+first startup, scheduled, or manual cleanup at or after that instant. The gear
+shows backup count and size, opens the recovery folder, runs expired cleanup,
+and clears the current workspace's session memory. To restore manually: stop
+Ogent, copy the chosen backup over the original, reopen it, and validate it with
+OfficeCLI. Deletion is best-effort, not forensic erasure.
 
 ## Sessions and automatic cleanup
 
 Each fresh browser workspace creates one Ogent session. Each session has its own
-protected working copy, transcript, provider-specific Codex and Claude session
-IDs, run state, and OfficeCLI watch port from 26320-26380. Different sessions
-may edit different files concurrently; one individual session allows one agent
-run at a time. Codex IDs are never passed to Claude, Claude IDs are never passed
-to Codex, and tabs that navigate to the same deduplicated session share that
+document, transcript, provider-neutral memory, run state, and OfficeCLI watch
+port from 26320-26380. Different sessions may edit different files
+concurrently; one individual session allows one agent run at a time. Each turn
+starts a fresh, non-resumable provider process, while Ogent supplies the
+conversation delta, attachment metadata, document identity, and submitted
+selection. Tabs that navigate to the same deduplicated session share that
 workspace.
 
 Closing the final connected tab starts a 120-second grace window; closing one of
@@ -170,18 +199,20 @@ automation process for forced cleanup if that window expires.
 |---|---|
 | Recent paths | `%LOCALAPPDATA%\OgentLite\recent.json` |
 | Browser drag/drop imports | `%LOCALAPPDATA%\OgentLite\imports\` |
-| Protected working copies | `%LOCALAPPDATA%\OgentLite\work\` |
-| Temporary chat references | `%LOCALAPPDATA%\OgentLite\temporary-references\` |
+| PDF working copies | `%LOCALAPPDATA%\OgentLite\work\` |
+| Direct-edit recovery backups | `%LOCALAPPDATA%\OgentLite\backups\` |
+| Launch-scoped session memory and canonical attachments | `%LOCALAPPDATA%\OgentLite\session-memory\` |
+| Per-run attachment copies | `%LOCALAPPDATA%\OgentLite\temporary-references\` |
 | Agent capability cache | `%LOCALAPPDATA%\OgentLite\agent-capabilities-v1.json` |
 | Running-server record | `%LOCALAPPDATA%\OgentLite\server.json` |
 
 Recent paths and working documents stay local and are excluded from Git.
-Temporary references are not written to recents or the active-document index.
+Composer attachments are not written to recents or the active-document index.
 
 ## Requirements
 
 - Windows 11 with Python 3 (`py -3 --version`)
-- OfficeCLI (`officecli --version`)
+- OfficeCLI 1.0.142 or later (`officecli --version`)
 - At least one supported agent CLI, installed and signed in:
   - Codex: `codex --version` and `codex login status`
   - Claude Code: `claude --version` and `claude auth status --json`
@@ -219,11 +250,20 @@ compile, Ruff, and whitespace checks on Windows for every pull request to
 `main` and every push to `main`. The live-provider scripts remain separate
 because CI never requires a Codex or Claude login and never consumes inference.
 
-Selections are stored separately for each provider in the local browser. A
-model change starts a fresh context. Switching providers leaves the active
-document open and preserves that provider's compatible session, so switching
-back can resume it. A temporary-reference run is always isolated and
-non-resumable.
+Every run is fresh at the provider layer:
+
+- Codex uses `--ephemeral --ignore-user-config --ignore-rules`, workspace-write
+  sandboxing, no interactive approvals, and one explicit MCP gateway restricted
+  to the active document. Backups and other documents are rejected.
+- Claude uses `--setting-sources "" --strict-mcp-config
+  --no-session-persistence`, no permission bypass, and only the explicit
+  document gateway and/or read-only materialized attachment access required for
+  that turn.
+
+Ogent's own provider-neutral session memory carries the relevant prior turns,
+active document identity, retained-attachment metadata, and submitted
+selection. Switching provider or model therefore does not resume or expose a
+provider-owned session.
 
 ## Brand assets
 
@@ -255,27 +295,31 @@ dot in `#14b8a6`.
 | Complex DOCX preview looks incomplete | The live HTML view approximates some floating shapes. Click **Word view** and verify before concluding content is missing. |
 | PDF opens with broken spacing | PDF Reflow preserved editable content but not exact layout; clean up the working DOCX or use the original source document. |
 | PDF reports that OCR is needed | The PDF is image-only. Run OCR first, then import the searchable PDF. |
-| A reference says Failed | Check the extension and file content, then confirm the 50 MB/file, 100 MB/run, five-file, and 25-page PDF limits. Rejected uploads are removed. |
+| An attachment says Failed | Check the extension and file content, then confirm the 50 MB/file, 20-file/100-MB Send, 100-file/500-MB workspace, three-concurrent-upload, and 25-page PDF limits. Rejected uploads are removed. |
 | Reference PDF/image preparation is unavailable | Run `py -3 -m pip install -r .\requirements.txt`, restart Ogent, and attach the file again. |
 | A visual Office reference cannot render | Text extraction can still work. Microsoft Office or LibreOffice is required for the optional temporary visual export; attach a PDF export if exact visual analysis is essential. |
-| Files remain after an abnormal crash | Restart Ogent once. Startup clears the abandoned temporary-reference root before accepting sessions. |
+| Files remain after an abnormal crash | Restart Ogent once. Startup clears abandoned run copies and launch-scoped session memory before accepting sessions. |
 | A run is taking too long | Click **Stop**; Ogent terminates the active provider child process tree. |
 
 ## Privacy and limits
 
 - Localhost only; no telemetry or external web assets.
-- No direct edits to source documents.
-- Composer references never become active documents, watches, recents, dedupe
+- Local-path Office files are edited directly only after a verified physical
+  recovery backup. Browser imports and PDFs remain copy-based.
+- Composer attachments never become active documents, watches, recents, dedupe
   entries, or final outputs. Their browser metadata contains no temporary path.
-- Reference contents are sent to the selected AI provider in a non-resumable
-  run. Local deletion does not control copies retained under that provider's
-  own data-handling policy.
+- Attachment contents and the provider-neutral conversation context needed for
+  a turn are sent to the selected provider in a fresh run. Local deletion does
+  not control copies retained under that provider's own data-handling policy.
 - Browser drag/drop accepts one DOCX, XLSX, PPTX, or PDF at a time, up to
   128 MB, and retains a local import copy until the user removes it.
-- Composer references accept up to five supported files per run, 50 MB each,
-  100 MB combined, and 25 pages per PDF.
-- One active document and one agent run per session; provider sessions and
-  documents remain independent.
-- Excel live preview does not support click-to-select paths.
+- Composer attachments accept up to 20 supported files per Send, 50 MB each,
+  100 MB combined, 100 files/500 MB retained per workspace, three concurrent
+  uploads, and 25 pages per PDF.
+- One active document and one agent run per session; provider processes are
+  non-resumable and documents remain session-isolated.
+- Focused selection supports Excel cells/ranges, Word paragraphs/table cells,
+  and PowerPoint shapes. Unsupported or stale paths fail closed.
+- Recovery backups expire at the first cleanup at or after exactly 30 days.
 - PDF editing happens in a converted DOCX, never in the PDF itself.
 - Word view currently supports DOCX only and requires Microsoft Word.

@@ -1,14 +1,16 @@
 # Ogent Lite Verification Report
 
 Date: 2026-07-27
-Status: v0.9.0 automated and live provider acceptance passed; earlier release
-matrices are retained below as historical evidence.
+Status: v0.10.0 automated and core live-provider acceptance passed. The
+in-app browser control surface was unavailable for the final responsive visual
+pass; earlier release matrices are retained below as historical evidence.
 
 ## Current runtime and architecture
 
 - Runtime: system Python 3.14.3
 - Application: `ogent.py` with embedded HTML/CSS/JavaScript plus separate
-  provider and capability-catalog adapters
+  provider, capability-catalog, recovery, provider-neutral memory, retained
+  attachment, timing, preview-selection, and document-gateway adapters
 - Dependencies: Python standard library, plus the existing pinned reference
   inspection packages
 - Server bind: `127.0.0.1` only
@@ -19,9 +21,9 @@ matrices are retained below as historical evidence.
   no static provider model or effort catalog
 - OfficeCLI: 1.0.142
 
-The v0.9.0 acceptance evidence appears in the final section. Statements in the
-v0.1.0 through v0.8.0 sections describe those historical releases and are not
-the current catalog or session architecture.
+The v0.10.0 acceptance evidence appears in the final section. Statements in the
+v0.1.0 through v0.9.0 sections describe those historical releases and are not
+the current edit, memory, attachment, or provider-isolation architecture.
 
 ## Live test matrix
 
@@ -787,3 +789,118 @@ test output.
 The application code was unchanged during publication preparation. In
 accordance with the release plan, the live Codex and Claude inference checks
 documented above were not repeated solely for README and CI changes.
+
+## v0.10.0 — recovery-backed direct edits, shared memory, retained attachments, and speed
+
+Verified on 2026-07-27 with Windows 11, Python 3.14.3, OfficeCLI 1.0.142,
+Codex CLI 0.145.0, Claude Code 2.1.220, Microsoft Word, Excel, and PowerPoint.
+
+### Current behavior
+
+- Local-path DOCX/XLSX/PPTX files are edited directly after Ogent creates a
+  physical, size/SHA-256-verified recovery copy. Browser uploads are edited
+  under `imports`; PDFs are copied and converted under `work`.
+- Backups use no hardlinks, expire exactly 30 x 24 hours after creation, and
+  are deleted by the first cleanup at or after expiry. Settings exposes summary,
+  folder-open, manual expired cleanup, and session-memory clearing.
+- Every provider turn is fresh. Provider-neutral Ogent memory carries prior
+  turns, active-document identity/revision, retained-attachment metadata, and
+  immutable submitted selections across provider/model switches.
+- A workspace retains up to 100 attachments/500 MB. Each Send is limited to
+  20 files/100 MB, 50 MB per file, with at most three uploads processing
+  concurrently. Per-run materializations are deleted at the terminal boundary;
+  canonical copies are removed by Forget, memory clear, session reap, shutdown,
+  or launch cleanup.
+- Preview focus supports Word paragraphs and table cells, PowerPoint shapes,
+  and Excel cells/ranges. Up to 20 targets can be retained. Origin, iframe
+  source, protocol, channel, watch generation, document, session, revision, and
+  path are validated before server-side metadata resolution.
+- Turn icons distinguish working/completed/error/stopped. Privacy-safe timing
+  records provider/model/effort, major phases, OfficeCLI call counts, elapsed
+  time, attachment count/bytes, and focused-scope audit results.
+
+### Provider least privilege
+
+- Codex uses ephemeral execution with user configuration and rules ignored,
+  workspace-write sandboxing, no interactive approvals, and a single explicit
+  MCP tool. That gateway is restricted to the active document and allowed
+  per-run read roots.
+- Claude uses an empty setting-source list, strict explicit MCP configuration,
+  no session persistence, `dontAsk` without permission bypass, and only the
+  document gateway and/or read access required for materialized attachments.
+- The gateway invokes OfficeCLI without a shell. Live denial checks blocked a
+  recovery-backup read, another document, shell-like input, `create`, and an
+  `--out` escape while permitting the active-document read. Automated
+  regressions also reject split, `--option=value`, `-o=value`, and attached
+  `-ovalue` forms for every forbidden option.
+
+### Direct-edit and PDF evidence
+
+| Case | Result | Provider time | Evidence |
+|---|---|---:|---|
+| Word direct local edit | PASS | 52.725 s | Only paragraph 2 became `DIRECT-WORD-EDIT-VERIFIED`; outside paragraph/table sentinels stayed unchanged; package validation passed; backup hash equaled the pre-edit hash. |
+| Excel direct local edit | PASS | 53.976 s | `B2=42`; `D20` stayed unchanged; package validation passed; backup hash equaled the pre-edit hash. |
+| PowerPoint direct local edit | PASS | 40.920 s | Shape `100000` became `DIRECT-PPT-EDIT-VERIFIED`; shapes `100001/100002` stayed unchanged; package validation passed; backup hash equaled the pre-edit hash. |
+| Browser-import semantics | PASS | 52.591 s | The imported copy changed while the browser source hash and source paragraph remained unchanged; package validation passed. |
+| Protected PDF | PASS | 38.997 s edit | Searchable PDF converted successfully; only working-DOCX paragraph 2 gained yellow highlight; working hash changed, OfficeCLI validation passed, and original PDF hash stayed unchanged. |
+
+The three-turn shared-memory sequence also passed:
+
+1. Codex `gpt-5.6-sol` low made the first heading blue at 24 pt/non-bold.
+2. Claude `sonnet` automatic made the same heading 18 pt while preserving blue.
+3. Codex `gpt-5.6-terra` low made that heading bold while preserving 18 pt/blue.
+
+Final OfficeCLI readback was `size=18pt`, `color=#0000FF`, `bold=true`; the
+outside sentinel stayed unchanged, validation returned zero errors, and the
+recovery backup still matched the original SHA-256.
+
+### Selection, attachment, and lifecycle evidence
+
+- Native watch-to-Ogent selection passed nine cases: Word paragraph, multiple
+  Word paragraphs, Word table cell, PowerPoint shape, multiple PowerPoint
+  shapes, Excel cell, compacted Excel range, stale-after-mutation, and a
+  submitted selection carried into a Claude/provider-model switch.
+- A live idle-window test found and fixed a 30-second SSE socket timeout. The
+  long-lived bridge then continued accepting selections after that window.
+- Wrong origin, wrong iframe source, stale revision, wrong channel, and path
+  traversal requests returned HTTP 409 and retained no forged metadata.
+- Twenty mixed Office/Markdown files uploaded successfully with three workers;
+  file 21 returned a clean HTTP 413. The successful Codex turn materialized all
+  20 and preserved 20 transcript cards. A second two-file batch then supported
+  a Claude comparison between `word-01.docx` and
+  `second-batch-slides.pptx`, with exact paragraph/slide citations.
+- A focused Codex follow-up read retained `note-01.md` and cited its top-level
+  heading. One abandoned workspace was reaped; both its session-memory and
+  temporary-reference directories were gone afterward.
+- Live Office visual-reference preparation exposed and fixed two Windows
+  compatibility problems: PowerShell 5.1 `utf8NoBOM` and COM applications
+  without an exposed `Hwnd`. PowerPoint now uses the cross-version PDF `SaveAs`
+  path. Individual Word, Excel, and PowerPoint visual exports then passed with
+  no tracking sidecar left behind.
+
+### Controlled performance gate
+
+Each post-change trial used a fresh copy of the same synthetic DOCX, the same
+path-explicit paragraph-2 italic edit, the same CLI-reported model/effort, and
+external OfficeCLI readback/validation. The master SHA-256 remained unchanged.
+
+| Provider | Baseline trials (s) | Baseline median | v0.10 trials (s) | v0.10 median | Change |
+|---|---|---:|---|---:|---:|
+| Codex `gpt-5.6-sol`, low | 93.112, 142.228, 183.041 | 142.228 s | 54.024, 39.545, 48.393 | 48.393 s | 66.0% faster |
+| Claude `sonnet`, automatic | 51.339, 47.306, 45.410 | 47.306 s | 18.076, 24.098, 21.501 | 21.501 s | 54.5% faster |
+
+This exceeds the release gate (Claude at least 25% faster total, Codex less
+than 10% median regression).
+
+### Automated and visual gate
+
+- Final deterministic suite: 135 tests and 46 subtests.
+- Python compilation, Ruff, PowerShell parser validation, `git diff --check`,
+  OfficeCLI package validation, and real Word/Excel/PowerPoint helper exports
+  passed.
+- The in-app browser runtime returned no available browser binding. Per the
+  browser-control rules, no unrelated browser backend was substituted.
+  Responsive 1440x900/390x844 screenshots and a fresh visual inspection of all
+  four turn-status icons therefore remain the one uncompleted v0.10 check.
+  Selection protocol/backend behavior and existing browser regression tests
+  passed, but they are not represented as a visual substitute.

@@ -25,8 +25,15 @@ from typing import Any
 
 
 MAX_REFERENCE_BYTES = 50 * 1024 * 1024
-MAX_REFERENCES_PER_RUN = 5
-MAX_COMBINED_BYTES = 100 * 1024 * 1024
+MAX_REFERENCES_PER_SEND = 20
+MAX_COMBINED_BYTES_PER_SEND = 100 * 1024 * 1024
+MAX_SESSION_REFERENCE_COUNT = 100
+MAX_SESSION_REFERENCE_BYTES = 500 * 1024 * 1024
+MAX_CONCURRENT_REFERENCE_UPLOADS = 3
+# Compatibility aliases for older integrations. New code and UI use the
+# explicit send-scoped names above.
+MAX_REFERENCES_PER_RUN = MAX_REFERENCES_PER_SEND
+MAX_COMBINED_BYTES = MAX_COMBINED_BYTES_PER_SEND
 MAX_PDF_PAGES = 25
 MAX_IMAGE_FRAMES = 25
 MAX_IMAGE_PIXELS = 40_000_000
@@ -142,6 +149,10 @@ class ReferenceAttachment:
     error_message: str | None = None
     page_count: int | None = None
     frame_count: int | None = None
+    ocr_or_vision: bool = False
+    available_in_session: bool = True
+    sent_sequence: int | None = None
+    canonical_attachment_id: str | None = None
 
     def public_metadata(self) -> dict[str, Any]:
         """Return browser-safe metadata.  Filesystem paths are intentionally absent."""
@@ -150,8 +161,12 @@ class ReferenceAttachment:
             "filename": self.original_name,
             "size": self.byte_size,
             "kind": self.kind,
+            "detected_type": self.detected_type,
             "status": self.status,
             "error": self.error_message,
+            "ocr_or_vision": self.ocr_or_vision,
+            "available_in_session": self.available_in_session,
+            "pending": self.sent_sequence is None and self.owning_run_id is None,
         }
 
     def preparation_manifest_item(self) -> dict[str, Any]:

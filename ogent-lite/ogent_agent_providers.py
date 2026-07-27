@@ -17,6 +17,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -36,16 +37,12 @@ from ogent_agent_catalog import (
 )
 
 
-APP_CLIENT_VERSION = "0.9.0"
+APP_CLIENT_VERSION = "0.10.0"
 DEFAULT_DISCOVERY_TIMEOUT = 20.0
-DEFAULT_AGENT_TOOL_ALLOWLIST = (
-    "Bash",
-    "Read",
-)
-DEFAULT_AGENT_ALLOWED_TOOLS = (
-    "Bash(officecli *)",
-    "Read",
-    "mcp__officecli__officecli",
+DEFAULT_AGENT_TOOL_ALLOWLIST = ("Read",)
+DEFAULT_AGENT_ALLOWED_TOOLS = ("mcp__officecli__officecli",)
+OFFICECLI_MCP_GATEWAY = Path(__file__).resolve().with_name(
+    "ogent_officecli_mcp.py"
 )
 
 CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -97,10 +94,88 @@ class ProviderRunRequest:
     session_id: str | None
     new_session_id: str | None
     persistent: bool
+    office_document: Path | None = None
     image_paths: tuple[Path, ...] = ()
-    sandbox: str = "danger-full-access"
+    sandbox: str = "workspace-write"
     writable_directories: tuple[Path, ...] = ()
     extra_directories: tuple[Path, ...] = ()
+    event_observer: Callable[[str, dict[str, Any]], None] | None = dataclasses.field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    phase_observer: Callable[[str, dict[str, Any]], None] | None = dataclasses.field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    first_event_timeout: float = 90.0
+    inactivity_timeout: float = 300.0
+    total_timeout: float = 1800.0
+
+
+def _officecli_gateway_definition(
+    request: ProviderRunRequest,
+) -> dict[str, Any] | None:
+    if request.office_document is None:
+        return None
+    arguments = [
+        str(OFFICECLI_MCP_GATEWAY),
+        "--document",
+        str(request.office_document),
+    ]
+    read_roots = {
+        Path(path).resolve(strict=False)
+        for path in (
+            *request.writable_directories,
+            *request.extra_directories,
+        )
+    }
+    for read_root in sorted(read_roots, key=lambda path: str(path).casefold()):
+        arguments.extend(["--read-root", str(read_root)])
+    return {
+        "type": "stdio",
+        "command": sys.executable,
+        "args": arguments,
+    }
+
+
+def _claude_officecli_mcp_config(
+    request: ProviderRunRequest,
+) -> str:
+    gateway = _officecli_gateway_definition(request)
+    return json.dumps(
+        {
+            "mcpServers": (
+                {"officecli": gateway}
+                if gateway is not None
+                else {}
+            )
+        },
+        separators=(",", ":"),
+    )
+
+
+def _codex_officecli_config_arguments(
+    request: ProviderRunRequest,
+) -> list[str]:
+    gateway = _officecli_gateway_definition(request)
+    if gateway is None:
+        return []
+    return [
+        "-c",
+        "mcp_servers.officecli.command="
+        + json.dumps(gateway["command"]),
+        "-c",
+        "mcp_servers.officecli.args="
+        + json.dumps(gateway["args"], separators=(",", ":")),
+        "-c",
+        "mcp_servers.officecli.required=true",
+        "-c",
+        'mcp_servers.officecli.enabled_tools=["officecli"]',
+        "-c",
+        'mcp_servers.officecli.default_tools_approval_mode="approve"',
+    ]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -494,7 +569,6 @@ def _build_codex_from_request(
     if request.sandbox not in {
         "read-only",
         "workspace-write",
-        "danger-full-access",
     }:
         raise ValueError(f"Unsupported Codex sandbox: {request.sandbox}")
     effort_arguments: list[str] = []
@@ -508,14 +582,18 @@ def _build_codex_from_request(
         for path in request.image_paths
         for argument in ("-i", str(path))
     ]
+    officecli_arguments = _codex_officecli_config_arguments(request)
     if request.session_id:
         return [
             *resolution.command,
+            "--ask-for-approval",
+            "never",
             "exec",
             "resume",
             "-m",
             request.model,
             *effort_arguments,
+            *officecli_arguments,
             "--json",
             "--skip-git-repo-check",
             *image_arguments,
@@ -524,10 +602,18 @@ def _build_codex_from_request(
         ]
     command = [
         *resolution.command,
+        "--ask-for-approval",
+        "never",
         "exec",
+        *(
+            ["--ephemeral", "--ignore-user-config", "--ignore-rules"]
+            if not request.persistent
+            else []
+        ),
         "-m",
         request.model,
         *effort_arguments,
+        *officecli_arguments,
         "-s",
         request.sandbox,
         "--color",
@@ -547,6 +633,11 @@ def _build_claude_from_request(
     command = [
         *resolution.command,
         "-p",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        _claude_officecli_mcp_config(request),
         "--verbose",
         "--output-format",
         "stream-json",
@@ -556,14 +647,22 @@ def _build_claude_from_request(
     ]
     if request.effort != AUTOMATIC_EFFORT:
         command.extend(["--effort", request.effort])
+    tools = list(DEFAULT_AGENT_TOOL_ALLOWLIST) if request.extra_directories else []
+    allowed_tools = (
+        list(DEFAULT_AGENT_ALLOWED_TOOLS)
+        if request.office_document is not None
+        else []
+    )
+    if request.extra_directories:
+        allowed_tools.append("Read")
     command.extend(
         [
             "--permission-mode",
             "dontAsk",
             "--tools",
-            ",".join(DEFAULT_AGENT_TOOL_ALLOWLIST),
+            ",".join(tools),
             "--allowedTools",
-            ",".join(DEFAULT_AGENT_ALLOWED_TOOLS),
+            ",".join(allowed_tools),
         ]
     )
     for directory in request.extra_directories:
@@ -705,6 +804,8 @@ class BaseAgentProvider:
             creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
         )
         on_process(process)
+        if request.phase_observer is not None:
+            request.phase_observer("provider_process_spawn", {})
         if should_stop():
             terminate_process_tree(process)
         assert process.stdout is not None
@@ -731,13 +832,62 @@ class BaseAgentProvider:
         state = self.new_stream_state()
         stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
         closed = 0
+        started_at = time.perf_counter()
+        last_progress_at = started_at
+        first_event_seen = False
+        timeout_message: str | None = None
         while closed < 2:
-            stream, line = output_queue.get()
+            try:
+                stream, line = output_queue.get(timeout=0.25)
+            except queue.Empty:
+                now = time.perf_counter()
+                if should_stop():
+                    terminate_process_tree(process)
+                    continue
+                if (
+                    not first_event_seen
+                    and request.first_event_timeout > 0
+                    and now - started_at >= request.first_event_timeout
+                ):
+                    timeout_message = (
+                        f"{self.label} produced no event within "
+                        f"{request.first_event_timeout:g} seconds."
+                    )
+                elif (
+                    request.inactivity_timeout > 0
+                    and now - last_progress_at >= request.inactivity_timeout
+                ):
+                    timeout_message = (
+                        f"{self.label} produced no progress for "
+                        f"{request.inactivity_timeout:g} seconds."
+                    )
+                elif (
+                    request.total_timeout > 0
+                    and now - started_at >= request.total_timeout
+                ):
+                    timeout_message = (
+                        f"{self.label} exceeded the "
+                        f"{request.total_timeout:g}-second run limit."
+                    )
+                if timeout_message:
+                    terminate_process_tree(process)
+                    state.error_message = timeout_message
+                    if request.phase_observer is not None:
+                        request.phase_observer(
+                            "provider_timeout",
+                            {"kind": timeout_message.split(" produced", 1)[0]},
+                        )
+                continue
             if line is None:
                 closed += 1
                 continue
             if not line:
                 continue
+            last_progress_at = time.perf_counter()
+            if not first_event_seen:
+                first_event_seen = True
+                if request.phase_observer is not None:
+                    request.phase_observer("first_provider_event", {})
             if stream == "stderr":
                 stderr_tail.append(line)
                 on_activity("stderr", line)
@@ -750,10 +900,14 @@ class BaseAgentProvider:
             if not isinstance(event, dict):
                 on_activity(self.provider_id, line)
                 continue
+            if request.event_observer is not None:
+                request.event_observer(self.provider_id, event)
             activity = self.parse_stream_event(state, event)
             if activity:
                 on_activity(self.provider_id, activity)
         exit_code = process.wait()
+        if timeout_message and exit_code == 0:
+            exit_code = 124
         if state.error_message and exit_code == 0:
             exit_code = 1
         return ProviderRunResult(
@@ -1646,7 +1800,7 @@ def build_codex_command(*args: Any, **kwargs: Any) -> list[str]:
         new_session_id=None,
         persistent=True,
         image_paths=tuple(image_paths or ()),
-        sandbox=str(kwargs.get("sandbox", "danger-full-access")),
+        sandbox=str(kwargs.get("sandbox", "workspace-write")),
         writable_directories=tuple(
             kwargs.get("writable_directories") or ()
         ),

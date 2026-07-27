@@ -100,6 +100,11 @@ class ReferenceFeatureTests(unittest.TestCase):
         self.originals = {
             "STATE": ogent.STATE,
             "REFERENCE_ROOT": ogent.REFERENCE_ROOT,
+            "SESSION_MEMORY_ROOT": ogent.SESSION_MEMORY_ROOT,
+            "SESSION_MEMORY_STORE": ogent.SESSION_MEMORY_STORE,
+            "BACKUP_ROOT": ogent.BACKUP_ROOT,
+            "BACKUP_STORE": ogent.BACKUP_STORE,
+            "SERVICES_INITIALIZED": ogent.SERVICES_INITIALIZED,
             "WORK_ROOT": ogent.WORK_ROOT,
             "IMPORT_ROOT": ogent.IMPORT_ROOT,
             "RECENT_PATH": ogent.RECENT_PATH,
@@ -111,6 +116,17 @@ class ReferenceFeatureTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
         ogent.REFERENCE_ROOT = root / "temporary-references"
+        ogent.SESSION_MEMORY_ROOT = root / "session-memory"
+        ogent.SESSION_MEMORY_STORE = ogent.SessionMemoryStore(
+            ogent.SESSION_MEMORY_ROOT,
+            launch_id="reference-tests",
+        )
+        ogent.BACKUP_ROOT = root / "backups"
+        ogent.BACKUP_STORE = ogent.BackupStore(
+            ogent.BACKUP_ROOT,
+            application_version=ogent.APP_VERSION,
+        )
+        ogent.SERVICES_INITIALIZED = False
         ogent.WORK_ROOT = root / "work"
         ogent.IMPORT_ROOT = root / "imports"
         ogent.RECENT_PATH = root / "recent.json"
@@ -137,12 +153,18 @@ class ReferenceFeatureTests(unittest.TestCase):
             if active:
                 ogent.stop_active_run(session)
                 session.run_complete.wait(timeout=20)
+            ogent.close_session(session)
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
         self.assertFalse(self.thread.is_alive(), "test server did not stop")
         ogent.STATE = self.originals["STATE"]
         ogent.REFERENCE_ROOT = self.originals["REFERENCE_ROOT"]
+        ogent.SESSION_MEMORY_ROOT = self.originals["SESSION_MEMORY_ROOT"]
+        ogent.SESSION_MEMORY_STORE = self.originals["SESSION_MEMORY_STORE"]
+        ogent.BACKUP_ROOT = self.originals["BACKUP_ROOT"]
+        ogent.BACKUP_STORE = self.originals["BACKUP_STORE"]
+        ogent.SERVICES_INITIALIZED = self.originals["SERVICES_INITIALIZED"]
         ogent.WORK_ROOT = self.originals["WORK_ROOT"]
         ogent.IMPORT_ROOT = self.originals["IMPORT_ROOT"]
         ogent.RECENT_PATH = self.originals["RECENT_PATH"]
@@ -249,7 +271,10 @@ class ReferenceFeatureTests(unittest.TestCase):
         with self.session.reference_lock:
             stored = self.session.pending_references[0].source_path
         self.assertEqual(stored.name, "source.docx")
-        self.assertTrue(stored.is_relative_to(ogent.REFERENCE_ROOT))
+        assert self.session.attachment_store is not None
+        self.assertTrue(
+            stored.is_relative_to(self.session.attachment_store.canonical_root)
+        )
         self.assertEqual(
             hashlib.sha256(stored.read_bytes()).digest(),
             hashlib.sha256(uploaded_content).digest(),
@@ -302,22 +327,26 @@ class ReferenceFeatureTests(unittest.TestCase):
         with self.session.reference_lock:
             path = self.session.pending_references[0].source_path
         self.assertEqual(path.name, "source.png")
-        self.assertTrue(path.is_relative_to(ogent.REFERENCE_ROOT))
+        assert self.session.attachment_store is not None
+        self.assertTrue(
+            path.is_relative_to(self.session.attachment_store.canonical_root)
+        )
 
-    def test_five_file_limit_and_clear(self) -> None:
-        for index in range(5):
+    def test_twenty_file_limit_and_clear(self) -> None:
+        for index in range(20):
             status, _ = self.upload(f"reference-{index}.txt", f"marker {index}".encode())
             self.assertEqual(status, 201)
-        status, payload = self.upload("sixth.txt", b"too many")
+        status, payload = self.upload("twenty-first.txt", b"too many")
         self.assertEqual(status, 413, payload)
+        self.assertIn("20", payload["error"])
         with self.session.reference_lock:
-            self.assertEqual(len(self.session.pending_references), 5)
+            self.assertEqual(len(self.session.pending_references), 20)
         clear_status, result = self.post_json("/reference/clear", {})
         self.assertEqual(clear_status, 200, result)
         self.assertEqual(result["references"], [])
-        self.assertFalse((ogent.REFERENCE_ROOT / self.session.session_id).exists())
+        self.assertEqual(result["retained"], [])
 
-    def test_parallel_upload_reservations_allow_exactly_five(self) -> None:
+    def test_parallel_upload_reservations_allow_exactly_three(self) -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
             futures = [
                 executor.submit(
@@ -331,11 +360,11 @@ class ReferenceFeatureTests(unittest.TestCase):
         statuses = sorted(status for status, _ in results)
         self.assertEqual(
             statuses,
-            [201, 201, 201, 201, 201, 413],
+            [201, 201, 201, 429, 429, 429],
             results,
         )
         with self.session.reference_lock:
-            self.assertEqual(len(self.session.pending_references), 5)
+            self.assertEqual(len(self.session.pending_references), 3)
             self.assertEqual(self.session.reference_reservations, {})
             self.assertEqual(self.session.reference_operations, 0)
 
@@ -348,9 +377,18 @@ class ReferenceFeatureTests(unittest.TestCase):
             self.session.run_status = "working"
         claimed, run_root = ogent.claim_pending_references(self.session, run_id)
         self.assertEqual([item.original_name for item in claimed], ["first.txt"])
-        self.assertIsNotNone(run_root)
+        self.assertIsNone(run_root)
+        materialized, run_root = ogent.materialize_run_references(
+            self.session,
+            run_id,
+            claimed,
+        )
         assert run_root is not None
         self.assertTrue(run_root.exists())
+        self.assertEqual(
+            [item.original_name for item in materialized],
+            ["first.txt"],
+        )
 
         second_status, second = self.upload("second.txt", b"SECOND-UNIQUE")
         self.assertEqual(second_status, 201, second)
@@ -371,6 +409,13 @@ class ReferenceFeatureTests(unittest.TestCase):
         self.assertTrue(ogent.cleanup_run_references(self.session, run_id))
         self.assertFalse(run_root.exists())
         self.assertEqual(ogent._public_references(self.session), [])
+        self.assertIn(
+            first["attachment"]["id"],
+            {
+                item["id"]
+                for item in ogent._public_retained_references(self.session)
+            },
+        )
         self.assertEqual(first["attachment"]["id"], claimed[0].attachment_id)
 
     def test_two_sessions_never_share_reference_metadata(self) -> None:
@@ -477,11 +522,19 @@ class ReferenceFeatureTests(unittest.TestCase):
             self.assertIsNone(self.session.active_doc)
             transcript = [item["text"] for item in self.session.transcript]
         self.assertIn("UNIQUE-FACT-7429", transcript)
-        self.assertIn("Temporary references deleted.", transcript)
+        self.assertNotIn("Temporary references deleted.", transcript)
+        self.assertTrue(
+            any(
+                event["type"] == "activity"
+                and "Materialized run copies deleted" in event["data"]["text"]
+                for event in self.session.events
+            )
+        )
         self.assertFalse(
             (ogent.REFERENCE_ROOT / self.session.session_id / run_id).exists()
         )
         self.assertEqual(ogent._public_references(self.session), [])
+        self.assertEqual(len(ogent._public_retained_references(self.session)), 1)
         self.assertEqual(captured["model"], "gpt-5.6-sol")
         self.assertEqual(captured["reasoning"], "max")
         self.assertEqual(captured["sandbox"], "workspace-write")
@@ -575,13 +628,18 @@ class ReferenceFeatureTests(unittest.TestCase):
         self.assertFalse(
             (ogent.REFERENCE_ROOT / self.session.session_id / second_run).exists()
         )
-        with self.session.lock:
-            cleanup_messages = [
-                item
-                for item in self.session.transcript
-                if item["text"] == "Temporary references deleted."
-            ]
-        self.assertEqual(len(cleanup_messages), 2)
+        with self.session.reference_lock:
+            self.assertEqual(len(self.session.retained_references), 2)
+        self.assertTrue(
+            all(
+                not (
+                    ogent.REFERENCE_ROOT
+                    / self.session.session_id
+                    / run_id
+                ).exists()
+                for run_id in (first_run, second_run)
+            )
+        )
 
     def test_stop_terminates_active_reference_codex_process_then_cleans(self) -> None:
         status, _ = self.upload("stop.txt", b"STOP-MARKER")
@@ -648,6 +706,12 @@ class ReferenceFeatureTests(unittest.TestCase):
         run_id = "b" * 32
         references, run_root = ogent.claim_pending_references(self.session, run_id)
         self.assertEqual(len(references), 1)
+        self.assertIsNone(run_root)
+        _, run_root = ogent.materialize_run_references(
+            self.session,
+            run_id,
+            references,
+        )
         assert run_root is not None
         original_cleanup = ogent.cleanup_reference_path
 
@@ -670,7 +734,8 @@ class ReferenceFeatureTests(unittest.TestCase):
     def test_session_close_deletes_pending_references(self) -> None:
         status, _ = self.upload("close.txt", b"CLOSE")
         self.assertEqual(status, 201)
-        session_root = ogent.REFERENCE_ROOT / self.session.session_id
+        assert self.session.memory is not None
+        session_root = self.session.memory.root
         self.assertTrue(session_root.exists())
 
         self.assertTrue(ogent.close_session(self.session))

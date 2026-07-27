@@ -82,29 +82,63 @@ function Write-TrackedProcess {
     $expectedName = ''
     switch ($Extension) {
         '.docx' {
-            $window = [IntPtr]$Application.Hwnd
             $expectedName = 'WINWORD.EXE'
         }
         '.pptx' {
-            $window = [IntPtr]$Application.HWND
             $expectedName = 'POWERPNT.EXE'
         }
         '.xlsx' {
-            $window = [IntPtr]$Application.Hwnd
             $expectedName = 'EXCEL.EXE'
         }
         default {
             throw 'Unsupported Office reference type.'
         }
     }
-    if ($window -eq [IntPtr]::Zero) {
-        throw 'Could not identify the Office automation window.'
+
+    # Hwnd is available on current Office automation objects, but some
+    # installations omit it from the exposed COM type information. Resolve it
+    # dynamically so StrictMode does not turn that compatibility difference
+    # into an export failure.
+    $windowProperty = $Application.PSObject.Properties |
+        Where-Object {
+            $_.Name.Equals(
+                'Hwnd',
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        } |
+        Select-Object -First 1
+    if ($null -ne $windowProperty) {
+        try {
+            $window = [IntPtr]$windowProperty.Value
+        }
+        catch {
+            $window = [IntPtr]::Zero
+        }
     }
+
     $processId = [uint32]0
-    [void][OgentReferenceWindow]::GetWindowThreadProcessId(
-        $window,
-        [ref]$processId
-    )
+    if ($window -ne [IntPtr]::Zero) {
+        [void][OgentReferenceWindow]::GetWindowThreadProcessId(
+            $window,
+            [ref]$processId
+        )
+    }
+    if ($processId -eq 0) {
+        $processBaseName = [System.IO.Path]::GetFileNameWithoutExtension(
+            $expectedName
+        )
+        $newProcesses = @(
+            Get-Process -Name $processBaseName -ErrorAction SilentlyContinue |
+                Where-Object { [int]$_.Id -notin $ExistingProcessIds }
+        )
+        if ($newProcesses.Count -ne 1) {
+            throw (
+                'Could not uniquely identify the new Office automation ' +
+                'process without an application window handle.'
+            )
+        }
+        $processId = [uint32]$newProcesses[0].Id
+    }
     if ($processId -eq 0) {
         throw 'Could not identify the Office automation process.'
     }
@@ -124,10 +158,15 @@ function Write-TrackedProcess {
     ) {
         throw 'The tracked Office process did not match the expected application.'
     }
-    [pscustomobject]@{
+    $trackingJson = [pscustomobject]@{
         pid = [int]$processId
         process_name = $expectedName
-    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+    } | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText(
+        $Path,
+        $trackingJson,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
     return [int]$processId
 }
 
@@ -230,7 +269,12 @@ function Invoke-OfficeExport {
                     0,
                     0
                 )
-                $document.ExportAsFixedFormat($Destination, 2)
+                # Some installed PowerPoint COM type libraries expose
+                # ExportAsFixedFormat's enum parameter as an opaque Object and
+                # reject the numeric ppFixedFormatTypePDF value. SaveAs with
+                # ppSaveAsPDF (32) is supported across those versions and
+                # writes only the supplied derivative path.
+                $document.SaveAs($Destination, 32)
             }
             '.xlsx' {
                 $application = New-Object -ComObject Excel.Application

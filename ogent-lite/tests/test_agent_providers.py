@@ -95,6 +95,40 @@ class QueueLineStream:
         return value
 
 
+class BlockingRunStream:
+    def __init__(self) -> None:
+        self.items: queue.Queue[str | None] = queue.Queue()
+
+    def readline(self) -> str:
+        value = self.items.get()
+        return "" if value is None else value
+
+    def close(self) -> None:
+        self.items.put(None)
+
+
+class SilentRunProcess:
+    def __init__(self) -> None:
+        self.stdout = BlockingRunStream()
+        self.stderr = BlockingRunStream()
+        self.returncode: int | None = None
+        self.pid = 45000
+
+    def stop(self) -> None:
+        if self.returncode is None:
+            self.returncode = 124
+            self.stdout.close()
+            self.stderr.close()
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("silent-run", timeout)
+        return self.returncode
+
+
 class FakeAppServerStdin:
     def __init__(self, process: "FakeAppServerProcess") -> None:
         self.process = process
@@ -685,6 +719,61 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
         self.assertNotIn("model_reasoning_effort", " ".join(codex))
         self.assertNotIn("--effort", claude)
 
+    def test_codex_ephemeral_run_ignores_user_config_and_uses_workspace_write(
+        self,
+    ) -> None:
+        command = build_codex_command(
+            self.resolution,
+            ProviderRunRequest(
+                prompt="Work.",
+                working_directory=Path.cwd(),
+                model="catalog-model",
+                effort=AUTOMATIC_EFFORT,
+                session_id=None,
+                new_session_id=None,
+                persistent=False,
+                office_document=Path.cwd() / "active.docx",
+            ),
+        )
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertEqual(
+            command[command.index("--ask-for-approval") + 1],
+            "never",
+        )
+        self.assertEqual(command[command.index("-s") + 1], "workspace-write")
+        self.assertIn("mcp_servers.officecli.required=true", command)
+        self.assertIn(
+            'mcp_servers.officecli.enabled_tools=["officecli"]',
+            command,
+        )
+        self.assertIn(
+            'mcp_servers.officecli.default_tools_approval_mode="approve"',
+            command,
+        )
+        self.assertTrue(
+            any(
+                "ogent_officecli_mcp.py" in argument
+                for argument in command
+            )
+        )
+        self.assertNotIn("danger-full-access", command)
+
+    def test_codex_rejects_danger_full_access(self) -> None:
+        request = ProviderRunRequest(
+            prompt="Work.",
+            working_directory=Path.cwd(),
+            model="catalog-model",
+            effort=AUTOMATIC_EFFORT,
+            session_id=None,
+            new_session_id=None,
+            persistent=False,
+            sandbox="danger-full-access",
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported Codex sandbox"):
+            build_codex_command(self.resolution, request)
+
     def test_claude_first_resume_and_reference_session_arguments(self) -> None:
         session_id = str(uuid.uuid4())
         base = dict(
@@ -741,15 +830,36 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
                 session_id=None,
                 new_session_id=str(uuid.uuid4()),
                 persistent=True,
+                office_document=Path.cwd() / "active.docx",
             ),
         )
         rendered = " ".join(command)
         self.assertIn("--verbose", command)
-        self.assertIn("Bash(officecli *)", rendered)
-        self.assertIn("mcp__officecli__officecli", rendered)
-        self.assertIn("Read", rendered)
+        self.assertNotIn("--safe-mode", command)
+        self.assertEqual(
+            command[command.index("--setting-sources") + 1],
+            "",
+        )
+        self.assertIn("--strict-mcp-config", command)
+        mcp_config = json.loads(command[command.index("--mcp-config") + 1])
+        officecli_server = mcp_config["mcpServers"]["officecli"]
+        self.assertEqual(officecli_server["type"], "stdio")
+        self.assertEqual(officecli_server["command"], sys.executable)
+        self.assertIn("ogent_officecli_mcp.py", officecli_server["args"][0])
+        self.assertEqual(officecli_server["args"][1], "--document")
+        self.assertEqual(
+            officecli_server["args"][2],
+            str(Path.cwd() / "active.docx"),
+        )
+        self.assertNotIn("Bash", rendered)
+        self.assertNotIn("Read", rendered)
+        self.assertEqual(
+            command[command.index("--allowedTools") + 1],
+            "mcp__officecli__officecli",
+        )
         self.assertNotIn("--dangerously-skip-permissions", command)
         self.assertNotIn("bypassPermissions", command)
+        self.assertNotIn("--bare", command)
 
     def test_claude_stream_does_not_duplicate_partial_and_final_text(self) -> None:
         provider = ClaudeProvider()
@@ -789,6 +899,53 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
         self.assertEqual(state.final_text, "Done.")
         self.assertEqual(state.session_id, "session-fixture")
         self.assertEqual(state.usage["output_tokens"], 3)
+
+    def test_first_event_timeout_is_actionable_and_terminates_process(
+        self,
+    ) -> None:
+        process = SilentRunProcess()
+        provider = CodexProvider(popen_factory=lambda *_args, **_kwargs: process)
+        request = ProviderRunRequest(
+            prompt="Work.",
+            working_directory=Path.cwd(),
+            model="catalog-model",
+            effort=AUTOMATIC_EFFORT,
+            session_id=None,
+            new_session_id=None,
+            persistent=False,
+            first_event_timeout=0.01,
+            inactivity_timeout=2,
+            total_timeout=3,
+        )
+        phases: list[tuple[str, dict[str, Any]]] = []
+        request = __import__("dataclasses").replace(
+            request,
+            phase_observer=lambda phase, detail: phases.append((phase, detail)),
+        )
+        with (
+            mock.patch.object(
+                provider,
+                "resolve_cli",
+                return_value=self.resolution,
+            ),
+            mock.patch(
+                "ogent_agent_providers.terminate_process_tree",
+                side_effect=lambda _process: process.stop(),
+            ),
+        ):
+            result = provider.run_agent(
+                request,
+                on_process=lambda _process: None,
+                on_activity=lambda _stream, _text: None,
+                should_stop=lambda: False,
+            )
+
+        self.assertEqual(result.exit_code, 124)
+        self.assertIn("produced no event", result.error_message or "")
+        self.assertTrue(
+            any(phase == "provider_timeout" for phase, _detail in phases)
+        )
+        self.assertIsNotNone(process.poll())
 
     def test_structured_claude_error_is_captured(self) -> None:
         provider = ClaudeProvider()
@@ -838,7 +995,7 @@ class ProviderSessionTests(unittest.TestCase):
         self.assertNotEqual(first.codex_thread_id, second.codex_thread_id)
         self.assertNotEqual(first.claude_session_id, second.claude_session_id)
 
-    def test_model_change_starts_fresh_context(self) -> None:
+    def test_model_change_uses_fresh_context_without_native_thread_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             session = ogent.SessionState("fixture")
@@ -863,6 +1020,15 @@ class ProviderSessionTests(unittest.TestCase):
                 captured["model"] = model
                 return 0, "new-thread", "Done.", []
 
+            timing = ogent.RunTiming(
+                provider="codex",
+                model="new-model",
+                effort=AUTOMATIC_EFFORT,
+                context_mode="fresh",
+                prompt_bytes=0,
+                attachment_count=0,
+                materialized_bytes=0,
+            )
             with mock.patch.object(
                 ogent,
                 "ensure_watch",
@@ -871,6 +1037,10 @@ class ProviderSessionTests(unittest.TestCase):
                 ogent,
                 "_run_codex_once",
                 side_effect=fake_codex,
+            ), mock.patch.object(
+                ogent,
+                "run_quiet",
+                return_value=subprocess.CompletedProcess([], 0, "{}", ""),
             ):
                 ogent._agent_worker(
                     session,
@@ -883,12 +1053,14 @@ class ProviderSessionTests(unittest.TestCase):
                     "run-id",
                     [],
                     None,
+                    None,
+                    timing,
                 )
 
             self.assertIsNone(captured["thread_id"])
             self.assertEqual(captured["model"], "new-model")
-            self.assertEqual(session.codex_thread_id, "new-thread")
-            self.assertEqual(session.codex_model_id, "new-model")
+            self.assertEqual(session.codex_thread_id, "old-thread")
+            self.assertEqual(session.codex_model_id, "old-model")
 
     def test_failed_and_stopped_codex_runs_discard_discovered_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -963,6 +1135,15 @@ class ProviderSessionTests(unittest.TestCase):
                         "_run_codex_once",
                         side_effect=fake_codex,
                     ):
+                        timing = ogent.RunTiming(
+                            provider="codex",
+                            model="new-model",
+                            effort=AUTOMATIC_EFFORT,
+                            context_mode="fresh",
+                            prompt_bytes=0,
+                            attachment_count=0,
+                            materialized_bytes=0,
+                        )
                         ogent._agent_worker(
                             session,
                             "Work.",
@@ -974,12 +1155,14 @@ class ProviderSessionTests(unittest.TestCase):
                             "run-id",
                             [],
                             None,
+                            None,
+                            timing,
                         )
 
                     self.assertEqual(session.codex_thread_id, "prior-thread")
                     self.assertEqual(session.codex_model_id, "prior-model")
 
-    def test_reference_claude_run_is_ephemeral_and_next_run_is_clean(self) -> None:
+    def test_every_claude_run_is_ephemeral_and_provider_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             session = ogent.SessionState("fixture")
@@ -1034,11 +1217,11 @@ class ProviderSessionTests(unittest.TestCase):
                 requests[0].extra_directories,
                 (root / "temporary-run",),
             )
-            self.assertTrue(requests[1].persistent)
+            self.assertFalse(requests[1].persistent)
             self.assertIsNone(requests[1].session_id)
-            self.assertIsNotNone(requests[1].new_session_id)
+            self.assertIsNone(requests[1].new_session_id)
             self.assertEqual(requests[1].extra_directories, ())
-            self.assertIsNotNone(second[1])
+            self.assertIsNone(second[1])
 
     def test_stop_targets_the_active_provider_process(self) -> None:
         session = ogent.SessionState("fixture")

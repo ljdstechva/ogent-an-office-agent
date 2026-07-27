@@ -160,11 +160,16 @@ class ShellOpenTests(unittest.TestCase):
         session = self.state.create_session()
         session.connect_sse("upload-client")
         content = b"fake-office-package"
-        calls: list[tuple[Any, str, bytes]] = []
+        calls: list[tuple[Any, str, bytes, str]] = []
 
-        def fake_dispatch(current: Any, raw_path: str) -> dict[str, Any]:
+        def fake_dispatch(
+            current: Any,
+            raw_path: str,
+            *,
+            origin: str = "local_path",
+        ) -> dict[str, Any]:
             path = Path(raw_path)
-            calls.append((current, raw_path, path.read_bytes()))
+            calls.append((current, raw_path, path.read_bytes(), origin))
             return {
                 "action": "document_opened",
                 "session_id": current.session_id,
@@ -193,6 +198,7 @@ class ShellOpenTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIs(calls[0][0], session)
         self.assertEqual(calls[0][2], content)
+        self.assertEqual(calls[0][3], "browser_upload")
         imported = Path(calls[0][1])
         self.assertEqual(imported.name, filename)
         self.assertTrue(imported.is_relative_to(ogent.IMPORT_ROOT))
