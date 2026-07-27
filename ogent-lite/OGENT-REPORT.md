@@ -1,9 +1,9 @@
 # Ogent Lite Verification Report
 
 Date: 2026-07-27
-Status: v0.10.0 automated and core live-provider acceptance passed. The
-in-app browser control surface was unavailable for the final responsive visual
-pass; earlier release matrices are retained below as historical evidence.
+Status: v0.10.0 automated, live-provider, recovery, and responsive visual
+acceptance passed. Earlier release matrices are retained below as historical
+evidence.
 
 ## Current runtime and architecture
 
@@ -894,13 +894,31 @@ than 10% median regression).
 
 ### Automated and visual gate
 
-- Final deterministic suite: 135 tests and 46 subtests.
+- Final deterministic suite: 137 tests and 46 subtests.
 - Python compilation, Ruff, PowerShell parser validation, `git diff --check`,
-  OfficeCLI package validation, and real Word/Excel/PowerPoint helper exports
-  passed.
-- The in-app browser runtime returned no available browser binding. Per the
-  browser-control rules, no unrelated browser backend was substituted.
-  Responsive 1440x900/390x844 screenshots and a fresh visual inspection of all
-  four turn-status icons therefore remain the one uncompleted v0.10 check.
-  Selection protocol/backend behavior and existing browser regression tests
-  passed, but they are not represented as a visual substitute.
+  and OfficeCLI validation of all 13 packaged Office fixtures passed.
+- The in-app browser runtime returned no available browser binding. The
+  project-approved Playwright fallback then exercised the exact release build
+  in real Chromium at 1440x900 and 390x844.
+- Ten final screenshots were inspected: initial desktop, two-selection plus
+  attachment context, Settings/recovery, mobile top/composer/Settings, and
+  working/completed/stopped/error states. The interface showed v0.10.0,
+  CLI-verified `gpt-5.6-sol` with low effort, no horizontal page overflow or
+  clipped controls, and no mobile transcript/composer overlap.
+- Browser assertions found zero unexpected console warnings/errors, page
+  errors, failed requests, or HTTP errors. Expected loopback OfficeCLI
+  event-stream cancellations during watch replacement were classified
+  separately and were not treated as application failures.
+- A real Codex `gpt-5.6-sol` run submitted two preview selections and one
+  attachment, changed only those two DOCX paragraphs to italic, and passed
+  OfficeCLI readback and validation. The adjacent paragraph and table
+  sentinels remained unchanged.
+- The recovery copy SHA-256 was
+  `894854D9B8A1768A90F853006283354F20BC1448AB755606841CB8FDB03D7BB5`,
+  exactly matching the pre-edit document. The edited document had a distinct
+  hash and validated with zero errors.
+- Visual QA exposed and fixed three final defects before acceptance: the
+  missing visible version string, a programmatic selection-event echo that
+  could collapse touch multi-select context, and a 390 px transcript/composer
+  grid overlap. Regression coverage was added for the selection echo and
+  mobile layout contract.

@@ -2013,6 +2013,20 @@ def preview_selection_public(session: SessionState) -> dict[str, Any]:
     return value
 
 
+def post_session_watch_selection(
+    session: SessionState,
+    port: int,
+    paths: list[str],
+) -> None:
+    """Update the watch while preventing its SSE echo from becoming a click."""
+    with session.lock:
+        broker = session.selection_broker
+    if broker is not None and broker.port == port:
+        broker.post_selection(paths)
+        return
+    post_watch_selection(port, paths)
+
+
 def start_selection_broker(
     session: SessionState,
     *,
@@ -2044,7 +2058,7 @@ def start_selection_broker(
                         item.path for item in session.preview_selection.targets
                     ]
                 clicked = paths[0]
-                paths = (
+                merged_paths = (
                     [
                         item
                         for item in existing_paths
@@ -2053,7 +2067,9 @@ def start_selection_broker(
                     if clicked in existing_paths
                     else [*existing_paths, clicked]
                 )
-                post_watch_selection(port, paths)
+                if merged_paths != paths:
+                    post_session_watch_selection(session, port, merged_paths)
+                paths = merged_paths
             targets = session.preview_selection.apply_paths(
                 paths,
                 lambda selected: _resolve_preview_nodes(
@@ -2068,7 +2084,7 @@ def start_selection_broker(
             )
             accepted_paths = [item.path for item in targets]
             if accepted_paths != paths:
-                post_watch_selection(port, accepted_paths)
+                post_session_watch_selection(session, port, accepted_paths)
             session.add_activity(
                 "selection",
                 f"Selected {len(targets)} focused preview target(s).",
@@ -4084,7 +4100,7 @@ def remove_preview_selection(
         if port is None:
             raise UserFacingError("The OfficeCLI preview is not available.", 409)
         try:
-            post_watch_selection(port, remaining_paths)
+            post_session_watch_selection(session, port, remaining_paths)
             session.preview_selection.remove(selection_id)
         except PreviewSelectionError as exc:
             raise UserFacingError(str(exc), 409) from exc
@@ -4097,7 +4113,7 @@ def clear_preview_selection(session: SessionState) -> None:
     with session.preview_selection.lock:
         if port is not None:
             try:
-                post_watch_selection(port, [])
+                post_session_watch_selection(session, port, [])
             except PreviewSelectionError as exc:
                 raise UserFacingError(str(exc), 409) from exc
         session.preview_selection.clear()
@@ -4116,6 +4132,7 @@ def accept_postmessage_selection(
         document = session.active_doc
         revision = session.document_revision
         document_id = session.document_id
+        multi_mode = session.selection_multi_mode
     if port is None or document is None:
         raise UserFacingError("The OfficeCLI preview is not available.", 409)
     expected_origin = f"http://{HOST}:{port}"
@@ -4126,6 +4143,12 @@ def accept_postmessage_selection(
             expected_origin=expected_origin,
             source_matches=source_matches,
         )
+        if multi_mode and len(paths) == 1:
+            # The OfficeCLI SSE broker owns touch-toggle semantics. A browser click
+            # also emits this postMessage copy, which can arrive after the broker
+            # has already merged the clicked path into the multi-selection. Do not
+            # let that duplicate single-path envelope overwrite the merged set.
+            return
         targets = session.preview_selection.apply_paths(
             paths,
             lambda selected: _resolve_preview_nodes(
@@ -4141,7 +4164,7 @@ def accept_postmessage_selection(
         )
         accepted_paths = [item.path for item in targets]
         if accepted_paths != paths:
-            post_watch_selection(port, accepted_paths)
+            post_session_watch_selection(session, port, accepted_paths)
     except PreviewSelectionError as exc:
         raise UserFacingError(str(exc), 409) from exc
     emit_preview_selection(session)
@@ -5104,9 +5127,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       .chat-pane {
         width: 100%;
         min-width: 0;
-        min-height: 700px;
-        flex: 0 0 max(700px, 75vh);
+        min-height: 0;
+        flex: 0 0 auto;
+        grid-template-rows: auto auto auto auto auto;
       }
+      .transcript { max-height: min(320px, 38vh); }
       .preview-shell { padding: 10px; }
       .empty-document {
         width: calc(100% - 28px);
@@ -5180,7 +5205,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           <h2>Ogent</h2>
           <p>Plain-language Office editing</p>
         </div>
-        <span class="lite-badge">LITE</span>
+        <span class="lite-badge">LITE __VERSION__</span>
         <button class="settings-button" id="settingsButton" type="button" aria-label="Settings and recovery" title="Settings and recovery">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true" focusable="false">
             <circle cx="12" cy="12" r="3.2"/>
@@ -7377,6 +7402,7 @@ class OgentHandler(BaseHTTPRequestHandler):
                 HTML_TEMPLATE.replace("__TOKEN__", STATE.token)
                 .replace("__NONCE__", nonce)
                 .replace("__SESSION_ID__", session.session_id)
+                .replace("__VERSION__", APP_VERSION)
             )
             self._send_bytes(
                 200,

@@ -282,6 +282,27 @@ class PreviewSelectionTests(unittest.TestCase):
         self.assertEqual(selections, [["/body/p[1]", "/body/p[2]"]])
         self.assertEqual(documents, [{"action": "replace", "html": "ignored"}])
 
+    def test_broker_suppresses_only_the_matching_programmatic_echo(self) -> None:
+        selections: list[list[str]] = []
+        broker = OfficeCLISelectionBroker(
+            26320,
+            on_selection=selections.append,
+        )
+        with mock.patch(
+            "ogent_preview_selection.post_watch_selection"
+        ) as post_selection:
+            broker.post_selection(["/body/p[1]"])
+
+        post_selection.assert_called_once_with(26320, ["/body/p[1]"])
+        echo = json.dumps(
+            {"action": "selection-update", "paths": ["/body/p[1]"]}
+        )
+        broker._dispatch(echo)
+        self.assertEqual(selections, [])
+
+        broker._dispatch(echo)
+        self.assertEqual(selections, [["/body/p[1]"]])
+
     def test_broker_does_not_expire_an_idle_sse_stream(self) -> None:
         response = mock.MagicMock()
         response.readline.return_value = b""

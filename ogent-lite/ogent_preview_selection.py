@@ -10,6 +10,7 @@ import json
 import re
 import secrets
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -635,6 +636,44 @@ class OfficeCLISelectionBroker:
         self.stop_event = threading.Event()
         self.response: Any | None = None
         self.thread: threading.Thread | None = None
+        self._selection_echo_sequence = 0
+        self._expected_selection_echoes: list[
+            tuple[int, tuple[str, ...], float]
+        ] = []
+
+    def post_selection(self, paths: Iterable[str]) -> None:
+        """Update the watch selection and suppress its matching SSE echo."""
+        values = [str(path) for path in paths]
+        with self.lock:
+            self._selection_echo_sequence += 1
+            marker = self._selection_echo_sequence
+            self._expected_selection_echoes.append(
+                (marker, tuple(values), time.monotonic() + 2.0)
+            )
+            self._expected_selection_echoes = self._expected_selection_echoes[-64:]
+        try:
+            post_watch_selection(self.port, values)
+        except Exception:
+            with self.lock:
+                self._expected_selection_echoes = [
+                    item
+                    for item in self._expected_selection_echoes
+                    if item[0] != marker
+                ]
+            raise
+
+    def _consume_expected_selection_echo(self, paths: list[str]) -> bool:
+        key = tuple(str(path) for path in paths)
+        now = time.monotonic()
+        with self.lock:
+            self._expected_selection_echoes = [
+                item for item in self._expected_selection_echoes if item[2] >= now
+            ]
+            for index, item in enumerate(self._expected_selection_echoes):
+                if item[1] == key:
+                    self._expected_selection_echoes.pop(index)
+                    return True
+        return False
 
     def start(self) -> None:
         with self.lock:
@@ -719,7 +758,9 @@ class OfficeCLISelectionBroker:
         if payload.get("action") == "selection-update":
             paths = payload.get("paths")
             if isinstance(paths, list):
-                self.on_selection([str(item) for item in paths])
+                normalized = [str(item) for item in paths]
+                if not self._consume_expected_selection_echo(normalized):
+                    self.on_selection(normalized)
             return
         if (
             payload.get("action") not in {"mark-update"}

@@ -477,6 +477,72 @@ class V010IntegrationTests(unittest.TestCase):
                 )
                 self.assertTrue(session.run_complete.is_set())
 
+    def test_touch_multi_select_bridge_does_not_overwrite_broker_merge(
+        self,
+    ) -> None:
+        session = self.state.create_session()
+        document = self.root / "multi-select.docx"
+        document.write_bytes(b"synthetic")
+        document_id = "document-12345678"
+        with session.lock:
+            session.active_doc = document.resolve()
+            session.watch_port = 26320
+            session.document_id = document_id
+            session.document_revision = 1
+            session.selection_multi_mode = True
+        session.preview_selection.reset_for_watch(
+            document_id=document_id,
+            document_name=document.name,
+            document_format="docx",
+            revision=1,
+        )
+
+        def resolve(paths: list[str]) -> list[dict[str, object]]:
+            return [
+                {
+                    "type": "paragraph",
+                    "text": f"Target {index}",
+                    "preview": f"Target {index}",
+                    "style": "Normal",
+                    "format": {},
+                }
+                for index, _path in enumerate(paths, start=1)
+            ]
+
+        session.preview_selection.apply_paths(
+            ["/body/p[1]", "/body/p[2]"],
+            resolve,
+            expected_watch_id=session.preview_selection.watch_id,
+            expected_document_id=document_id,
+            expected_revision=1,
+        )
+        payload = session.preview_selection.public_state()
+        payload.update(
+            {
+                "type": "selection.changed",
+                "selected": [{"path": "/body/p[2]"}],
+                "primary_path": "/body/p[2]",
+            }
+        )
+
+        with (
+            mock.patch.object(ogent, "_resolve_preview_nodes") as resolver,
+            mock.patch.object(ogent, "post_watch_selection") as post_selection,
+        ):
+            ogent.accept_postmessage_selection(
+                session,
+                payload,
+                event_origin="http://127.0.0.1:26320",
+                source_matches=True,
+            )
+
+        self.assertEqual(
+            [item.path for item in session.preview_selection.targets],
+            ["/body/p[1]", "/body/p[2]"],
+        )
+        resolver.assert_not_called()
+        post_selection.assert_not_called()
+
     def test_ui_template_has_accessible_status_settings_and_selection_contract(
         self,
     ) -> None:
@@ -492,6 +558,9 @@ class V010IntegrationTests(unittest.TestCase):
         self.assertIn("Clear selection", html)
         self.assertIn("Touch multi-select", html)
         self.assertIn("@media (max-width: 820px)", html)
+        self.assertIn("grid-template-rows: auto auto auto auto auto;", html)
+        self.assertIn("max-height: min(320px, 38vh);", html)
+        self.assertIn("LITE __VERSION__", html)
         self.assertIn("Editing original · recovery backup created", html)
         self.assertIn("Browser upload · editing an imported copy", html)
         self.assertNotIn("Delete all backups", html)

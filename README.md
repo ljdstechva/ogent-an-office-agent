@@ -390,17 +390,25 @@ Browser UI (127.0.0.1) -> Ogent session memory -> fresh selected agent CLI
 - Live, zero-inference CLI capability discovery for both installed providers
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
-Automated coverage passed with 135 tests and 46 subtests before the final
-documentation-only changes. Live checks covered direct Word/Excel/PowerPoint
-edits with unchanged backups, protected PDF conversion/editing, provider-neutral
-Codex -> Claude -> Codex memory, 20 retained attachments plus a second batch,
-nine preview-selection protocol cases, and fail-closed gateway/security paths.
-The controlled simple-edit medians improved from 142.228 s to 48.393 s for
-Codex and from 47.306 s to 21.501 s for Claude. The in-app browser control
-surface was unavailable during this v0.10 run, so responsive visual inspection
-was not re-claimed; the protocol/backend and existing browser regressions were
-run instead. See [ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for
-the detailed evidence.
+Automated coverage passed with 137 tests and 46 subtests on the exact release
+build. Live checks covered direct Word/Excel/PowerPoint edits with unchanged
+backups, protected PDF conversion/editing, provider-neutral Codex -> Claude ->
+Codex memory, 20 retained attachments plus a second batch, preview-selection
+protocol cases, and fail-closed gateway/security paths. The controlled
+simple-edit medians improved from 142.228 s to 48.393 s for Codex and from
+47.306 s to 21.501 s for Claude.
+
+The final responsive gate used real Chromium through the project-approved
+Playwright fallback after the in-app browser returned no available binding.
+All ten 1440x900 and 390x844 screenshots were inspected. Version identity,
+recovery and memory settings, attachment and two-target selection context,
+working/completed/stopped/error states, responsive Office page scaling, and
+mobile transcript/composer separation passed with no unexpected console, page,
+HTTP, or request failures. The real Codex `gpt-5.6-sol` selected-text edit
+changed only the two target paragraphs; its physical recovery backup matched
+the pre-edit SHA-256 exactly. See
+[ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for the detailed
+evidence.
 The repository's 13 original Office test artifacts also pass OpenXML validation;
 see [TEST-REPORT.md](TEST-REPORT.md).
 
