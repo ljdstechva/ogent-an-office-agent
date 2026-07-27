@@ -1,25 +1,27 @@
 # Ogent Lite Verification Report
 
-Date: 2026-07-24
-Status: T1-T7, S1-S8, and M1-M12 pass
+Date: 2026-07-27
+Status: v0.9.0 automated and live provider acceptance passed; earlier release
+matrices are retained below as historical evidence.
 
-## Runtime and architecture
+## Current runtime and architecture
 
 - Runtime: system Python 3.14.3
-- Application: one Python file with embedded HTML, CSS, and JavaScript
-- Dependencies: Python standard library only
+- Application: `ogent.py` with embedded HTML/CSS/JavaScript plus separate
+  provider and capability-catalog adapters
+- Dependencies: Python standard library, plus the existing pinned reference
+  inspection packages
 - Server bind: `127.0.0.1` only
 - Preferred app port: 8765, with automatic upward fallback
 - OfficeCLI watch ports: one per session, allocated from 26320-26380
-- Agent backend: Codex CLI 0.144.1
-- Models: selectable `gpt-5.6-sol` or `gpt-5.6-terra`
-- Reasoning effort: selectable low, medium, high, xhigh, max, or ultra
-- Recommended defaults: `gpt-5.6-sol` with medium reasoning
-- OfficeCLI: 1.0.141
-- Browser test engine: Playwright with installed Microsoft Edge
+- Agent backends observed live: Codex CLI 0.145.0 and Claude Code 2.1.220
+- Model and effort source: the installed, authenticated provider CLI; Ogent has
+  no static provider model or effort catalog
+- OfficeCLI: 1.0.142
 
-The direct Codex preflight returned `READY` in 15.724 seconds. The global Codex
-instructions contain the mandatory OfficeCLI routing block.
+The v0.9.0 acceptance evidence appears in the final section. Statements in the
+v0.1.0 through v0.8.0 sections describe those historical releases and are not
+the current catalog or session architecture.
 
 ## Live test matrix
 
@@ -328,3 +330,460 @@ Final v0.5.0 state: implementation and documentation are locally committed,
 the per-user shell integration is enabled, the backend is stopped after the
 clean self-exit test, personal/source-derived documents remain untracked, and
 no public push was performed.
+
+## v0.6.0 - focused shell open and seamless preview handoff
+
+The user approved the existing Quiet Signal mark on 2026-07-26. Its approved
+parameters remain the 240 x 240 rounded badge at `(8, 8)` with radius 56, navy
+`#17324d` to teal `#0d9488`, a white ring centered at `(128, 120)` with radius
+66 and stroke 30, and the `#14b8a6` live dot at `(175, 167)` with radius 16 and
+white stroke 3. Revalidation confirmed all seven PNG dimensions and a
+Windows-loadable 44,813-byte ICO.
+
+### Shell behavior restored on the v0.5 session architecture
+
+- Explorer opens now select the most recently focused connected workspace
+  rather than silently creating a new session. Browser focus is recorded by
+  `POST /session/focus`; the initial SSE connection also establishes activity.
+- The selected workspace's SSE stream receives the document switch, while the
+  CLI still opens the predictable extra tab required by the shell contract.
+- A busy selected workspace returns HTTP 409, records the exact message in that
+  workspace, and returns its session id so the extra tab opens on the visible
+  error instead of an unrelated new workspace.
+- Independent sessions created through **+ New window** or a normal second
+  launch remain intact. Same-source dedupe still focuses the owning session.
+- Warm switching now starts the replacement OfficeCLI watch on a new port,
+  publishes it when ready, and retires the previous watch in the background.
+  DOCX complex-layout inspection runs concurrently with watch startup.
+- Ogent-owned OfficeCLI work now uses the workspace's validated direct mode,
+  `OFFICECLI_NO_AUTO_RESIDENT=1`, with per-mutation flushing retained.
+
+### v0.6 live evidence
+
+| Check | Result |
+|---|---|
+| Cold `--open` | A clean backend started v0.6.0 on port 8900, opened the Word fixture in session `a2a0c28c`, launched a healthy protected watch, and emitted the exact browser session URL. |
+| Warm Word | PASS in 2.919 seconds; the existing Playwright tab updated through SSE and displayed the complete Word fixture. |
+| Warm Excel | PASS in 2.976 seconds. |
+| Warm PowerPoint | PASS in 2.839 seconds. |
+| Unicode path | `résumé test file.docx` opened in 2.907 seconds; the source name remained Unicode in session state and the live preview rendered correctly. |
+| Busy guard | A real GPT-5.6 Sol read-only run was started, an immediate shell open returned exit 1 / HTTP 409, the document remained unchanged, the exact busy message appeared in the live transcript, and Stop ended the run. |
+| PDF direct open | Returned `pdf_import`, completed via SSE without polling, produced a validated searchable working DOCX with a healthy watch, and preserved the PDF hash. |
+| Same-source dedupe | A duplicate PDF open focused the existing session and left one session plus one isolated OfficeCLI watch. |
+| Source preservation | SHA-256 hashes for Word, Unicode Word, Excel, PowerPoint, and PDF fixtures were identical before and after the matrix. |
+| Browser brand | Inline SVG favicon present; toolbar mark measured 28 x 28; empty-state SVG present; zero browser console errors or warnings. |
+| Shell registry | Unregister removed all six verb/command keys; absence was verified; register restored exact label, icon, `pythonw.exe` command, and quoted `%1` for `.docx`, `.xlsx`, and `.pptx`; `.pdf` remained absent; Explorer icon cache was refreshed. |
+| Protocol regressions | Six stdlib unit tests passed: connected-focus selection, resident-backend session creation, replacement-port reservation, direct-mode environment, busy 409 transcript/session targeting, and warm workspace reuse. Python compilation, Ruff, and `git diff --check` also passed. |
+
+The final Windows Explorer gesture checks for v0.6.0 remain human-operated:
+confirm the icon and no-console behavior for one Word, Excel, and PowerPoint
+right-click. The same registered `pythonw.exe` command and icon passed the
+earlier v0.4.0 human matrix; the v0.6 command path and all downstream behavior
+have been revalidated above.
+
+## v0.7.0 - drag-and-drop reference workflow
+
+Verified on 2026-07-26 with Python 3.14.3, OfficeCLI 1.0.141, Microsoft Word,
+Chrome, and Playwright CLI. This release makes drag-and-drop the primary
+document-entry workflow while retaining the v0.6 right-click behavior.
+
+### Behavior delivered
+
+- A file can be dropped on the visible drop target or anywhere in the Ogent
+  browser window. Clicking the target opens the native file chooser.
+- DOCX, XLSX, PPTX, and PDF are accepted one at a time up to 128 MB.
+- Browser security does not expose the original Windows path. Ogent therefore
+  preserves the exact received bytes under
+  `%LOCALAPPDATA%\OgentLite\imports\`, then creates the independently editable
+  working copy under `%LOCALAPPDATA%\OgentLite\work\`.
+- The full-window drop overlay explains the action and source-file protection.
+  Busy runs, snapshots, and uploads disable competing document opens.
+- Dropping a supported file onto the Ogent desktop shortcut now forwards that
+  file to `ogent.py --open`; normal double-click launch and `ogent.cmd stop`
+  remain unchanged.
+- Right-click **Open in Ogent** remains enabled for DOCX, XLSX, and PPTX.
+
+### v0.7 acceptance evidence
+
+| Check | Result |
+|---|---|
+| Browser chooser | PASS: a real Word file was selected through the file chooser, imported, copied to the session work folder, and rendered with `Baseline Test v2`, `Revenue grew 25% in Q4.`, and `LIVE-EDIT-MARKER-777`. |
+| Drop target | PASS: Playwright's native file-drop action opened the Excel and PowerPoint fixtures. The live previews showed the monthly-sales sheet/chart and the `Baseline Deck` slide respectively. |
+| Full-window drop | PASS: dropping `résumé test file.docx` on the page body preserved the Unicode display name and opened the correct Word content. |
+| PDF drop | PASS: a 664,625-byte searchable PDF was imported and converted through the Word-first pipeline in about 9.1 seconds. The resulting 320,683-byte DOCX opened with a healthy preview and exposed searchable resume text. |
+| Office validity | PASS: OfficeCLI validation reported no errors for the Word, Excel, PowerPoint, and PDF-derived working files; `officecli view ... text` returned the expected content for all four. |
+| Byte preservation | PASS: SHA-256 hashes for all four source fixtures were unchanged after testing, and every browser import copy hash exactly matched its source fixture. |
+| Native desktop gesture | PASS: Windows Computer Use dragged `OGENT-NATIVE-DROP-TEST.docx` from Explorer onto the real `Ogent.lnk`. Ogent v0.7.0 launched on port 8765, opened the exact source in session `62091768`, produced a valid working DOCX, and preserved the source hash. |
+| Browser quality | PASS: the 1440 × 900 visual inspection showed a clean two-pane layout with the first-class drop target, no clipping or overlap, and a connected live preview. Browser console inspection returned zero errors and warnings. |
+| Protocol regressions | PASS: eight stdlib unit tests covered session selection, replacement watch allocation, direct OfficeCLI mode, busy targeting, warm reuse, upload-byte preservation, Unicode upload names, path traversal, reserved names, and unsupported extensions. Python compilation also passed. |
+
+The temporary Explorer test tab was closed without disturbing the user's four
+existing tabs. The disposable desktop source was moved back into the ignored
+workspace test area after validation. Both production and isolated test servers
+were stopped, the right-click registration remains enabled, and no public push
+was performed.
+
+### Honest remaining limits
+
+- Browser imports are retained locally until the user removes the Ogent local
+  data; there is no automatic import-pruning control yet.
+- Browser and shortcut drops intentionally accept one file at a time.
+- Image-only PDFs still stop with `needs OCR`; PDF editing still occurs in a
+  converted DOCX.
+- Word view remains the fidelity check for complex floating Word layouts.
+
+## v0.8.0 - temporary read-only chat references
+
+Verified on 2026-07-26 with Windows 11, Python 3.14.3, pypdfium2 5.12.1,
+Pillow 12.1.1, OfficeCLI 1.0.142, Codex CLI 0.145.0, Microsoft Office,
+Microsoft Edge, Playwright CLI, and GPT-5.6 Sol with Max reasoning.
+
+### Architecture delivered
+
+- Composer references use dedicated `/reference/upload`, `/reference/remove`,
+  and `/reference/clear` routes. They do not reuse the active-document
+  `/upload` route.
+- Every session owns an isolated pending set. Send atomically moves that set
+  from a random pending directory into one random run directory; uploads made
+  while the run works remain pending for the next run.
+- Browser state exposes only attachment ID, sanitized filename, byte size,
+  detected kind, status, and safe error text. Temporary absolute paths remain
+  server-side.
+- Upload reservations make the five-file and 100 MB combined limits atomic
+  under concurrent requests. Inspection runs in a killable Python helper so
+  native ZIP, PDFium, and image decoders do not execute inside the HTTP server.
+- The validator checks actual PDF, OOXML, text-encoding, and image content. It
+  also rejects ZIP prefix tricks, traversal or duplicate members, embedded
+  executables, macros, ActiveX/OLE payloads, excessive expansion, oversized
+  images, unsupported types, empty files, and extension/signature mismatches.
+- `ogent_references.py` performs bounded extraction and rendering. OfficeCLI is
+  restricted to read-only `view ... text`; searchable PDF text is grouped under
+  page headings; scanned/low-text pages and images become normalized PNG inputs.
+  Visually requested Office files export only inside the run directory, then
+  render to PNG.
+- Codex receives repeated image arguments before positional arguments, with an
+  explicit `--` boundary for the installed CLI's variadic new-run image option.
+  Reference runs use a fresh thread, workspace-write only inside the temporary
+  run, and a prompt that treats all reference content as untrusted evidence.
+- One path-contained, idempotent deletion primitive removes uploads and every
+  derived artifact. Terminal cleanup runs after owned preprocessing, Office,
+  and Codex processes release their files. Startup clears crash leftovers only
+  after Ogent owns the selected listener.
+
+### Automated verification
+
+`py -3 -m unittest discover -s ogent-lite/tests -v` passed all 26 tests in
+15.8 seconds. The reference coverage includes:
+
+- active-document isolation, no recents/dedupe/watch changes, safe browser
+  metadata, filename normalization, and manual Remove/Clear;
+- empty, malformed, mismatched, embedded-OLE, prefixed-ZIP, oversized,
+  over-page-limit, traversal-name, unsupported, and truncated upload rejection;
+- five simultaneous successful reservations with the sixth rejected;
+- frozen-run versus next-run attachment ownership;
+- two-session metadata, preparation, findings, and transcript isolation;
+- analysis-only success, direct image/PDF rendering, Codex failure,
+  preprocessing failure, Stop, close, retryable cleanup failure, crash-root
+  reset, and outside-root deletion refusal;
+- correct new/resumed Codex image argument placement; and
+- the eight pre-existing shell/open/upload regressions.
+
+The following checks also passed:
+
+```text
+py -3 -m py_compile ogent-lite\ogent.py ogent-lite\ogent_references.py
+py -3 -m ruff check ogent-lite/ogent.py ogent-lite/ogent_references.py ogent-lite/tests
+PowerShell parse of tools\office-reference-to-pdf.ps1
+git diff --check
+```
+
+### Edge and live GPT acceptance
+
+| Check | Result |
+|---|---|
+| Composer DOCX drop | PASS: `marker-reference.docx` produced a Ready chip while the left pane remained `No document open`; recents, dedupe state, and preview were unchanged. |
+| Paperclip and multiple files | PASS: the native browser file chooser attached a long TXT filename; a three-file composer drop produced five Ready chips total. The long name ellipsized without hiding its accessible full name. |
+| Drag isolation | PASS: a synthetic file drag set `defaultPrevented=true`, added the composer highlight, suppressed the whole-page overlay, and displayed `Drop to attach as temporary references`. |
+| Error state | PASS: a false `.pdf` displayed a red Failed chip with `The file extension does not match a PDF with a valid %PDF signature.` The server left no rejected upload artifact. |
+| Responsive themes | PASS: 1440 × 900 light, 760 × 900 narrow, and 1440 × 900 dark captures showed no clipping, overlap, blank panel, or broken control. |
+| Active document + DOCX reference | PASS: GPT-5.6 Sol Max read `DOCX-REFERENCE-MARKER-7429` and appended only `ACTIVE-DOC-EDIT-FROM-REFERENCE-7429` to the protected working DOCX. OfficeCLI readback found the exact final paragraph and validation returned no errors. The original DOCX and reference hashes were unchanged. |
+| Empty-message searchable PDF | PASS: Ogent supplied the documented default request. GPT-5.6 Sol Max reported both unique markers from `searchable-reference.pdf`, cited page 1, and stated that searchable extracted text—not OCR—was used. No Office document was created. |
+| Scanned PDF OCR | PASS: GPT-5.6 Sol Max read `Intake Review Process Flow` from page 1 of an image-only PDF and explicitly identified it as OCR with no searchable extracted text. |
+| Direct image vision | PASS: from `process-flow-qa.png`, GPT-5.6 Sol Max inferred Yes → Archive and No → Revise → Review again. |
+| Frozen versus next run | PASS: the scanned PDF and PNG chips were locked as OCR/vision during their run. A TXT attached while they worked stayed Ready and removable; terminal cleanup deleted only the frozen run. |
+| Stop | PASS: Stop terminated a real Codex reference run, produced `Stopped. No further agent work is running.`, then `Temporary references deleted.`, with an empty reference root and no Codex child. |
+| Crash recovery | PASS: a force-killed isolated server left one pending upload. Restarting v0.8.0 recreated an empty reference root before accepting sessions. |
+| Shutdown and reap | PASS: shutdown deleted a pending reference. A four-second test grace reaped a disconnected session, stopped its exact OfficeCLI watch, and left an empty reference root. |
+| Office visual reference | PASS: a disposable PPTX copy produced OfficeCLI-labeled extracted text, a temporary PDF, and one visually correct rendered slide. Source and temporary-copy SHA-256 hashes matched, and PowerPoint exited. |
+
+The local, Git-ignored visual evidence is under
+`output\ogent-reference-acceptance\` with descriptive light, dark, narrow,
+drag-highlight, error-state, and frozen-run filenames.
+
+The first scanned-PDF/image attempt found a real installed-CLI edge case:
+`codex exec -i <file>...` greedily consumed the positional prompt. The command
+builder now inserts `--` before a new-run prompt. Targeted tests and the repeated
+live vision run passed after that correction.
+
+### Existing-workflow regression evidence
+
+- Whole-page drop still opened a protected Word working copy with its connected
+  preview; composer drop of the same document type did not open it.
+- Paste-path open displayed the expected Word fixture. Word view produced a
+  Microsoft Word-rendered PDF tab.
+- Whole-page drop of the searchable PDF preserved the source, converted it to a
+  validated working DOCX, and exposed both unique text markers through
+  `officecli view`.
+- The native Browse button launched the topmost `Open in Ogent` Windows picker;
+  the current automation capture canceled it after verifying the dialog. The
+  earlier v0.5 matrix remains the full file-selection baseline.
+- The registered DOCX/XLSX/PPTX commands still contain the exact Python,
+  `ogent.py --open "%1"`, icon, and `Position=Top` values. A warm shell-route
+  call opened the PowerPoint fixture as a protected document.
+- Model and all six reasoning choices remained present; the live reference runs
+  used GPT-5.6 Sol Max.
+- A short isolated idle timeout exited the empty backend, removed
+  `server.json`, and closed port 8765.
+
+### Integrity and process evidence
+
+Pre/post SHA-256 hashes matched for the Word, Excel, PowerPoint, PNG, DOCX
+reference, searchable PDF, and scanned PDF fixtures. The final process audit
+found no Ogent server, Codex run, OfficeCLI watch, Office-reference helper,
+Word, Excel, PowerPoint, PDF-rendering, or OCR process owned by the test.
+
+### Privacy and remaining limits
+
+- Reference deletion is best-effort local deletion, not forensic erasure from
+  NTFS, SSDs, backups, antivirus caches, or synchronized storage.
+- Deleting local reference files does not remove their contents from an
+  existing Codex conversation context.
+- OCR and visual findings are model interpretations. Ogent labels them and
+  requires the answer not to claim unreadable or unprocessed content was read.
+- Visual Office reference export requires Microsoft Office or LibreOffice.
+  Text-only Office extraction remains available through OfficeCLI.
+- PDF references stop at 25 pages and image/renderer limits are intentionally
+  conservative; Ogent rejects over-limit material instead of truncating it.
+
+Final v0.8.0 acceptance state: all isolated test servers and owned child
+processes are stopped, the right-click registration remains enabled, sources
+are unchanged, unrelated worktree files remain untouched, and no public push
+was performed.
+
+## v0.9.0 - dynamic Codex and Claude Code providers
+
+Verified on 2026-07-27 with Windows 11, Python 3.14.3, OfficeCLI 1.0.142,
+Codex CLI 0.145.0, Claude Code 2.1.220, Microsoft Word, and the in-app browser.
+This release removes Ogent's static model and effort assumptions and adds an
+independent Claude Code execution path beside Codex.
+
+### Capability architecture delivered
+
+- The installed, authenticated CLI is the only production source of model and
+  effort choices. A regression guard fails if a static Codex or Claude catalog
+  is added to the production modules.
+- Codex discovery uses App Server `model/list`, including pagination and
+  per-model reasoning capabilities. `codex debug models` is a dynamic fallback
+  for a compatible CLI when App Server discovery fails.
+- Claude Code model aliases come from a local `/model` request that must report
+  zero API duration, zero cost, and zero input/output/cache tokens. Global
+  effort candidates come from `claude --help`; the selected model is checked
+  lazily with bounded, zero-inference `/model` probes.
+- Capability data is cached atomically under
+  `%LOCALAPPDATA%\OgentLite\agent-capabilities-v1.json`. Cache identity includes
+  provider, normalized executable path, and exact CLI version. Cached data is
+  marked stale and can explain the interface while refreshing, but it cannot
+  authorize a run.
+- The browser exposes **Agent**, **Model**, and **Effort** selectors plus
+  **Refresh**. Loading, ready, sign-in-required, unavailable, stale, and
+  incompatible states have distinct messages. Send remains disabled until the
+  server validates a live selection.
+- Provider, model, and effort selections persist independently in the browser.
+  A model change starts a fresh provider context. Codex and Claude session IDs
+  never cross providers or documents; switching back may resume only a
+  compatible context owned by that provider and document.
+- Temporary-reference runs remain non-resumable and isolated. Their run
+  directory is released only after the owned provider and preprocessing
+  processes exit, then it is deleted through the existing contained cleanup
+  primitive.
+- Stop targets the active provider process tree. Claude runs use a minimal
+  allowlist containing the OfficeCLI MCP tool and do not use permission bypass
+  flags.
+
+### Live CLI capability evidence
+
+The verified Codex account reported seven models:
+
+```text
+gpt-5.6-sol
+gpt-5.6-terra
+gpt-5.6-luna
+gpt-5.5
+gpt-5.4
+gpt-5.4-mini
+gpt-5.3-codex-spark
+```
+
+Per-model Codex efforts came directly from the CLI. For example,
+`gpt-5.6-sol` and `gpt-5.6-terra` reported low, medium, high, xhigh, max, and
+ultra; Ogent does not assume those values for a different CLI, account, or
+future version.
+
+The verified Claude account reported ten aliases:
+
+```text
+sonnet
+opus
+haiku
+fable
+best
+sonnet[1m]
+opus[1m]
+fable[1m]
+opusplan
+default
+```
+
+A lazy zero-inference check for `sonnet` verified low, medium, high, xhigh, and
+max with zero reported usage. The browser also exercised lazy verification for
+`opus`. Aliases and effort support remain account- and CLI-specific.
+
+### Automated verification
+
+`python -m unittest discover -s ogent-lite\tests -v` passed all 72 tests in
+16.404 seconds. Coverage includes:
+
+- cache expiry, executable/version invalidation, atomic replacement, stale/live
+  gating, duplicate-refresh suppression, and secret-free serialization;
+- Codex App Server pagination, malformed output, timeout cleanup, dynamic
+  fallback, account filtering, and per-model capabilities;
+- Claude zero-usage enforcement, account-visible alias parsing, wrapped help,
+  lazy effort probes, exact-match rejection, inference detection, explicit
+  snake_case and camelCase input/output/cache accounting, missing and
+  unauthenticated states, and fail-closed malformed output;
+- first-run, resume, model-change, provider-switch, multi-document, reference,
+  stream parsing, structured error, Stop, failed/stopped-thread rejection, and
+  session-isolation behavior;
+- the complete temporary-reference safety suite and all existing shell,
+  working-copy, upload, and direct-mode regressions; and
+- narrow-screen stacking plus saved-provider restoration after a transient
+  refresh fallback.
+
+Python compilation and `git diff --check` passed. Ruff initially found two
+unused imports in the new test modules; they were removed and the clean Ruff
+result was rerun before completion.
+
+A final read-only supervisor review found three issues before commit: camelCase
+cache-token accounting was not fail-closed, failed/stopped Codex runs could
+retain an unusable thread ID, and Claude's CLI-valid compatibility fallback was
+labeled as model-verified. All three were corrected, covered by new regression
+tests, and included in the 72-test rerun. The stricter validator was then
+exercised against the installed Claude CLI; it reported zero input, output,
+cache-creation, cache-read, and ephemeral-cache token fields, zero API time, and
+zero cost.
+
+### Browser verification
+
+The in-app browser exercised the production interface at a disposable local
+test server:
+
+- Codex displayed all seven live models and their CLI-reported per-model
+  efforts.
+- Claude displayed all ten account-visible aliases. Selecting `opus` showed
+  the checking state and then enabled only its verified effort choices.
+- Refresh showed an explicit provider-refreshing state, disabled Send, and
+  restored the validated selection after completion.
+- The final desktop layout was visually inspected: the two panes, agent/model/
+  effort controls, status text, document drop surface, and composer were
+  visible without clipping or overlap.
+
+A final real-Chromium Playwright pass exercised the exact post-review build at
+1440 x 900 and 390 x 844. It found and corrected a narrow-screen defect in the
+old side-by-side minimum widths; below 760 px the document and chat panes now
+stack. At 390 px, the document scroll width equaled the viewport width, every
+agent control and Send ended at or before x=376, and the full page remained
+vertically scrollable. The 1440 px layout also had no horizontal overflow.
+Desktop and mobile screenshots were inspected, and the final browser console
+reported zero errors and zero warnings.
+
+The same production renderer was exercised with normalized checking,
+not-installed, authentication-required, catalog-error, cached-refresh,
+CLI-default-only, and globally CLI-valid/model-unverified states. Send was
+disabled for every unavailable or stale state, and the unverified fallback was
+labeled explicitly. A live Codex refresh temporarily selected the still-ready
+Claude provider; after refresh, the saved live Codex selection, model, and
+effort were restored without reloading the page. Claude `opus` was selected,
+verified lazily, and accepted a live CLI-reported explicit effort before the
+provider was switched back to Codex.
+
+### Live protected-copy Office edits
+
+Two synthetic Word sources were created under the local test area. Each provider
+received its model and effort from the live catalog, edited only Ogent's
+protected working copy, and used OfficeCLI to read back and validate the result.
+
+| Provider | Live selection | Marker in working copy | Source unchanged | OfficeCLI validation |
+|---|---|---|---|---|
+| Codex | CLI-reported model, Automatic | `CODEX-V090-FINAL-PASS` | PASS | No errors; zero issues |
+| Claude Code | CLI-reported model, Automatic | `CLAUDE-V090-FINAL-PASS` | PASS | No errors; zero issues |
+
+The Claude acceptance transcript showed successful
+`mcp__officecli__officecli` calls. The first live attempt exposed two real CLI
+integration defects: streamed print mode required `--verbose`, and the minimal
+permission allowlist omitted the OfficeCLI MCP tool. Both command builders and
+their regression tests were corrected before the passing rerun.
+
+### Live API, isolation, Stop, and reference evidence
+
+- The current-code API returned schema version 1 with both catalogs live and
+  non-stale. A selected Claude model moved from Automatic-only to five
+  zero-use verified effort choices while the other nine models remained lazy.
+- A manual provider refresh immediately exposed cached/stale status, then
+  returned to live without a page reload. The successful live refresh cleared
+  old lazy-probe results so the current selected model must be verified again.
+- Concurrent Codex and Claude edits used distinct Ogent run IDs, working
+  documents, watch ports, and provider contexts. Neither provider ID appeared
+  in the other document session, each live preview contained only its own
+  marker, and both source hashes stayed unchanged.
+- Stop returned success for both real provider processes. Each session ended
+  with `stopped`, and both owned process trees had exited.
+- A Claude analysis-only reference run reported the source marker, left the
+  reference source hash unchanged, deleted the temporary copy, and persisted no
+  Claude session. The next normal run created a new resumable context and did
+  not contain the prior reference marker.
+
+### Honest limits
+
+- Claude Code does not expose a stable machine-readable model catalog endpoint
+  equivalent to Codex App Server. Ogent therefore uses a tightly bounded,
+  zero-inference CLI interaction and fails closed if usage accounting is
+  missing, nonzero, or malformed.
+- A provider may remove or rename a model between refresh and Send. The server
+  revalidates the selected live catalog and returns an actionable error instead
+  of silently substituting another model or effort.
+- **Automatic — CLI default** is the only portable effort choice across every
+  provider and model. Any explicit effort appears only after the corresponding
+  CLI reports or verifies it.
+- Provider authentication, usage limits, service availability, and data
+  retention remain controlled by OpenAI or Anthropic, not by Ogent.
+
+Final v0.9.0 acceptance state: both installed providers supplied their live
+catalogs and completed protected-copy Office edits; source documents were
+unchanged; automated, browser, and OfficeCLI checks passed; task-generated
+document artifacts remain local and uncommitted; and no public push was
+performed.
+
+### Publication readiness gate (2026-07-27)
+
+The isolated publication worktree added a minimal-permission Windows GitHub
+Actions workflow and refreshed the public installation and usage documentation.
+Before any remote write, 72 deterministic tests passed in 15.997 seconds,
+Python compilation passed, Ruff reported no errors, `git diff --check` passed,
+the CI YAML parsed successfully, and every relative Markdown link resolved.
+The publication diff introduced no credential signatures, private absolute
+paths, Office documents, capability caches, screenshots, logs, or generated
+test output.
+
+The application code was unchanged during publication preparation. In
+accordance with the release plan, the live Codex and Claude inference checks
+documented above were not repeated solely for README and CI changes.
