@@ -225,7 +225,9 @@ class OfficeCLIGateTests(unittest.TestCase):
         )
         self.assertEqual(result, GatewayResult(0, "verified"))
         self.assertFalse(captured["shell"])
-        self.assertEqual(captured["cwd"], str(self.document.parent))
+        self.assertTrue(
+            Path(captured["cwd"]).samefile(self.document.parent)
+        )
         self.assertEqual(
             captured["env"]["OFFICECLI_NO_AUTO_RESIDENT"],
             "1",
