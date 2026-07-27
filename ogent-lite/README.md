@@ -21,7 +21,17 @@ reference lifecycle and never become active documents.
 For the AI-agent installation sentence and complete human setup, see the
 [repository README](../README.md).
 
-## Start
+## Start and stop
+
+From the repository root:
+
+```powershell
+Set-Location '.\ogent-lite'
+.\ogent.cmd
+
+# Stop Ogent and its owned provider/OfficeCLI processes
+.\ogent.cmd stop
+```
 
 - Drag a `.docx`, `.xlsx`, `.pptx`, or `.pdf` anywhere into the running Ogent
   window. The drop area can also be clicked to choose a file.
@@ -123,14 +133,6 @@ sent to the selected AI provider. Ogent uses a non-resumable provider context
 for that run and does not carry it into the next normal chat; the provider's
 own data-handling policy still applies.**
 
-## Stop
-
-- In PowerShell: `ogent stop`
-- Or from this folder: `ogent.cmd stop`
-
-Stopping Ogent also stops its OfficeCLI watch and the active Codex or Claude
-Code process tree it owns.
-
 ## Sessions and automatic cleanup
 
 Each fresh browser workspace creates one Ogent session. Each session has its own
@@ -211,6 +213,11 @@ Choices can differ by account, organization policy, provider, and CLI version.
 shown only to keep the interface understandable while refreshing; `stale`
 information is never accepted for a new run. Use **Refresh** after signing in,
 changing accounts, changing policy, or upgrading a CLI.
+
+The public repository's **Ogent CI** workflow runs the deterministic test,
+compile, Ruff, and whitespace checks on Windows for every pull request to
+`main` and every push to `main`. The live-provider scripts remain separate
+because CI never requires a Codex or Claude login and never consumes inference.
 
 Selections are stored separately for each provider in the local browser. A
 model change starts a fresh context. Switching providers leaves the active

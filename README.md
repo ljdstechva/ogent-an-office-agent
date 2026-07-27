@@ -4,6 +4,8 @@
 
 # Ogent — an office agent
 
+[![Ogent CI](https://github.com/ljdstechva/ogent-an-office-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ljdstechva/ogent-an-office-agent/actions/workflows/ci.yml)
+
 Ogent is a local Windows workspace for editing real Word, Excel, and PowerPoint
 files with plain-language instructions. It places an OfficeCLI live preview
 beside a Codex or Claude Code chat, runs on `127.0.0.1`, and creates a
@@ -64,10 +66,13 @@ asks for a password, token, or API key.
 
    For [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started):
 
-   Install Node.js 18 or later first. Native Windows Claude Code also uses Git
-   for Windows, which was installed in step 1.
+   Install [Node.js 18 or later from the official Node.js
+   download](https://nodejs.org/en/download) first, then confirm the installed
+   version. Native Windows Claude Code also uses Git for Windows, which was
+   installed in step 1.
 
    ```powershell
+   node --version
    npm install -g @anthropic-ai/claude-code
    claude --version
    claude auth login
@@ -91,6 +96,11 @@ asks for a password, token, or API key.
    Your browser opens the local app, normally at
    `http://127.0.0.1:8765/`. No AionUi installation or OfficeCLI MCP call is
    required: Ogent invokes the selected agent CLI and OfficeCLI automatically.
+   Stop it from the same folder when finished:
+
+   ```powershell
+   .\ogent.cmd stop
+   ```
 
 The Explorer command appears under **Right-click > Show more options > Open in
 Ogent** for `.docx`, `.xlsx`, and `.pptx`. Ogent requests Windows' `Top`
@@ -151,6 +161,8 @@ installed CLI's dynamic fallback. Claude Code uses a local zero-inference
 `/model` query and help/probe checks, so discovery does not consume an inference
 turn. If model-specific probing is structurally unsupported, Claude's global
 CLI-valid efforts remain visibly labeled as model-specific support unverified.
+Claude's catalog interface is less stable than Codex App Server, so Ogent fails
+closed if `/model` output or zero-usage accounting becomes incompatible.
 
 The last successful catalog is cached only to keep the interface understandable
 while refreshing. A stale catalog cannot start a run. Changing a model starts a
@@ -315,7 +327,7 @@ Browser UI (127.0.0.1) -> Ogent server -> selected agent CLI -> OfficeCLI -> pro
   [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md), but it is not required to run the
   Ogent app.
 
-## Verified workstation
+## Verified v0.9.0 workstation (2026-07-27)
 
 - Windows 11
 - Ogent Lite 0.9.0
@@ -373,12 +385,17 @@ see [TEST-REPORT.md](TEST-REPORT.md).
 ├── AGENTS.md
 ├── AIONUI-WORKFLOW.md
 ├── TEST-REPORT.md
+├── .github/workflows/ci.yml
 ├── ogent-lite/
 │   ├── ogent.py
+│   ├── ogent_agent_catalog.py
+│   ├── ogent_agent_providers.py
 │   ├── ogent_references.py
 │   ├── ogent.cmd
 │   ├── requirements.txt
+│   ├── README.md
 │   ├── OGENT-REPORT.md
+│   ├── tests/
 │   └── assets/
 ├── tools/
 │   ├── pdf2docx.ps1

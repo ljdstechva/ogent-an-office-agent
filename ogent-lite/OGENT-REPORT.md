@@ -772,3 +772,18 @@ catalogs and completed protected-copy Office edits; source documents were
 unchanged; automated, browser, and OfficeCLI checks passed; task-generated
 document artifacts remain local and uncommitted; and no public push was
 performed.
+
+### Publication readiness gate (2026-07-27)
+
+The isolated publication worktree added a minimal-permission Windows GitHub
+Actions workflow and refreshed the public installation and usage documentation.
+Before any remote write, 72 deterministic tests passed in 15.997 seconds,
+Python compilation passed, Ruff reported no errors, `git diff --check` passed,
+the CI YAML parsed successfully, and every relative Markdown link resolved.
+The publication diff introduced no credential signatures, private absolute
+paths, Office documents, capability caches, screenshots, logs, or generated
+test output.
+
+The application code was unchanged during publication preparation. In
+accordance with the release plan, the live Codex and Claude inference checks
+documented above were not repeated solely for README and CI changes.
