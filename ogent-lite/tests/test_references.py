@@ -227,7 +227,8 @@ class ReferenceFeatureTests(unittest.TestCase):
             dict(self.state.path_index),
         )
 
-        status, payload = self.upload("Guide.docx", make_docx_bytes())
+        uploaded_content = make_docx_bytes()
+        status, payload = self.upload("Guide.docx", uploaded_content)
 
         self.assertEqual(status, 201, payload)
         attachment = payload["attachment"]
@@ -249,7 +250,10 @@ class ReferenceFeatureTests(unittest.TestCase):
             stored = self.session.pending_references[0].source_path
         self.assertEqual(stored.name, "source.docx")
         self.assertTrue(stored.is_relative_to(ogent.REFERENCE_ROOT))
-        self.assertEqual(hashlib.sha256(stored.read_bytes()).digest(), hashlib.sha256(make_docx_bytes()).digest())
+        self.assertEqual(
+            hashlib.sha256(stored.read_bytes()).digest(),
+            hashlib.sha256(uploaded_content).digest(),
+        )
 
         remove_status, _ = self.post_json(
             "/reference/remove",

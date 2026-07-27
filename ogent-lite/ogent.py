@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Ogent Lite: a local, single-file document workspace and Codex chat bridge.
+"""Ogent Lite: a local, multi-document Office workspace and agent bridge.
 
 Standard-library only. The server binds to 127.0.0.1, owns the OfficeCLI watch
 lifecycle, preserves source documents by editing working copies, and runs one
-Codex process at a time.
+selected CLI agent per document session at a time.
 """
 
 from __future__ import annotations
@@ -57,9 +57,24 @@ from ogent_references import (  # noqa: E402
     sanitize_reference_filename,
     visual_analysis_requested,
 )
+from ogent_agent_catalog import (  # noqa: E402
+    AUTOMATIC_EFFORT,
+    AgentSelection,
+    CapabilityCache,
+    CapabilityManager,
+    SelectionValidationError,
+)
+from ogent_agent_providers import (  # noqa: E402
+    CLIResolution,
+    ProviderRunRequest,
+    BaseAgentProvider,
+    build_codex_command as _build_codex_provider_command,
+    build_default_providers,
+    resolve_codex_cli,
+)
 
 APP_NAME = "Ogent Lite"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 HOST = "127.0.0.1"
 BASE_PORT = 8765
 WATCH_PORT_FIRST = 26320
@@ -75,10 +90,7 @@ ACTIVE_RUN_STATUSES = {"starting", "working", "stopping"}
 REAPABLE_RUN_STATUSES = {"idle", "error", "stopped"}
 MAX_BODY_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 128 * 1024 * 1024
-DEFAULT_MODEL = "gpt-5.6-sol"
-DEFAULT_REASONING = "medium"
-ALLOWED_MODELS = ("gpt-5.6-sol", "gpt-5.6-terra")
-ALLOWED_REASONING = ("low", "medium", "high", "xhigh", "max", "ultra")
+DEFAULT_PROVIDER = "codex"
 
 REPO_ROOT = SCRIPT_DIR.parent
 ASSETS_DIR = SCRIPT_DIR / "assets"
@@ -93,10 +105,20 @@ IMPORT_ROOT = LOCAL_DATA / "imports"
 REFERENCE_ROOT = LOCAL_DATA / "temporary-references"
 RECENT_PATH = LOCAL_DATA / "recent.json"
 SERVER_INFO_PATH = LOCAL_DATA / "server.json"
+AGENT_CAPABILITIES_PATH = LOCAL_DATA / "agent-capabilities-v1.json"
 
 CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOWS_CHILD_FLAGS = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+
+AGENT_PROVIDERS = build_default_providers()
+AGENT_PROVIDER_BY_ID: dict[str, BaseAgentProvider] = {
+    provider.provider_id: provider for provider in AGENT_PROVIDERS
+}
+AGENT_CATALOG = CapabilityManager(
+    AGENT_PROVIDERS,
+    CapabilityCache(AGENT_CAPABILITIES_PATH),
+)
 
 
 class UserFacingError(RuntimeError):
@@ -167,33 +189,58 @@ def command_env() -> dict[str, str]:
 
 def codex_launch_prefix() -> list[str]:
     """Resolve Codex without asking CreateProcess to execute an npm shim."""
-    cmd_path = shutil.which("codex.cmd")
-    node_path = shutil.which("node.exe") or shutil.which("node")
-    if cmd_path and node_path:
-        codex_js = Path(cmd_path).parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
-        if codex_js.is_file():
-            return [node_path, str(codex_js)]
-    exe_path = shutil.which("codex.exe")
-    if exe_path:
-        return [exe_path]
-    raise UserFacingError(
-        "Codex CLI was not found. Install or repair Codex, then confirm `codex --version` works.",
-        500,
-    )
+    resolution = resolve_codex_cli()
+    if resolution is None:
+        raise UserFacingError("Codex CLI is not installed.", 500)
+    return list(resolution.command)
+
+
+def provider_label(provider_id: str) -> str:
+    provider = AGENT_PROVIDER_BY_ID.get(provider_id)
+    return provider.label if provider is not None else provider_id
+
+
+def _provider_or_error(provider_id: str) -> BaseAgentProvider:
+    provider = AGENT_PROVIDER_BY_ID.get(provider_id)
+    if provider is None:
+        raise UserFacingError("Choose an available agent provider.", 409)
+    return provider
+
+
+def activity_from_codex_event(event: dict[str, Any]) -> str | None:
+    provider = _provider_or_error("codex")
+    return provider.parse_stream_event(provider.new_stream_state(), event)
 
 
 def validate_agent_settings(model: Any, reasoning: Any) -> tuple[str, str]:
-    selected_model = str(model or DEFAULT_MODEL).strip()
-    selected_reasoning = str(reasoning or DEFAULT_REASONING).strip().casefold()
-    if selected_model not in ALLOWED_MODELS:
-        raise UserFacingError(
-            f"Unsupported model. Choose one of: {', '.join(ALLOWED_MODELS)}."
-        )
-    if selected_reasoning not in ALLOWED_REASONING:
-        raise UserFacingError(
-            f"Unsupported reasoning effort. Choose one of: {', '.join(ALLOWED_REASONING)}."
-        )
+    """Legacy command-builder validation without a static model catalog."""
+
+    selected_model = str(model or "").strip()
+    selected_reasoning = str(reasoning or AUTOMATIC_EFFORT).strip()
+    if (
+        not selected_model
+        or len(selected_model) > 256
+        or any(ord(character) < 32 for character in selected_model)
+    ):
+        raise UserFacingError("Choose a model reported by the selected CLI.")
+    if (
+        not selected_reasoning
+        or len(selected_reasoning) > 64
+        or any(ord(character) < 32 for character in selected_reasoning)
+    ):
+        raise UserFacingError("Choose an effort reported for the selected model.")
     return selected_model, selected_reasoning
+
+
+def validate_agent_selection(
+    provider: Any,
+    model: Any,
+    effort: Any,
+) -> AgentSelection:
+    try:
+        return AGENT_CATALOG.validate_selection(provider, model, effort)
+    except SelectionValidationError as exc:
+        raise UserFacingError(str(exc), 409) from exc
 
 
 def build_codex_command(
@@ -207,51 +254,24 @@ def build_codex_command(
     writable_directories: list[Path] | None = None,
 ) -> list[str]:
     selected_model, selected_reasoning = validate_agent_settings(model, reasoning)
-    if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
-        raise ValueError(f"Unsupported Codex sandbox: {sandbox}")
-    effort_config = f"model_reasoning_effort={json.dumps(selected_reasoning)}"
-    image_arguments = [
-        argument
-        for path in image_paths or []
-        for argument in ("-i", str(path))
-    ]
-    if session_id:
-        return [
-            *codex_launch_prefix(),
-            "exec",
-            "resume",
-            "-m",
-            selected_model,
-            "-c",
-            effort_config,
-            "--json",
-            "--skip-git-repo-check",
-            *image_arguments,
-            session_id,
-            prompt,
-        ]
-    command = [
-        *codex_launch_prefix(),
-        "exec",
-        "-m",
-        selected_model,
-        "-c",
-        effort_config,
-        "-s",
-        sandbox,
-        "--color",
-        "never",
-        "--json",
-        "--skip-git-repo-check",
-    ]
-    for directory in writable_directories or []:
-        command.extend(["--add-dir", str(directory)])
-    return [
-        *command,
-        *image_arguments,
-        "--",
-        prompt,
-    ]
+    prefix = codex_launch_prefix()
+    resolution = CLIResolution(
+        command=tuple(prefix),
+        executable_path=prefix[0],
+    )
+    request = ProviderRunRequest(
+        prompt=prompt,
+        working_directory=Path.cwd(),
+        model=selected_model,
+        effort=selected_reasoning,
+        session_id=session_id,
+        new_session_id=None,
+        persistent=True,
+        image_paths=tuple(image_paths or ()),
+        sandbox=sandbox,
+        writable_directories=tuple(writable_directories or ()),
+    )
+    return _build_codex_provider_command(resolution, request)
 
 
 def run_quiet(
@@ -425,6 +445,9 @@ class SessionState:
         self.run_id: str | None = None
         self.stop_requested = False
         self.codex_thread_id: str | None = None
+        self.codex_model_id: str | None = None
+        self.claude_session_id: str | None = None
+        self.claude_model_id: str | None = None
         self.pending_pdf = False
         self.last_error: str | None = None
         self.sse_clients = 0
@@ -509,6 +532,10 @@ class SessionState:
                 "transcript": list(self.transcript),
                 "last_error": self.last_error,
                 "codex_context": bool(self.codex_thread_id),
+                "agent_contexts": {
+                    "codex": bool(self.codex_thread_id),
+                    "claude": bool(self.claude_session_id),
+                },
                 "sequence": self.sequence,
                 "sse_clients": self.sse_clients,
                 "orphan_since": self.orphan_since,
@@ -681,6 +708,7 @@ class OgentState:
                 "sessions": self.summaries(),
                 "idle_exit_minutes": self.idle_exit_minutes,
                 "session_grace_seconds": self.session_grace_seconds,
+                "agent_capabilities": AGENT_CATALOG.snapshot(),
             }
         )
         return snapshot
@@ -696,6 +724,7 @@ class OgentState:
             "sessions": self.summaries(),
             "idle_exit_minutes": self.idle_exit_minutes,
             "session_grace_seconds": self.session_grace_seconds,
+            "agent_capabilities": AGENT_CATALOG.snapshot(),
         }
 
     def broadcast_sessions(self) -> None:
@@ -777,6 +806,9 @@ class OgentState:
                 session.active_source = None
                 session.opening_source = None
                 session.codex_thread_id = None
+                session.codex_model_id = None
+                session.claude_session_id = None
+                session.claude_model_id = None
                 session.pending_pdf = False
                 session.snapshot_path = None
                 session.complex_layout = False
@@ -808,6 +840,9 @@ class OgentState:
                 session.active_doc = working
                 session.opening_source = None
                 session.codex_thread_id = None
+                session.codex_model_id = None
+                session.claude_session_id = None
+                session.claude_model_id = None
                 session.pending_pdf = False
                 session.last_error = None
                 session.complex_layout = complex_layout
@@ -1961,7 +1996,7 @@ def _finish_session_run(
         session.run_status = status
         session.run_complete.set()
         if session.sse_clients == 0:
-            # A tab may close while Codex is working. Never consume the user's
+            # A tab may close while an agent is working. Never consume the user's
             # reconnect grace while that run is protected from reaping.
             session.orphan_since = time.time()
     session.emit("run", {"status": status, "run_id": run_id, **extra})
@@ -2288,44 +2323,8 @@ User request:
 """
 
 
-def _pipe_reader(
-    pipe: Any,
-    name: str,
-    output_queue: queue.Queue[tuple[str, str | None]],
-) -> None:
-    for raw in iter(pipe.readline, ""):
-        output_queue.put((name, raw.rstrip("\r\n")))
-    output_queue.put((name, None))
-
-
 def _activity_from_codex_event(event: dict[str, Any]) -> str | None:
-    event_type = str(event.get("type", ""))
-    item = event.get("item")
-    if event_type == "thread.started":
-        return "Codex context started."
-    if event_type == "turn.started":
-        return "Codex is working."
-    if event_type == "turn.completed":
-        usage = event.get("usage") or {}
-        output = usage.get("output_tokens")
-        return f"Codex turn completed{f' ({output} output tokens)' if output is not None else ''}."
-    if isinstance(item, dict):
-        item_type = item.get("type")
-        if item_type == "command_execution":
-            command = item.get("command") or item.get("title") or "OfficeCLI command"
-            status = item.get("status") or event_type
-            return f"{status}: {command}"
-        if item_type == "reasoning":
-            text = item.get("text") or item.get("summary")
-            return str(text) if text else "Reasoning step complete."
-        if item_type == "error":
-            message = str(item.get("message") or "")
-            if "Skill descriptions were shortened" in message:
-                return None
-            return message
-    if event_type == "error":
-        return str(event.get("message") or event)
-    return None
+    return activity_from_codex_event(event)
 
 
 def _run_codex_once(
@@ -2360,103 +2359,154 @@ def _run_codex_once(
                 "A Codex image input failed reference validation.",
                 500,
             )
-    args = build_codex_command(
-        prompt,
-        codex_thread_id,
-        model,
-        reasoning,
-        image_paths,
+    provider = _provider_or_error("codex")
+    request = ProviderRunRequest(
+        prompt=prompt,
+        working_directory=working_directory,
+        model=model,
+        effort=reasoning,
+        session_id=codex_thread_id,
+        new_session_id=None,
+        persistent=not bool(references),
+        image_paths=tuple(image_paths or ()),
         sandbox=sandbox,
-        writable_directories=writable_directories,
+        writable_directories=tuple(writable_directories or ()),
     )
 
-    with session.lock:
-        if session.stop_requested or session.run_id != run_id or session.closed:
-            return 130, None, None, []
-        process = subprocess.Popen(
-            args,
-            cwd=str(working_directory),
-            env=command_env(),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=1,
-            creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
+    def on_process(process: subprocess.Popen[str]) -> None:
+        with session.lock:
+            session.run_process = process
+
+    def on_activity(stream: str, text: str) -> None:
+        session.add_activity(
+            stream,
+            _redact_reference_detail(text, attachments=references),
         )
-        session.run_process = process
-    assert process.stdout is not None
-    assert process.stderr is not None
-    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
-    stdout_thread = threading.Thread(
-        target=_pipe_reader,
-        args=(process.stdout, "stdout", output_queue),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_pipe_reader,
-        args=(process.stderr, "stderr", output_queue),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
 
-    closed_streams = 0
-    thread_id: str | None = None
-    final_text: str | None = None
-    stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
-    while closed_streams < 2:
-        stream_name, line = output_queue.get()
-        if line is None:
-            closed_streams += 1
-            continue
-        if not line:
-            continue
-        if stream_name == "stderr":
-            stderr_tail.append(line)
-            session.add_activity(
-                "stderr",
-                _redact_reference_detail(line, attachments=references),
-            )
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            session.add_activity(
-                "codex",
-                _redact_reference_detail(line, attachments=references),
-            )
-            continue
-        if event.get("type") == "thread.started" and event.get("thread_id"):
-            thread_id = str(event["thread_id"])
-        item = event.get("item")
-        if (
-            event.get("type") == "item.completed"
-            and isinstance(item, dict)
-            and item.get("type") == "agent_message"
-        ):
-            final_text = str(item.get("text") or "").strip() or final_text
-        activity = _activity_from_codex_event(event)
-        if activity:
-            session.add_activity(
-                "codex",
-                _redact_reference_detail(activity, attachments=references),
+    def should_stop() -> bool:
+        with session.lock:
+            return (
+                session.stop_requested
+                or session.run_id != run_id
+                or session.closed
             )
 
-    code = process.wait()
+    if should_stop():
+        return 130, None, None, []
+    result = provider.run_agent(
+        request,
+        on_process=on_process,
+        on_activity=on_activity,
+        should_stop=should_stop,
+    )
+    stderr_tail = [
+        _redact_reference_detail(line, attachments=references)
+        for line in result.stderr_tail
+    ]
+    if result.error_message and not stderr_tail:
+        stderr_tail.append(
+            _redact_reference_detail(
+                result.error_message,
+                attachments=references,
+            )
+        )
     return (
-        code,
-        thread_id,
+        result.exit_code,
+        result.session_id if result.resumable else None,
         (
-            _redact_reference_detail(final_text, attachments=references)
-            if final_text
+            _redact_reference_detail(
+                result.final_text,
+                attachments=references,
+            )
+            if result.final_text
             else None
         ),
-        [
-            _redact_reference_detail(line, attachments=references)
-            for line in stderr_tail
-        ],
+        stderr_tail,
+    )
+
+
+def _run_claude_once(
+    session: SessionState,
+    prompt: str,
+    working_directory: Path,
+    existing_session_id: str | None,
+    model: str,
+    effort: str,
+    run_id: str,
+    *,
+    ephemeral: bool,
+    additional_directories: list[Path] | None = None,
+    references: list[ReferenceAttachment] | None = None,
+) -> tuple[int, str | None, str | None, list[str]]:
+    provider = _provider_or_error("claude")
+    new_session_id = (
+        str(uuid.uuid4())
+        if not ephemeral and not existing_session_id
+        else None
+    )
+    request = ProviderRunRequest(
+        prompt=prompt,
+        working_directory=working_directory,
+        model=model,
+        effort=effort,
+        session_id=existing_session_id,
+        new_session_id=new_session_id,
+        persistent=not ephemeral,
+        extra_directories=tuple(additional_directories or ()),
+    )
+
+    def on_process(process: subprocess.Popen[str]) -> None:
+        with session.lock:
+            session.run_process = process
+
+    def on_activity(stream: str, text: str) -> None:
+        session.add_activity(
+            stream,
+            _redact_reference_detail(text, attachments=references),
+        )
+
+    def should_stop() -> bool:
+        with session.lock:
+            return (
+                session.stop_requested
+                or session.run_id != run_id
+                or session.closed
+            )
+
+    if should_stop():
+        return 130, None, None, []
+    result = provider.run_agent(
+        request,
+        on_process=on_process,
+        on_activity=on_activity,
+        should_stop=should_stop,
+    )
+    session_id = None
+    if not ephemeral and result.exit_code == 0:
+        session_id = result.session_id or existing_session_id or new_session_id
+    stderr_tail = [
+        _redact_reference_detail(line, attachments=references)
+        for line in result.stderr_tail
+    ]
+    if result.error_message and not stderr_tail:
+        stderr_tail.append(
+            _redact_reference_detail(
+                result.error_message,
+                attachments=references,
+            )
+        )
+    return (
+        result.exit_code,
+        session_id,
+        (
+            _redact_reference_detail(
+                result.final_text,
+                attachments=references,
+            )
+            if result.final_text
+            else None
+        ),
+        stderr_tail,
     )
 
 
@@ -2465,16 +2515,18 @@ def _agent_worker(
     message: str,
     document: Path | None,
     source: Path | None,
+    provider: str,
     model: str,
-    reasoning: str,
+    effort: str,
     run_id: str,
     references: list[ReferenceAttachment],
     run_root: Path | None,
 ) -> None:
     started = time.perf_counter()
     terminal_status = "error"
-    terminal_extra: dict[str, Any] = {"kind": "codex"}
+    terminal_extra: dict[str, Any] = {"kind": provider}
     references_cleaned = False
+    provider_name = provider_label(provider)
     try:
         with session.lock:
             if session.stop_requested or session.run_id != run_id or session.closed:
@@ -2485,22 +2537,43 @@ def _agent_worker(
             if session.run_id != run_id:
                 return
             session.run_status = "working"
-            codex_thread_id = None if references else session.codex_thread_id
+            if references:
+                provider_session_id = None
+            elif provider == "codex":
+                provider_session_id = (
+                    session.codex_thread_id
+                    if session.codex_model_id == model
+                    else None
+                )
+            else:
+                provider_session_id = (
+                    session.claude_session_id
+                    if session.claude_model_id == model
+                    else None
+                )
         session.emit(
             "run",
             {
                 "status": "working",
-                "kind": "codex",
+                "kind": provider,
                 "run_id": run_id,
                 "label": (
                     "Preparing temporary references"
                     if references
-                    else "Running Codex"
+                    else f"Running {provider_name}"
                 ),
             },
         )
         STATE.broadcast_sessions()
-        session.add_activity("codex", f"Using {model} with {reasoning} reasoning.")
+        effort_label = (
+            "CLI-default effort"
+            if effort == AUTOMATIC_EFFORT
+            else f"{effort} effort"
+        )
+        session.add_activity(
+            provider,
+            f"Using {provider_name} model {model} with {effort_label}.",
+        )
 
         prepared_references = references
         agent_derived: Path | None = None
@@ -2544,41 +2617,72 @@ def _agent_worker(
             "run",
             {
                 "status": "working",
-                "kind": "codex",
+                "kind": provider,
                 "run_id": run_id,
-                "label": "Codex is analyzing temporary references"
+                "label": f"{provider_name} is analyzing temporary references"
                 if prepared_references
-                else "Codex is editing",
+                else f"{provider_name} is editing",
             },
         )
-        code, new_thread_id, final_text, stderr_tail = _run_codex_once(
-            session,
-            agent_prompt(
-                message,
-                document,
-                source,
-                prepared_references,
-                run_root,
-            ),
-            working_directory,
-            codex_thread_id,
-            model,
-            reasoning,
-            run_id,
-            image_paths=image_paths,
-            sandbox=sandbox,
-            writable_directories=writable_directories,
-            references=prepared_references,
+        prompt = agent_prompt(
+            message,
+            document,
+            source,
+            prepared_references,
+            run_root,
         )
+        if provider == "codex":
+            code, new_provider_session_id, final_text, stderr_tail = _run_codex_once(
+                session,
+                prompt,
+                working_directory,
+                provider_session_id,
+                model,
+                effort,
+                run_id,
+                image_paths=image_paths,
+                sandbox=sandbox,
+                writable_directories=writable_directories,
+                references=prepared_references,
+            )
+        else:
+            additional_directories = (
+                [run_root]
+                if run_root is not None
+                else []
+            )
+            code, new_provider_session_id, final_text, stderr_tail = _run_claude_once(
+                session,
+                prompt,
+                working_directory,
+                provider_session_id,
+                model,
+                effort,
+                run_id,
+                ephemeral=bool(prepared_references),
+                additional_directories=additional_directories,
+                references=prepared_references,
+            )
         elapsed_ms = round((time.perf_counter() - started) * 1000)
         with session.lock:
-            stopped = session.stop_requested or session.run_id != run_id
+            stopped = (
+                session.stop_requested
+                or session.run_id != run_id
+                or session.closed
+            )
             if (
-                new_thread_id
+                new_provider_session_id
                 and session.run_id == run_id
                 and not prepared_references
+                and not stopped
+                and code == 0
             ):
-                session.codex_thread_id = new_thread_id
+                if provider == "codex":
+                    session.codex_thread_id = new_provider_session_id
+                    session.codex_model_id = model
+                else:
+                    session.claude_session_id = new_provider_session_id
+                    session.claude_model_id = model
         if stopped:
             session.add_message("assistant", "Stopped. No further agent work is running.")
             terminal_status = "stopped"
@@ -2586,7 +2690,7 @@ def _agent_worker(
             return
         if code != 0:
             detail = "\n".join(stderr_tail[-6:]).strip()
-            message_text = f"Codex exited with code {code}."
+            message_text = f"{provider_name} exited with code {code}."
             if detail:
                 message_text += f" {detail}"
             with session.lock:
@@ -2674,9 +2778,20 @@ def start_agent_run(
     session: SessionState,
     message: str,
     model: str,
-    reasoning: str,
+    effort: str,
+    provider: str = DEFAULT_PROVIDER,
+    *,
+    selection: AgentSelection | None = None,
 ) -> str:
-    selected_model, selected_reasoning = validate_agent_settings(model, reasoning)
+    if selection is None:
+        selected_model, selected_effort = validate_agent_settings(model, effort)
+        selected_provider = str(provider or DEFAULT_PROVIDER).strip().casefold()
+        if selected_provider not in {"codex", "claude"}:
+            raise UserFacingError("Choose an available agent provider.")
+    else:
+        selected_provider = selection.provider_id
+        selected_model = selection.model
+        selected_effort = selection.effort
     with session.reference_lock:
         with session.lock:
             if session.closed:
@@ -2719,10 +2834,11 @@ def start_agent_run(
         "run",
         {
             "status": "starting",
-            "kind": "codex",
+            "kind": selected_provider,
             "run_id": run_id,
+            "provider": selected_provider,
             "model": selected_model,
-            "reasoning": selected_reasoning,
+            "effort": selected_effort,
             "references": len(references),
             "analysis_only": document is None,
         },
@@ -2735,13 +2851,16 @@ def start_agent_run(
             message,
             document,
             source,
+            selected_provider,
             selected_model,
-            selected_reasoning,
+            selected_effort,
             run_id,
             references,
             run_root,
         ),
-        name=f"ogent-codex-{session.session_id}-{run_id[:8]}",
+        name=(
+            f"ogent-{selected_provider}-{session.session_id}-{run_id[:8]}"
+        ),
         daemon=True,
     )
     with session.lock:
@@ -2764,11 +2883,11 @@ def start_agent_run(
 def handle_chat_message(
     session: SessionState,
     message: str,
-    model: Any = DEFAULT_MODEL,
-    reasoning: Any = DEFAULT_REASONING,
+    provider: Any = DEFAULT_PROVIDER,
+    model: Any = None,
+    effort: Any = AUTOMATIC_EFFORT,
 ) -> tuple[int, dict[str, Any]]:
     text = message.strip()
-    selected_model, selected_reasoning = validate_agent_settings(model, reasoning)
     with session.reference_lock:
         has_references = bool(session.pending_references)
     with session.lock:
@@ -2781,17 +2900,21 @@ def handle_chat_message(
     if not text:
         raise UserFacingError("Type a request or attach a temporary reference first.")
     if has_document or has_references:
+        selection = validate_agent_selection(provider, model, effort)
         run_id = start_agent_run(
             session,
             text,
-            selected_model,
-            selected_reasoning,
+            selection.model,
+            selection.effort,
+            selection.provider_id,
+            selection=selection,
         )
         return 202, {
             "message": "Run started.",
             "run_id": run_id,
-            "model": selected_model,
-            "reasoning": selected_reasoning,
+            "provider": selection.provider_id,
+            "model": selection.model,
+            "effort": selection.effort,
             "references": has_references,
             "analysis_only": not has_document,
         }
@@ -2858,7 +2981,7 @@ def generate_word_snapshot(session: SessionState) -> Path:
             raise UserFacingError("This Ogent session has closed.", 410)
         if session.run_status in ACTIVE_RUN_STATUSES:
             raise UserFacingError(
-                "Wait for the active Codex run to finish before creating Word view.",
+                "Wait for the active agent run to finish before creating Word view.",
                 409,
             )
         if session.snapshot_in_progress:
@@ -3170,6 +3293,7 @@ def cleanup() -> None:
         sessions = list(STATE.sessions.values())
         pick_process = STATE.pick_process
     terminate_process_tree(pick_process)
+    AGENT_CATALOG.shutdown()
     for session in sessions:
         close_session(session)
     if REFERENCE_ROOT.exists():
@@ -3512,8 +3636,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       margin: 0 0 9px; color: var(--muted); font-size: 9px; line-height: 1.4;
     }
     .agent-settings {
-      display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, .85fr);
-      gap: 8px; margin-bottom: 8px;
+      display: grid;
+      grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr) minmax(0, .8fr) auto;
+      align-items: end; gap: 7px; margin-bottom: 5px;
     }
     .setting-field { min-width: 0; }
     .setting-field span {
@@ -3529,6 +3654,19 @@ HTML_TEMPLATE = r"""<!doctype html>
       border-color: var(--teal); box-shadow: 0 0 0 3px rgba(13,148,136,.11);
     }
     .agent-select:disabled { opacity: .58; cursor: default; }
+    .agent-refresh {
+      width: 34px; height: 32px; padding: 0; border: 1px solid var(--line);
+      border-radius: 9px; background: var(--panel); color: var(--teal);
+      font-size: 16px; line-height: 1;
+    }
+    .agent-refresh:hover { border-color: var(--teal); }
+    .agent-refresh:disabled { opacity: .45; cursor: default; }
+    .agent-status {
+      min-height: 14px; margin: 0 0 7px; color: var(--muted);
+      font-size: 9px; line-height: 1.35;
+    }
+    .agent-status.error { color: var(--danger); }
+    .agent-status.ready { color: var(--teal); }
     textarea {
       width: 100%; min-height: 74px; max-height: 180px; resize: vertical; border: 1px solid var(--line);
       border-radius: 11px; padding: 10px 11px; background: var(--panel); color: var(--ink); outline: none;
@@ -3576,6 +3714,39 @@ HTML_TEMPLATE = r"""<!doctype html>
       .session-select { width: 120px; }
       .new-window { display: none; }
       .reference-chip { width: 100%; }
+      .agent-settings {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto;
+      }
+      .agent-settings .effort-field { grid-column: 1 / 3; }
+    }
+    @media (max-width: 760px) {
+      html, body { height: auto; min-height: 100%; overflow-x: hidden; overflow-y: auto; }
+      .workspace {
+        width: 100%;
+        height: auto;
+        min-height: 100vh;
+        flex-direction: column;
+      }
+      .document-pane {
+        width: 100%;
+        min-width: 0;
+        min-height: 260px;
+        flex: 0 0 min(360px, 40vh);
+      }
+      .splitter { display: none; }
+      .chat-pane {
+        width: 100%;
+        min-width: 0;
+        min-height: 700px;
+        flex: 0 0 max(700px, 75vh);
+      }
+      .preview-shell { padding: 10px; }
+      .empty-document {
+        width: calc(100% - 28px);
+        padding: 24px 20px;
+      }
+      .empty-document .symbol { width: 58px; height: 58px; margin-bottom: 14px; }
+      .empty-document h1 { font-size: 22px; }
     }
   </style>
 </head>
@@ -3672,27 +3843,25 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="reference-chips" id="referenceChips"></div>
         </div>
-        <p class="reference-disclosure">References are temporary local copies and are deleted after this run. Their contents are sent to Codex for analysis and may remain in the Codex conversation context.</p>
+        <p class="reference-disclosure">References are temporary local copies sent only to the selected AI provider for this run. Ogent uses a non-resumable context and deletes the copies afterward.</p>
         <div class="agent-settings" aria-label="Agent settings">
           <label class="setting-field">
-            <span>Model</span>
-            <select class="agent-select" id="modelSelect" aria-label="Codex model">
-              <option value="gpt-5.6-sol" selected>GPT-5.6 Sol</option>
-              <option value="gpt-5.6-terra">GPT-5.6 Terra</option>
-            </select>
+            <span>Agent</span>
+            <select class="agent-select" id="providerSelect" aria-label="AI agent provider" disabled></select>
           </label>
           <label class="setting-field">
-            <span>Reasoning</span>
-            <select class="agent-select" id="reasoningSelect" aria-label="Reasoning effort">
-              <option value="low">Low</option>
-              <option value="medium" selected>Medium</option>
-              <option value="high">High</option>
-              <option value="xhigh">XHigh</option>
-              <option value="max">Max</option>
-              <option value="ultra">Ultra</option>
+            <span>Model</span>
+            <select class="agent-select" id="modelSelect" aria-label="AI model" disabled></select>
+          </label>
+          <label class="setting-field effort-field">
+            <span>Effort</span>
+            <select class="agent-select" id="effortSelect" aria-label="Model effort" disabled>
+              <option value="automatic">Automatic — CLI default</option>
             </select>
           </label>
+          <button class="agent-refresh" id="agentRefreshButton" type="button" title="Refresh models and efforts" aria-label="Refresh models and efforts" disabled>↻</button>
         </div>
+        <p class="agent-status" id="agentStatus">Checking installed agent CLIs…</p>
         <div class="composer-input-row">
           <button class="attach-button" id="referenceAttachButton" type="button" title="Attach temporary read-only references" aria-label="Attach temporary read-only references">&#128206;</button>
           <textarea id="messageInput" placeholder="Tell Ogent what to change or ask about references…" aria-label="Document request"></textarea>
@@ -3701,7 +3870,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="composer-actions">
           <span class="hint">Enter to send · Shift+Enter for a new line · drag files here to add references</span>
           <button class="stop" id="stopButton" type="button" disabled>Stop</button>
-          <button class="primary send" id="sendButton" type="button">Send</button>
+          <button class="primary send" id="sendButton" type="button" disabled>Send</button>
         </div>
       </section>
     </aside>
@@ -3721,7 +3890,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       (globalThis.crypto && crypto.randomUUID)
         ? crypto.randomUUID()
         : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
-    const AGENT_SETTINGS_KEY = "ogent-agent-settings-v1";
+    const AGENT_SETTINGS_KEY = "ogent-agent-settings-v2";
+    const LEGACY_AGENT_SETTINGS_KEY = "ogent-agent-settings-v1";
     const elements = {
       path: document.getElementById("pathInput"),
       open: document.getElementById("openButton"),
@@ -3740,8 +3910,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       referenceTray: document.getElementById("referenceTray"),
       referenceChips: document.getElementById("referenceChips"),
       referenceClear: document.getElementById("referenceClearButton"),
+      provider: document.getElementById("providerSelect"),
       model: document.getElementById("modelSelect"),
-      reasoning: document.getElementById("reasoningSelect"),
+      effort: document.getElementById("effortSelect"),
+      agentRefresh: document.getElementById("agentRefreshButton"),
+      agentStatus: document.getElementById("agentStatus"),
       send: document.getElementById("sendButton"),
       stop: document.getElementById("stopButton"),
       preview: document.getElementById("preview"),
@@ -3766,7 +3939,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       recent: [],
       sessions: [],
       transcript: [],
-      references: []
+      references: [],
+      agent_capabilities: { refreshing: true, providers: [] }
     };
     let repairing = false;
     let uploadBusy = false;
@@ -3776,6 +3950,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     let referenceDragDepth = 0;
     let toastTimer = null;
     let closeSent = false;
+    let agentSettings = { provider: null, selections: {} };
+    let agentRefreshTimer = null;
+    let agentCapabilityBusy = false;
+    let effortVerificationKey = null;
 
     function scopedPath(path) {
       const url = new URL(path, window.location.origin);
@@ -3924,18 +4102,308 @@ HTML_TEMPLATE = r"""<!doctype html>
     function loadAgentSettings() {
       try {
         const saved = JSON.parse(localStorage.getItem(AGENT_SETTINGS_KEY) || "{}");
-        if (optionExists(elements.model, saved.model)) elements.model.value = saved.model;
-        if (optionExists(elements.reasoning, saved.reasoning)) elements.reasoning.value = saved.reasoning;
+        if (saved && typeof saved === "object" && saved.selections) {
+          agentSettings = {
+            provider: typeof saved.provider === "string" ? saved.provider : null,
+            selections: saved.selections && typeof saved.selections === "object"
+              ? saved.selections
+              : {}
+          };
+          return;
+        }
+      } catch (_) {}
+      try {
+        const legacy = JSON.parse(
+          localStorage.getItem(LEGACY_AGENT_SETTINGS_KEY) || "{}"
+        );
+        if (legacy && (legacy.model || legacy.reasoning)) {
+          agentSettings = {
+            provider: "codex",
+            selections: {
+              codex: {
+                model: legacy.model || null,
+                effort: legacy.reasoning || "automatic"
+              }
+            }
+          };
+        }
       } catch (_) {}
     }
 
     function saveAgentSettings() {
+      const provider = elements.provider.value;
+      if (!provider) return;
+      agentSettings.provider = provider;
+      agentSettings.selections[provider] = {
+        model: elements.model.value || null,
+        effort: elements.effort.value || "automatic"
+      };
       try {
         localStorage.setItem(
           AGENT_SETTINGS_KEY,
-          JSON.stringify({ model: elements.model.value, reasoning: elements.reasoning.value })
+          JSON.stringify(agentSettings)
         );
       } catch (_) {}
+    }
+
+    function providerCatalog(providerId = elements.provider.value) {
+      return (state.agent_capabilities?.providers || []).find(
+        provider => provider.id === providerId
+      ) || null;
+    }
+
+    function selectedModelCapability(provider = providerCatalog()) {
+      if (!provider) return null;
+      return (provider.models || []).find(
+        model => model.id === elements.model.value
+      ) || null;
+    }
+
+    function providerIsReady(provider = providerCatalog()) {
+      return Boolean(
+        provider &&
+        provider.live &&
+        provider.status === "ready" &&
+        selectedModelCapability(provider)
+      );
+    }
+
+    function providerOptionLabel(provider) {
+      if (provider.status === "ready" && provider.live) return provider.label;
+      if (provider.status === "auth_required") return `${provider.label} — sign in`;
+      if (provider.status === "not_installed") return `${provider.label} — not installed`;
+      if (provider.status === "checking" || provider.status === "not_checked") {
+        return `${provider.label} — checking`;
+      }
+      if (provider.status === "refreshing") {
+        return `${provider.label} — refreshing`;
+      }
+      if (provider.status === "cached") return `${provider.label} — cached`;
+      return `${provider.label} — unavailable`;
+    }
+
+    function effortLabel(effort) {
+      return effort
+        .split(/[-_]/)
+        .filter(Boolean)
+        .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+    }
+
+    function renderAgentStatus() {
+      const provider = providerCatalog();
+      elements.agentStatus.className = "agent-status";
+      if (!provider) {
+        elements.agentStatus.textContent = state.agent_capabilities?.refreshing
+          ? "Checking installed agent CLIs…"
+          : "No agent provider was reported.";
+        elements.agentStatus.classList.add("error");
+        return;
+      }
+      const providerRefreshing = (
+        state.agent_capabilities?.refreshingProviders || []
+      ).includes(provider.id);
+      if (providerRefreshing && provider.stale && (provider.models || []).length) {
+        elements.agentStatus.textContent =
+          "Using cached information while refreshing.";
+        return;
+      }
+      if (providerRefreshing) {
+        elements.agentStatus.textContent =
+          `Refreshing ${provider.label} models and efforts from its CLI…`;
+        return;
+      }
+      if (!provider.live || provider.status !== "ready") {
+        elements.agentStatus.textContent =
+          provider.warning || `${provider.label} is not ready.`;
+        elements.agentStatus.classList.add("error");
+        return;
+      }
+      const model = selectedModelCapability(provider);
+      if (!model) {
+        elements.agentStatus.textContent =
+          `${provider.label} did not report a selectable model.`;
+        elements.agentStatus.classList.add("error");
+        return;
+      }
+      const probingSelectedModel = (
+        state.agent_capabilities?.probing || []
+      ).some(item => item.provider === provider.id && item.model === model.id);
+      if (agentCapabilityBusy || probingSelectedModel) {
+        elements.agentStatus.textContent =
+          `Checking effort support for ${model.displayName || model.id}…`;
+        return;
+      }
+      if (model.effortsVerified && !(model.efforts || []).length) {
+        elements.agentStatus.textContent =
+          "No model-specific effort control; using CLI default.";
+        elements.agentStatus.classList.add("ready");
+        return;
+      }
+      let suffix;
+      if (model.effortsVerified) {
+        suffix = "Ready — models and efforts verified from the installed CLI.";
+      } else if ((model.efforts || []).length) {
+        suffix = "Ready — model list is live.";
+      } else if (provider.warning) {
+        suffix = "Ready — model list is live.";
+      } else {
+        suffix =
+          "Ready — model list is live; effort support will be verified before use.";
+      }
+      elements.agentStatus.textContent = provider.warning
+        ? `${suffix} ${provider.warning}`
+        : suffix;
+      elements.agentStatus.classList.add("ready");
+    }
+
+    function renderAgentCapabilities(capabilities) {
+      if (!capabilities || !Array.isArray(capabilities.providers)) return;
+      const previousProvider = elements.provider.value;
+      const previousModel = elements.model.value;
+      const previousEffort = elements.effort.value;
+      state.agent_capabilities = capabilities;
+
+      elements.provider.replaceChildren();
+      for (const provider of capabilities.providers) {
+        elements.provider.add(
+          new Option(providerOptionLabel(provider), provider.id)
+        );
+      }
+      const providerChoices = capabilities.providers;
+      const readyProviderIds = new Set(
+        providerChoices
+          .filter(item => item.live && item.status === "ready")
+          .map(item => item.id)
+      );
+      const desiredProvider = [
+        readyProviderIds.has(agentSettings.provider)
+          ? agentSettings.provider
+          : null,
+        readyProviderIds.has(previousProvider) ? previousProvider : null,
+        providerChoices.find(item => item.live && item.status === "ready")?.id,
+        providerChoices[0]?.id
+      ].find(value => value && optionExists(elements.provider, value));
+      if (desiredProvider) elements.provider.value = desiredProvider;
+
+      const provider = providerCatalog();
+      const saved = agentSettings.selections[elements.provider.value] || {};
+      elements.model.replaceChildren();
+      for (const model of provider?.models || []) {
+        elements.model.add(
+          new Option(model.displayName || model.id, model.id)
+        );
+      }
+      const defaultModel = (provider?.models || []).find(model => model.isDefault);
+      const desiredModel = [
+        previousProvider === elements.provider.value ? previousModel : null,
+        saved.model,
+        defaultModel?.id,
+        provider?.models?.[0]?.id
+      ].find(value => value && optionExists(elements.model, value));
+      if (desiredModel) elements.model.value = desiredModel;
+
+      const model = selectedModelCapability(provider);
+      if (model?.effortsVerified) effortVerificationKey = null;
+      elements.effort.replaceChildren(
+        new Option("Automatic — CLI default", "automatic")
+      );
+      for (const effort of model?.efforts || []) {
+        elements.effort.add(new Option(effortLabel(effort), effort));
+      }
+      const desiredEffort = [
+        previousProvider === elements.provider.value &&
+        previousModel === elements.model.value
+          ? previousEffort
+          : null,
+        saved.effort,
+        model?.defaultEffort,
+        "automatic"
+      ].find(value => value && optionExists(elements.effort, value));
+      elements.effort.value = desiredEffort || "automatic";
+
+      renderAgentStatus();
+      setRunStatus(state.run_status || "idle");
+    }
+
+    async function fetchAgentCapabilities() {
+      const capabilities = await api("/api/agent-capabilities");
+      renderAgentCapabilities(capabilities);
+      if (capabilities.refreshing || (capabilities.probing || []).length) {
+        clearTimeout(agentRefreshTimer);
+        agentRefreshTimer = setTimeout(
+          () => fetchAgentCapabilities().catch(error => showToast(error.message)),
+          650
+        );
+      } else {
+        verifySelectedModelEfforts();
+      }
+      return capabilities;
+    }
+
+    async function refreshAgentCapabilities(provider = null) {
+      effortVerificationKey = null;
+      agentCapabilityBusy = true;
+      renderAgentStatus();
+      setRunStatus(state.run_status || "idle");
+      try {
+        const payload = provider ? { provider } : {};
+        const capabilities = await api("/api/agent-capabilities/refresh", {
+          method: "POST",
+          body: JSON.stringify(payload)
+        });
+        renderAgentCapabilities(capabilities);
+        clearTimeout(agentRefreshTimer);
+        agentRefreshTimer = setTimeout(
+          () => fetchAgentCapabilities().catch(error => showToast(error.message)),
+          450
+        );
+      } catch (error) {
+        showToast(error.message);
+      } finally {
+        agentCapabilityBusy = false;
+        renderAgentStatus();
+        setRunStatus(state.run_status || "idle");
+      }
+    }
+
+    async function verifySelectedModelEfforts() {
+      const provider = providerCatalog();
+      const model = selectedModelCapability(provider);
+      if (
+        !provider ||
+        provider.id !== "claude" ||
+        !provider.live ||
+        !model ||
+        model.effortsVerified
+      ) {
+        return;
+      }
+      const key = `${provider.cliVersion || ""}:${model.id}`;
+      if (effortVerificationKey === key) return;
+      effortVerificationKey = key;
+      agentCapabilityBusy = true;
+      renderAgentStatus();
+      setRunStatus(state.run_status || "idle");
+      try {
+        const capabilities = await api("/api/agent-capabilities/refresh", {
+          method: "POST",
+          body: JSON.stringify({ provider: provider.id, model: model.id })
+        });
+        renderAgentCapabilities(capabilities);
+        clearTimeout(agentRefreshTimer);
+        agentRefreshTimer = setTimeout(
+          () => fetchAgentCapabilities().catch(error => showToast(error.message)),
+          450
+        );
+      } catch (error) {
+        effortVerificationKey = null;
+        showToast(error.message);
+      } finally {
+        agentCapabilityBusy = false;
+        renderAgentStatus();
+        setRunStatus(state.run_status || "idle");
+      }
     }
 
     function setPreview(path, url) {
@@ -3960,18 +4428,31 @@ HTML_TEMPLATE = r"""<!doctype html>
       const snapshotBusy = Boolean(state.snapshot_in_progress);
       const interactionBusy = busy || snapshotBusy || uploadBusy;
       const messageBusy = interactionBusy || referenceUploadBusy;
+      const selectedProvider = providerCatalog();
+      const providerName = selectedProvider?.label || "Agent";
+      const agentUnavailable = !providerIsReady(selectedProvider);
       if (busy && !lockedReferenceIds.size) {
         for (const item of state.references || []) lockedReferenceIds.add(item.id);
       } else if (!busy) {
         lockedReferenceIds.clear();
       }
       elements.stop.disabled = !busy;
-      elements.send.disabled = messageBusy;
+      elements.send.disabled =
+        messageBusy || agentUnavailable || agentCapabilityBusy;
       elements.open.disabled = interactionBusy;
       elements.browse.disabled = interactionBusy;
       elements.drop.disabled = interactionBusy;
-      elements.model.disabled = busy || uploadBusy || referenceUploadBusy;
-      elements.reasoning.disabled = busy || uploadBusy || referenceUploadBusy;
+      elements.provider.disabled =
+        busy || uploadBusy || referenceUploadBusy || agentCapabilityBusy;
+      elements.model.disabled =
+        busy || uploadBusy || referenceUploadBusy || agentCapabilityBusy ||
+        !elements.model.options.length;
+      elements.effort.disabled =
+        busy || uploadBusy || referenceUploadBusy || agentCapabilityBusy ||
+        !elements.effort.options.length;
+      elements.agentRefresh.disabled =
+        busy || uploadBusy || referenceUploadBusy || agentCapabilityBusy ||
+        Boolean(state.agent_capabilities?.refreshing);
       elements.referenceAttach.disabled = referenceUploadBusy;
       elements.referenceFile.disabled = referenceUploadBusy;
       elements.wordView.disabled = interactionBusy;
@@ -3980,13 +4461,14 @@ HTML_TEMPLATE = r"""<!doctype html>
         referenceUploadBusy ? "Uploading reference…" :
         uploadBusy ? "Importing file…" :
         snapshotBusy ? "Rendering Word view…" :
-        status === "working" ? "Codex is editing…" :
-        status === "starting" ? "Starting Codex…" :
+        status === "working" ? `${providerName} is editing…` :
+        status === "starting" ? `Starting ${providerName}…` :
         status === "stopping" ? "Stopping…" :
         status === "error" ? "Action needed" :
         state.active_document ? (state.watch_alive ? "Live preview connected" : "Preview reconnecting") :
         "Ready to open a document";
       elements.activitySummary.textContent = busy ? "Agent activity · working…" : "Agent activity";
+      renderAgentStatus();
       renderDocumentControls();
       renderReferences();
     }
@@ -3996,6 +4478,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       renderTranscript(state.transcript || []);
       renderRecent(state.recent || []);
       renderSessions(state.sessions || []);
+      if (snapshot.agent_capabilities) {
+        renderAgentCapabilities(snapshot.agent_capabilities);
+      }
       setPreview(
         state.active_document,
         state.active_document && state.watch_url
@@ -4353,8 +4838,9 @@ HTML_TEMPLATE = r"""<!doctype html>
           method: "POST",
           body: JSON.stringify({
             message,
+            provider: elements.provider.value,
             model: elements.model.value,
-            reasoning: elements.reasoning.value
+            effort: elements.effort.value
           })
         });
         if (result.action === "focus_session" && result.session_id) {
@@ -4483,8 +4969,22 @@ HTML_TEMPLATE = r"""<!doctype html>
         window.location.assign(`/?s=${encodeURIComponent(elements.session.value)}`);
       }
     });
-    elements.model.addEventListener("change", saveAgentSettings);
-    elements.reasoning.addEventListener("change", saveAgentSettings);
+    elements.provider.addEventListener("change", () => {
+      agentSettings.provider = elements.provider.value;
+      renderAgentCapabilities(state.agent_capabilities);
+      saveAgentSettings();
+      verifySelectedModelEfforts();
+    });
+    elements.model.addEventListener("change", () => {
+      renderAgentCapabilities(state.agent_capabilities);
+      saveAgentSettings();
+      verifySelectedModelEfforts();
+    });
+    elements.effort.addEventListener("change", saveAgentSettings);
+    elements.agentRefresh.addEventListener(
+      "click",
+      () => refreshAgentCapabilities(elements.provider.value || null)
+    );
     elements.reload.addEventListener("click", repairWatch);
     elements.preview.addEventListener("error", repairWatch);
     elements.recent.addEventListener("change", () => {
@@ -4527,6 +5027,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     loadAgentSettings();
     api("/health").then(applySnapshot).catch(error => showToast(error.message));
+    fetchAgentCapabilities().catch(error => showToast(error.message));
 
     function announceClose() {
       if (closeSent) return;
@@ -4860,6 +5361,12 @@ class OgentHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(200, STATE.global_snapshot())
             return
+        if parsed.path in {
+            "/agent-capabilities",
+            "/api/agent-capabilities",
+        }:
+            self._send_json(200, AGENT_CATALOG.snapshot())
+            return
         if parsed.path == "/events":
             query = urllib.parse.parse_qs(parsed.query)
             token = (query.get("token") or [""])[0]
@@ -5066,13 +5573,52 @@ class OgentHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parsed.path in {
+                "/agent-capabilities/refresh",
+                "/api/agent-capabilities/refresh",
+            }:
+                payload = self._read_json()
+                provider = str(payload.get("provider") or "").strip().casefold()
+                model = str(payload.get("model") or "").strip()
+                if model:
+                    if provider != "claude":
+                        raise UserFacingError(
+                            "Model-specific effort refresh is available only for Claude Code."
+                        )
+                    try:
+                        AGENT_CATALOG.ensure_model_efforts_async(provider, model)
+                    except SelectionValidationError as exc:
+                        raise UserFacingError(str(exc), 409) from exc
+                else:
+                    try:
+                        started = AGENT_CATALOG.refresh_async(provider or None)
+                    except SelectionValidationError as exc:
+                        raise UserFacingError(str(exc)) from exc
+                    if not started:
+                        self._send_json(
+                            202,
+                            {
+                                **AGENT_CATALOG.snapshot(),
+                                "message": "Agent capability refresh is already running.",
+                            },
+                        )
+                        return
+                self._send_json(
+                    202,
+                    AGENT_CATALOG.snapshot(),
+                )
+                return
             if parsed.path == "/chat":
                 payload = self._read_json()
                 status, result = handle_chat_message(
                     session,
                     str(payload.get("message", "")),
-                    payload.get("model", DEFAULT_MODEL),
-                    payload.get("reasoning", DEFAULT_REASONING),
+                    payload.get("provider", DEFAULT_PROVIDER),
+                    payload.get("model"),
+                    payload.get(
+                        "effort",
+                        payload.get("reasoning", AUTOMATIC_EFFORT),
+                    ),
                 )
                 self._send_json(status, result)
                 return
@@ -5458,6 +6004,7 @@ def main() -> int:
         server.server_close()
         print(f"Could not initialize temporary references: {exc}", file=sys.stderr)
         return 1
+    AGENT_CATALOG.refresh_async()
     write_server_info(port)
     atexit.register(cleanup)
     initial_session: SessionState | None = None

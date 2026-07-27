@@ -6,12 +6,12 @@
 
 Ogent is a local Windows workspace for editing real Word, Excel, and PowerPoint
 files with plain-language instructions. It places an OfficeCLI live preview
-beside a Codex chat, runs on `127.0.0.1`, and creates a protected working copy
-before any edit touches a document.
+beside a Codex or Claude Code chat, runs on `127.0.0.1`, and creates a
+protected working copy before any edit touches a document.
 
-The current app is **Ogent Lite 0.8.0**. It uses your existing Codex CLI login,
-so it does not require a separate OpenAI API key. Ogent is open source under the
-[MIT License](LICENSE).
+The current app is **Ogent Lite 0.9.0**. It uses the selected CLI's existing
+sign-in and never asks you to enter an OpenAI or Anthropic API key. Ogent is
+open source under the [MIT License](LICENSE).
 
 ## Install Ogent
 
@@ -21,7 +21,7 @@ Copy and paste this one sentence into Codex or another local AI agent that can
 run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; reuse compatible tools already installed; install or update Git, Python 3, OpenAI Codex CLI, and OfficeCLI only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete any unavoidable Windows elevation or ChatGPT sign-in without asking me to paste secrets into chat; verify that py -3, git, codex, and officecli all work; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.8.0; drag disposable DOCX, XLSX, PPTX, and searchable PDF files into the browser and one DOCX onto the desktop shortcut; attach disposable Office, PDF, text, and image files at the chat composer and confirm they remain read-only, work with and without an active document, and are deleted after each run; confirm protected import and working copies, live previews, valid Office output, unchanged source hashes, the session switcher, model and reasoning selectors, Word view button, Stop, and automatic tab cleanup; leave the right-click integration enabled; and finish by reporting the installed versions, paths, test evidence, and any remaining limitation.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; preserve unrelated files and reuse compatible tools already installed; install or update Git, Python 3, OfficeCLI, and at least one supported agent CLI—OpenAI Codex CLI, Anthropic Claude Code, or both—only from their official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete any unavoidable Windows elevation or interactive provider sign-in without asking me to paste passwords, tokens, or API keys into chat; verify py -3, git, officecli, and every installed agent CLI; discover the models and effort choices available to my signed-in account from each CLI at runtime instead of hard-coding names, using Codex App Server model/list with the installed CLI's dynamic fallback and Claude Code's zero-inference /model and help probes, and report any provider that cannot be verified; from the ogent-lite folder register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut targeting ogent.cmd with assets\ogent.ico, launch Ogent, and verify that its health endpoint reports version 0.9.0; confirm that Agent, Model, and Effort selectors show only live CLI-reported choices and that stale or unavailable choices cannot start a run; drag disposable DOCX, XLSX, PPTX, and searchable PDF files into the browser and one DOCX onto the desktop shortcut; attach disposable Office, PDF, text, and image files at the chat composer and confirm they remain read-only, work with and without an active document, use an isolated non-resumable provider context, and are deleted after each run; run one protected-copy Office edit with each installed provider, verify valid Office output and unchanged source hashes, then verify the session switcher, provider isolation, live preview, Word view, Stop, automatic tab cleanup, and right-click integration; leave the right-click integration enabled; and finish by reporting installed versions, discovered model/effort evidence, paths, test results, and any remaining limitation without committing or pushing unless I explicitly request it.
 ```
 
 The prompt deliberately leaves sign-in and elevation with the human and never
@@ -51,13 +51,26 @@ asks for a password, token, or API key.
    py -3 -m pip install -r '.\ogent-lite\requirements.txt'
    ```
 
-4. Install [OpenAI Codex CLI](https://github.com/openai/codex), then sign in
-   interactively with ChatGPT:
+4. Install and sign in to at least one supported agent CLI. You may install
+   both and switch between them without reopening the document.
+
+   For [OpenAI Codex CLI](https://github.com/openai/codex):
 
    ```powershell
    powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
    codex --version
-   codex
+   codex login
+   ```
+
+   For [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started):
+
+   Install Node.js 18 or later first. Native Windows Claude Code also uses Git
+   for Windows, which was installed in step 1.
+
+   ```powershell
+   npm install -g @anthropic-ai/claude-code
+   claude --version
+   claude auth login
    ```
 
 5. Install [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI):
@@ -77,7 +90,7 @@ asks for a password, token, or API key.
 
    Your browser opens the local app, normally at
    `http://127.0.0.1:8765/`. No AionUi installation or OfficeCLI MCP call is
-   required: Ogent invokes Codex CLI and OfficeCLI automatically.
+   required: Ogent invokes the selected agent CLI and OfficeCLI automatically.
 
 The Explorer command appears under **Right-click > Show more options > Open in
 Ogent** for `.docx`, `.xlsx`, and `.pptx`. Ogent requests Windows' `Top`
@@ -118,14 +131,31 @@ Ogent with that file immediately.
    You can also click the drop area to choose a file, drag a supported
    file onto the desktop shortcut, right-click an Office file and select
    **Open in Ogent**, or paste its absolute path and click **Open**.
-2. Choose the model and reasoning effort above the message box. The recommended
-   day-to-day setting is **GPT-5.6 Sol + Medium**.
+2. Choose a ready provider, then choose a model and effort reported by its
+   installed CLI. Click **Refresh** after signing in, changing account or
+   policy, or upgrading a CLI. **Automatic — CLI default** omits the effort
+   override.
 3. Describe the change in plain language and press **Enter**.
-4. Review each change in the live preview. Ogent asks Codex to use OfficeCLI,
-   read the result back, and validate the working document.
+4. Review each change in the live preview. Ogent asks the selected agent to use
+   OfficeCLI, read the result back, and validate the working document.
 5. For a DOCX with floating shapes or textboxes, click **Word view** for an
    on-demand PDF rendered by Microsoft Word. The normal live preview stays
    faster and editable; Word view is the layout-accurate verification surface.
+
+### Choose an agent, model, and effort
+
+Ogent does not ship a static model list. At startup and when **Refresh** is
+clicked, it asks each installed CLI for the models and effort choices available
+to the current signed-in account. Codex uses App Server `model/list`, with the
+installed CLI's dynamic fallback. Claude Code uses a local zero-inference
+`/model` query and help/probe checks, so discovery does not consume an inference
+turn. If model-specific probing is structurally unsupported, Claude's global
+CLI-valid efforts remain visibly labeled as model-specific support unverified.
+
+The last successful catalog is cached only to keep the interface understandable
+while refreshing. A stale catalog cannot start a run. Changing a model starts a
+fresh provider context; switching between Codex and Claude keeps their session
+identifiers separate.
 
 ### Analyze temporary chat references
 
@@ -145,8 +175,7 @@ Send references with a request, or press **Send** with an empty message to ask
 for a summary. The selected set is frozen into that run; references attached
 while it works stay in the tray for the next run. Searchable PDF text retains
 page headings. Scanned or low-text PDF pages, images, and visually requested
-Office content are supplied to Codex as bounded image inputs for OCR and visual
-interpretation.
+Office content are supplied only to the selected provider for that run.
 
 References and derived text, page images, and manifests live only under
 `%LOCALAPPDATA%\OgentLite\temporary-references\`. Ogent normally deletes the
@@ -154,7 +183,8 @@ run directory after success, error, Stop, preparation failure, session cleanup,
 or shutdown, and clears abandoned files on the next startup after a crash.
 Deletion is best-effort local deletion, not forensic erasure. **References are
 temporary local copies and are deleted after this run. Their contents are sent
-to Codex for analysis and may remain in the Codex conversation context.**
+to the selected AI provider in a non-resumable context; the provider's own
+data-handling policy still applies.**
 
 ### Start a new document
 
@@ -171,18 +201,22 @@ Use `.xlsx` or `.pptx` instead when starting a workbook or presentation.
 ### Work with several documents
 
 Each newly created Ogent browser workspace gets an independent session with its
-own document, OfficeCLI preview port, transcript, Codex context, and run state.
+own document, OfficeCLI preview port, transcript, provider-specific contexts,
+and run state.
 Use **+ New window** or launch `ogent.cmd` again to create a second workspace.
 Explorer's **Open in Ogent** command targets the most recently focused connected
 workspace so its existing tab updates immediately; Ogent also opens that
 workspace in a predictable extra tab. The session dropdown switches among every
 live workspace.
 
-Different sessions can run Codex edits at the same time. Each individual
+Different sessions can run agent edits at the same time. Each individual
 session still allows only one active run, which prevents two agents from
-editing the same working copy concurrently. Opening the same source twice
-focuses its existing session instead of starting a second watch. If two browser
-tabs point to that same deduplicated session, they share its document and chat;
+editing the same working copy concurrently. Codex and Claude keep separate
+document-specific contexts; changing model starts a fresh context, while
+switching back to a provider may resume its compatible context. Opening the
+same source twice focuses its existing session instead of starting a second
+watch. If two browser tabs point to that same deduplicated session, they share
+its document and chat;
 closing only one of them does not orphan the session.
 
 ### Keep the finished file
@@ -199,7 +233,7 @@ location and filename you want. Validate that final copy before delivery.
 Closing the final browser tab connected to a session marks that session
 orphaned. If it stays disconnected and idle, Ogent reaps it after 120 seconds,
 stops its OfficeCLI watch, and releases its preview port. A session with an
-active Codex run is protected until the run finishes, then receives a fresh
+active provider run is protected until the run finishes, then receives a fresh
 120-second reconnect window.
 
 After the last session is gone, the backend exits automatically after 10
@@ -229,7 +263,7 @@ From the `ogent-lite` folder:
 # Start or return to the existing app
 .\ogent.cmd
 
-# Stop Ogent, its OfficeCLI preview, and any Codex process it owns
+# Stop Ogent, its OfficeCLI preview, and any active provider process it owns
 .\ogent.cmd stop
 ```
 
@@ -262,17 +296,17 @@ remove them.
 ## How it works
 
 ```text
-Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected working copy
-       one tab/session -----------^        \-> its own live preview port
+Browser UI (127.0.0.1) -> Ogent server -> selected agent CLI -> OfficeCLI -> protected copy
+       one tab/session -----------^                 \-> its own live preview port
        another tab/session ------^
-       composer references -> temporary validation/extraction/images -> Codex
+       composer references -> temporary validation/extraction/images -> selected provider
 ```
 
 - Ogent owns one local server and a registry of independent tab sessions.
-  Each session owns its protected copy, transcript, Codex context, run state,
-  and OfficeCLI preview on a port allocated from 26320-26380.
-- Codex receives the selected model and reasoning level with document-specific,
-  single-agent editing instructions.
+  Each session owns its protected copy, transcript, provider-specific contexts,
+  run state, and OfficeCLI preview on a port allocated from 26320-26380.
+- The installed CLI is the model and effort source of truth. Ogent keeps no
+  static provider model catalog and validates every selection server-side.
 - Composer references use a separate per-session, per-run store. Only safe
   metadata reaches the browser; paths and derived artifacts stay local and are
   deleted at the terminal boundary.
@@ -284,28 +318,29 @@ Browser UI (127.0.0.1) -> Ogent server -> Codex CLI -> OfficeCLI -> protected wo
 ## Verified workstation
 
 - Windows 11
-- Ogent Lite 0.8.0
+- Ogent Lite 0.9.0
 - Python 3.14.3 with pypdfium2 5.12.1 and Pillow 12.1.1
 - OfficeCLI 1.0.142
 - Codex CLI 0.145.0
-- GPT-5.6 Sol with selectable Low, Medium, High, XHigh, Max, and Ultra reasoning
+- Claude Code 2.1.220
+- Live, zero-inference CLI capability discovery for both installed providers
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
 The app's browser and full-window drag/drop, composer references, searchable and
 scanned PDF analysis, direct image vision, desktop-shortcut drop, multi-session
 launch, concurrent protected-copy edits, live previews, same-file dedupe, tab
-reaping, crash cleanup, automatic backend exit, Word view, model and reasoning
-selectors, Stop control, PDF import, Explorer integration, desktop shortcut, and
-reversible unregister flow were exercised end to end. See
+reaping, crash cleanup, automatic backend exit, Word view,
+provider/model/effort selectors, Stop control, PDF import, Explorer integration,
+desktop shortcut, and reversible unregister flow were exercised end to end. See
 [ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for the app evidence.
 The repository's 13 original Office test artifacts also pass OpenXML validation;
 see [TEST-REPORT.md](TEST-REPORT.md).
 
 ## What Ogent demonstrates
 
-- A local two-pane Ogent app with live Office preview, Codex chat, model and
-  reasoning controls, independent browser-tab sessions, and Windows Explorer
-  integration
+- A local two-pane Ogent app with live Office preview, selectable Codex or
+  Claude Code chat, CLI-discovered controls, independent browser-tab sessions,
+  and Windows Explorer integration
 - Word reports with cover pages, live tables of contents, styles, headers, footers, page fields, tables, charts, and equations
 - Excel workbooks with real formulas, evaluated totals, formatting, conditional formatting, and native charts
 - PowerPoint decks with consistent themes, backgrounds, editable shapes, and charts
