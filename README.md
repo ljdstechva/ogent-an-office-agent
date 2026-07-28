@@ -12,11 +12,12 @@ beside a Codex or Claude Code chat and runs on `127.0.0.1`. Files opened by
 local path are edited directly after Ogent creates and verifies a physical
 recovery backup. Browser uploads and PDFs remain copy-based.
 
-This source tree is **Ogent Lite 0.10.1**. It uses the selected CLI's existing
+This source tree is **Ogent Lite 0.10.2**. It uses the selected CLI's existing
 sign-in and never asks you to enter an OpenAI or Anthropic API key. Ogent is
 open source under the [MIT License](LICENSE). See the
-[v0.10.1 release notes](ogent-lite/RELEASE-NOTES-v0.10.1.md) for the stable
-preview, submitted-selection behavior, and temporary OfficeCLI dependency.
+[v0.10.2 release notes](ogent-lite/RELEASE-NOTES-v0.10.2.md) for
+document-scoped chats, safe New Chat behavior, the verified live-preview
+revision handshake, and the temporary OfficeCLI dependency.
 
 ## Install Ogent
 
@@ -26,7 +27,7 @@ Copy and paste this one sentence into Codex or another local AI agent that can
 run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; preserve unrelated files and reuse compatible tools already installed; install or update Git, Python 3, and at least one supported agent CLI—OpenAI Codex CLI, Anthropic Claude Code, or both—only from official sources; install OfficeCLI 1.0.143 or later, using the checksum-verified Ogent viewer fork prerelease documented below only while the compatible upstream release is unavailable; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete unavoidable Windows elevation or interactive provider sign-in without asking me to paste secrets into chat; verify py -3, git, officecli, and every installed agent CLI; discover the live models and effort choices for my signed-in account instead of hard-coding names; register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut, launch Ogent, and verify that health reports version 0.10.1; exercise direct local DOCX/XLSX/PPTX edits and confirm each recovery backup matches the pre-edit hash; confirm normal completion, error, and Stop do not reload or reset the live preview; click submitted selection tags and verify that each exact target centers with a temporary gold highlight without changing the Office package or composer selection; confirm browser uploads and PDF edits remain copy-based; verify provider-neutral Codex/Claude memory, run status icons, Settings recovery controls, a 20-attachment Send followed by retained cross-provider use, Stop, tab cleanup, and right-click integration; validate every edited Office file with OfficeCLI and report measured performance, security checks, remaining limitations, and exact paths without pushing unless I explicitly request it.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; preserve unrelated files and reuse compatible tools already installed; install or update Git, Python 3, and at least one supported agent CLI—OpenAI Codex CLI, Anthropic Claude Code, or both—only from official sources; install OfficeCLI 1.0.143 or later, using the checksum-verified Ogent viewer fork prerelease documented below only while the compatible upstream release is unavailable; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete unavoidable Windows elevation or interactive provider sign-in without asking me to paste secrets into chat; verify py -3, git, officecli, and every installed agent CLI; discover the live models and effort choices for my signed-in account instead of hard-coding names; register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut, launch Ogent, and verify that health reports version 0.10.2; exercise direct local DOCX/XLSX/PPTX edits and confirm each recovery backup matches the pre-edit hash; demonstrate that two documents retain separate chats, attachments, selections, and provider-neutral memory; verify accessible Cancel, Escape, focus trapping, and confirmation for New Chat and prove that it preserves document and backup hashes; confirm completed Word edits report Preview updated only after the live viewer acknowledges the exact document revision, without reloading or losing the semantic viewport; click submitted selection tags and verify that each exact target centers with a temporary gold highlight without changing the Office package or composer selection; confirm browser uploads and PDF edits remain copy-based; verify Codex and Claude readiness, run status icons, Settings recovery controls, Stop followed by a successful edit, tab cleanup, and right-click integration; validate every edited Office file with OfficeCLI and report measured performance, security checks, remaining limitations, and exact paths without pushing unless I explicitly request it.
 ```
 
 The prompt deliberately leaves sign-in and elevation with the human and never
@@ -88,7 +89,7 @@ asks for a password, token, or API key.
    officecli --version
    ```
 
-   Ogent 0.10.1 requires OfficeCLI 1.0.143 or later. If the official installer
+   Ogent 0.10.2 requires OfficeCLI 1.0.143 or later. If the official installer
    still reports an older version, Windows x64 users can install the temporary,
    public [1.0.143 Ogent viewer preview fork prerelease](https://github.com/ljdstechva/OfficeCLI/releases/tag/v1.0.143-ogent-preview):
 
@@ -277,9 +278,10 @@ Canonical retained copies live under the launch-scoped session-memory root.
 Each provider turn receives independent copies under
 `%LOCALAPPDATA%\OgentLite\temporary-references\`; those run copies and
 derivatives are deleted after success, error, Stop, or preparation failure.
-**Forget** removes one retained attachment. **Settings > Clear session memory**
-removes the transcript and all retained attachments for that workspace. Session
-reaping, shutdown, and the next startup also clear launch-scoped memory.
+**Forget** removes one retained attachment. **+ New chat** (also available from
+Settings as **Start a new chat**) clears the transcript, memory, attachments,
+and selection context only for that document workspace. Session reaping,
+shutdown, and the next startup also clear launch-scoped memory.
 Deletion is best-effort local deletion, not forensic erasure. Attachment
 contents are sent to the selected AI provider for the requested turn; that
 provider's own data-handling and retention policy still applies.
@@ -298,14 +300,19 @@ Use `.xlsx` or `.pptx` instead when starting a workbook or presentation.
 
 ### Work with several documents
 
-Each newly created Ogent browser workspace gets an independent session with its
-own document, OfficeCLI preview port, transcript, provider-neutral memory, and
-run state.
-Use **+ New window** or launch `ogent.cmd` again to create a second workspace.
-Explorer's **Open in Ogent** command targets the most recently focused connected
-workspace so its existing tab updates immediately; Ogent also opens that
-workspace in a predictable extra tab. The session dropdown switches among every
-live workspace.
+Each open document owns one independent Ogent workspace with its document
+identity, OfficeCLI preview, transcript, provider-neutral memory, retained
+attachments, submitted selections, provider continuation IDs, and run state.
+Opening document B from a browser currently showing A creates or focuses B's
+workspace and navigates directly to it; A's history is never rendered under B.
+Reopening A during the same backend lifetime restores only A. Equivalent
+Windows path spellings resolve to the same workspace, while different files
+with the same filename remain separate.
+
+Use **+ New window** or launch `ogent.cmd` again when you want another browser
+client. Explorer's **Open in Ogent** command targets the most recently focused
+connected workspace and then creates or focuses the requested document
+workspace. The session dropdown switches among every live document workspace.
 
 Different sessions can run agent edits at the same time. Each individual
 session still allows only one active run, which prevents two agents from
@@ -315,6 +322,22 @@ delta to the freshly selected provider/model. Opening the same source twice
 focuses its existing session instead of starting a second watch. If two browser
 tabs point to that same deduplicated session, they share its document and chat;
 closing only one of them does not orphan the session.
+
+### Start a new chat
+
+Click **+ New chat** in the chat header to reset only the active document's
+conversation. The application modal starts on **Cancel**, traps keyboard focus,
+supports Escape, and explains the boundary before anything is removed.
+
+After confirmation, Ogent clears that document's transcript, provider-neutral
+memory, retained and pending attachments, submitted/current selections,
+provider continuation IDs, and old run summaries. It increments the
+conversation generation so late provider or browser events from the previous
+chat cannot repopulate the new one. The active Office document, all edits,
+recovery backup, direct-edit mode, preview watch and position, recent-file
+entry, application settings, and every other document workspace are preserved.
+Chat and memory remain launch-scoped: they last only while the current Ogent
+backend is running.
 
 ### Keep the finished file
 
@@ -341,9 +364,9 @@ exactly 30 x 24 hours after creation and is removed by the first startup,
 scheduled, or manual cleanup that runs at or after that instant.
 
 Open the gear menu to view backup count/size, open the recovery folder, run
-expired-backup cleanup, or clear the current workspace's provider-neutral
-memory. To restore manually: stop Ogent, copy the wanted backup over the
-original path, reopen it, and validate it with OfficeCLI. Cleanup is best-effort
+expired-backup cleanup, or start a new chat for the current document. To
+restore manually: stop Ogent, copy the wanted backup over the original path,
+reopen it, and validate it with OfficeCLI. Cleanup is best-effort
 filesystem deletion, not forensic erasure; storage snapshots, sync history,
 antivirus caches, and provider-side retention are outside Ogent's control.
 
@@ -416,15 +439,17 @@ policy applies.
 ## How it works
 
 ```text
-Browser UI (127.0.0.1) -> Ogent session memory -> fresh selected agent CLI
+Browser UI (127.0.0.1) -> document workspace memory -> fresh selected agent CLI
        |                         |                         |
        |                         +-> retained attachments -+
        +-> live preview selection -> scoped OfficeCLI MCP -> active document
 ```
 
-- Ogent owns one local server and a registry of independent tab sessions.
-  Each session owns its document identity, transcript, provider-neutral memory,
-  run state, and OfficeCLI preview on a port allocated from 26320-26380.
+- Ogent owns one local server and a registry of document workspaces. Each
+  workspace owns its document identity, transcript, provider-neutral memory,
+  attachments, selections, conversation generation, run state, and OfficeCLI
+  preview on a port allocated from 26320-26380. Browser clients focus or share
+  a workspace; they are not the conversation ownership boundary.
 - The installed CLI is the model and effort source of truth. Ogent keeps no
   static provider model catalog and validates every selection server-side.
 - Retained attachments use canonical per-session storage plus disposable,
@@ -436,8 +461,12 @@ Browser UI (127.0.0.1) -> Ogent session memory -> fresh selected agent CLI
   and/or read-only run-reference access needed for that turn.
 - OfficeCLI performs and validates the actual Office-file changes.
 - Preview navigation identity is the Ogent session, logical document, watch
-  port, and watch generation—not the document revision. OfficeCLI's live
-  renderer preserves the newest semantic Word/Excel/PowerPoint viewport anchor.
+  port, and watch generation—not the document revision. A per-client relay
+  correlates the validated Office package and exact OfficeCLI watch event, then
+  requires the initiating viewer's DOM to equal a fully rendered canonical view before
+  reporting **Preview updated**. In-place resynchronization preserves the
+  viewport; a dead watch is restarted once and restores the first visible
+  semantic path.
 - Historical selection focus accepts only a submitted message sequence and
   selection ID from the browser. The server revalidates canonical session
   memory and invokes public OfficeCLI commands as argument arrays without a
@@ -446,10 +475,10 @@ Browser UI (127.0.0.1) -> Ogent session memory -> fresh selected agent CLI
   [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md), but it is not required to run the
   Ogent app.
 
-## Verified v0.10.1 release (2026-07-28)
+## Verified v0.10.2 release (2026-07-28)
 
 - Windows 11
-- Ogent Lite 0.10.1
+- Ogent Lite 0.10.2
 - Python 3.14.3 with pypdfium2 5.12.1 and Pillow 12.1.1
 - Public OfficeCLI 1.0.143-ogent-preview Windows x64 fork prerelease
 - Codex CLI 0.145.0
@@ -457,22 +486,37 @@ Browser UI (127.0.0.1) -> Ogent session memory -> fresh selected agent CLI
 - Live, zero-inference CLI capability discovery for both installed providers
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
-Automated coverage passed with 148 test methods and 56 executed subtests. Real Codex
-`gpt-5.6-sol` edits in synthetic Word, Excel, and PowerPoint files retained the
-latest manually chosen viewport with zero iframe load events. Submitted
-selection buttons centered their exact targets at 49-51% of preview height,
-showed a gold viewer-only mark, and preserved composer selection, draft text,
-transcript, and provider-neutral memory. OfficeCLI validation returned zero
-errors for all three edited files, and each recovery backup matched its
-pre-edit SHA-256.
+Automated coverage includes document path deduplication and concurrency,
+provider-neutral A/B memory isolation, transactional reset and late-event
+rejection, exact-client reset authorization, formatting/structural preview
+events, consecutive revisions, in-place recovery, and one-restart semantic
+position restoration. The final local gate passed 166 tests and 58 subtests
+under Pytest, then the same 166 tests under Unittest.
 
-The responsive gate used headed Microsoft Edge through the project-approved
+In real Chromium acceptance, document B first opened with no A transcript,
+memory, attachment, or selection. Reopening A restored its unique message,
+retained reference, and submitted selection tag; reopening B restored only B.
+Escape and Cancel changed nothing. Confirming New Chat incremented only B's
+conversation generation and reduced its transcript and retained memory to zero
+while B's document hash, backup hash, watch port, and watch generation stayed
+unchanged; A remained intact.
+
+Real Codex `gpt-5.6-sol` edits appeared automatically in the synthetic Word
+preview with the same iframe node, URL, and semantic viewport. The final
+post-review run returned HTTP 204 only after the initiating viewer and a fully
+rendered canonical view produced equal DOM fingerprints; it recorded watch
+version 2, `status=updated`, and zero scroll drift. A stopped run was followed
+by another successful in-place edit. Formatting-only bold and an added table
+row also rendered live. A submitted selection tag later centered the changed
+paragraph and added a gold viewer-only mark. OfficeCLI readback and validation
+passed after each real mutation.
+
+The responsive gate used headed Chromium through the project-approved
 Playwright fallback after the in-app browser reported `No browser is
 available`. Both 1440x900 and 390x844 passed with no horizontal page overflow
-or transcript/composer overlap. Hover, keyboard focus, loading, empty,
-completed, stopped, and controlled-error states were exercised; the current
-console was clean and the only HTTP conflict was the intentional
-cross-document selection rejection. See
+or clipped modal controls. Initial focus, focus cycling, Escape, Cancel, empty,
+completed, stopped, and updated states were exercised, and the current console
+was clean. See
 [ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for the detailed
 evidence.
 
@@ -489,8 +533,8 @@ see [TEST-REPORT.md](TEST-REPORT.md).
 ## What Ogent demonstrates
 
 - A local two-pane Ogent app with live Office preview, selectable Codex or
-  Claude Code chat, CLI-discovered controls, independent browser-tab sessions,
-  and Windows Explorer integration
+  Claude Code chat, CLI-discovered controls, document-scoped workspaces that
+  browser tabs can focus or share, and Windows Explorer integration
 - Word reports with cover pages, live tables of contents, styles, headers, footers, page fields, tables, charts, and equations
 - Excel workbooks with real formulas, evaluated totals, formatting, conditional formatting, and native charts
 - PowerPoint decks with consistent themes, backgrounds, editable shapes, and charts
@@ -596,7 +640,7 @@ for the complete agent workflow.
 
 ## Visio note
 
-OfficeCLI 1.0.143 or later is required for Ogent v0.10.1. It supports `.docx`,
+OfficeCLI 1.0.143 or later is required for Ogent v0.10.2. It supports `.docx`,
 `.xlsx`, and `.pptx`, but not `.vsdx`. Ogent demonstrates a native editable
 Word drawing as the current alternative. A future OfficeCLI format-handler
 plugin or a separate Python `vsdx` workflow could add real Visio output.

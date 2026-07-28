@@ -775,6 +775,15 @@ def _clear_owned_marks(
     state.selection_id = None
 
 
+def clear_historical_focus(
+    runner: Runner,
+    document: Path,
+    state: HistoricalFocusState,
+) -> None:
+    """Remove only Ogent-owned viewer marks for one document workspace."""
+    _clear_owned_marks(runner, document, state)
+
+
 def focus_historical_target(
     runner: Runner,
     document: Path,

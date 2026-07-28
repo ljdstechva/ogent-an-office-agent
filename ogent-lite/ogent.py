@@ -72,11 +72,23 @@ from ogent_preview_selection import (  # noqa: E402
 from ogent_selection_focus import (  # noqa: E402
     HistoricalFocusError,
     HistoricalFocusState,
+    clear_historical_focus,
     focus_historical_target,
     package_sha256,
     resolve_current_target,
     resolve_memory_selection,
     validate_focus_payload,
+)
+from ogent_preview_sync import (  # noqa: E402
+    CLIENT_ID_PATTERN as PREVIEW_CLIENT_ID_PATTERN,
+    MUTATION_ACTIONS as PREVIEW_MUTATION_ACTIONS,
+    PreviewAck as PreviewAck,
+    PreviewConfirmation,
+    PreviewRunBaseline,
+    PreviewSyncError,
+    PreviewSyncState,
+    WatchMutation as WatchMutation,
+    event_fingerprint,
 )
 from ogent_retained_attachments import (  # noqa: E402
     RetainedAttachmentError,
@@ -105,7 +117,7 @@ from ogent_agent_providers import (  # noqa: E402
 )
 
 APP_NAME = "Ogent Lite"
-APP_VERSION = "0.10.1"
+APP_VERSION = "0.10.2"
 MIN_OFFICECLI_VERSION = (1, 0, 143)
 MIN_OFFICECLI_VERSION_TEXT = ".".join(str(item) for item in MIN_OFFICECLI_VERSION)
 HOST = "127.0.0.1"
@@ -493,6 +505,456 @@ def preview_identity_public(session: "SessionState") -> dict[str, Any] | None:
         }
 
 
+def preview_proxy_parameters(
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> dict[str, str]:
+    with session.lock:
+        parameters = {
+            "s": session.session_id,
+            "client": client_id,
+            "document": (
+                session.document_id
+                if document_id is None
+                else document_id
+            ),
+            "generation": (
+                session.watch_generation
+                if watch_generation is None
+                else watch_generation
+            ),
+            "channel": channel,
+        }
+    if comparison_only:
+        parameters["canonical"] = "1"
+    return parameters
+
+
+def preview_proxy_path(
+    endpoint: str,
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> str:
+    query = urllib.parse.urlencode(
+        preview_proxy_parameters(
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+            comparison_only=comparison_only,
+        )
+    )
+    return f"{endpoint}?{query}"
+
+
+def preview_ack_script(
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    package_fingerprint: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> str:
+    ack_url = (
+        f"http://{HOST}:{STATE.server_port}"
+        + preview_proxy_path(
+            "/preview/ack",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        )
+    )
+    control_url = preview_proxy_path(
+        "/preview/control",
+        session,
+        client_id,
+        channel,
+        document_id=document_id,
+        watch_generation=watch_generation,
+    )
+    config = json.dumps(
+        {
+            "ackUrl": ack_url,
+            "controlUrl": control_url,
+            "canonicalUrl": preview_proxy_path(
+                "/preview",
+                session,
+                client_id,
+                channel,
+                document_id=document_id,
+                watch_generation=watch_generation,
+                comparison_only=True,
+            ),
+            "packageSha256": package_fingerprint,
+            "comparisonOnly": comparison_only,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return f"""
+<div id="ogent-preview-fingerprint" hidden aria-hidden="true"
+     data-package-sha256="{package_fingerprint}"></div>
+<script>
+(() => {{
+  "use strict";
+  const config = {config};
+  if (config.comparisonOnly) return;
+  const mutationActions = new Set([
+    "add", "doc-switched", "excel-patch", "full",
+    "remove", "replace", "word-patch"
+  ]);
+  const marker = () => document.getElementById("ogent-preview-fingerprint");
+  const packageSha = message =>
+    String(message?._ogent?.package_sha256 || marker()?.dataset.packageSha256 ||
+      config.packageSha256 || "");
+  const dynamicClasses = new Set([
+    "officecli-mark",
+    "officecli-mark-block",
+    "officecli-mark-stale",
+    "officecli-selected",
+    "officecli-sel-range",
+    "officecli-sel-rowcol"
+  ]);
+  async function digest(value) {{
+    if (!globalThis.crypto?.subtle) return null;
+    const bytes = new TextEncoder().encode(String(value || ""));
+    const result = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(result))
+      .map(item => item.toString(16).padStart(2, "0")).join("");
+  }}
+  function normalizedNodeHtml(node) {{
+    const clone = node.cloneNode(true);
+    clone.querySelectorAll(".officecli-mark,.cjk-done").forEach(item => {{
+      item.replaceWith(...Array.from(item.childNodes));
+    }});
+    clone.querySelectorAll("span").forEach(item => {{
+      const attributes = Array.from(item.attributes || []);
+      if (
+        item.style?.length === 1 &&
+        item.style.marginRight === "-0.2em" &&
+        attributes.every(attribute => attribute.name === "style")
+      ) {{
+        // OfficeCLI's CJK typography pass can add, omit, or nest this
+        // visually equivalent punctuation wrapper after an in-place patch.
+        item.replaceWith(...Array.from(item.childNodes));
+      }}
+    }});
+    [clone, ...clone.querySelectorAll("*")].forEach(item => {{
+      const marked = Array.from(item.classList || [])
+        .some(value => dynamicClasses.has(value));
+      dynamicClasses.forEach(value => item.classList?.remove(value));
+      if (marked) {{
+        item.style.boxShadow = "";
+        if (item.dataset?.officecliMarkBg) {{
+          item.style.backgroundColor = "";
+          delete item.dataset.officecliMarkBg;
+        }}
+        item.removeAttribute("title");
+      }}
+      if (item.getAttribute?.("class") === "") item.removeAttribute("class");
+      if (item.getAttribute?.("style") === "") item.removeAttribute("style");
+    }});
+    return clone.outerHTML;
+  }}
+  function semanticSignature(root) {{
+    const styles = Array.from(root.querySelectorAll("head style"))
+      .map(item => item.textContent || "");
+    const values = Array.from(root.querySelectorAll("[data-path]"))
+      .filter(item => !item.closest(".sidebar,.thumb"))
+      .filter(item => !item.parentElement?.closest("[data-path]"))
+      .map(item => [
+        String(item.getAttribute("data-path") || ""),
+        normalizedNodeHtml(item)
+      ]);
+    values.sort((left, right) =>
+      left[0].localeCompare(right[0]) || left[1].localeCompare(right[1]));
+    return JSON.stringify({{ styles, values }});
+  }}
+  async function semanticFingerprint(root = document) {{
+    return digest(semanticSignature(root));
+  }}
+  function visiblePath() {{
+    const items = Array.from(document.querySelectorAll("[data-path]"))
+      .filter(item => {{
+        if (item.closest(".sidebar,.thumb,.sheet-tabs")) return false;
+        const rect = item.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 &&
+          rect.bottom > 0 && rect.top < innerHeight &&
+          rect.right > 0 && rect.left < innerWidth;
+      }});
+    if (!items.length) return null;
+    const centerY = innerHeight / 2;
+    const centerX = innerWidth / 2;
+    items.sort((left, right) => {{
+      const a = left.getBoundingClientRect();
+      const b = right.getBoundingClientRect();
+      const scoreA = Math.abs((a.top + a.bottom) / 2 - centerY) +
+        Math.abs((a.left + a.right) / 2 - centerX) * 0.2;
+      const scoreB = Math.abs((b.top + b.bottom) / 2 - centerY) +
+        Math.abs((b.left + b.right) / 2 - centerX) * 0.2;
+      return scoreA - scoreB;
+    }});
+    return items[0].getAttribute("data-path");
+  }}
+  async function sendAck(
+    kind,
+    message = null,
+    viewportPath = null,
+    packageOverride = null,
+    canonicalDom = null
+  ) {{
+    const body = {{
+      kind,
+      version: Number(window._clientVersion || message?.version || 0),
+      event_fingerprint:
+        message?._ogent?.event_fingerprint || null,
+      package_sha256: String(packageOverride || packageSha(message)),
+      dom_fingerprint: await semanticFingerprint(document),
+      canonical_dom_fingerprint: canonicalDom,
+      control_id: message?._ogent?.control_id || null,
+      viewport_path: viewportPath
+    }};
+    try {{
+      await fetch(config.ackUrl, {{
+        method: "POST",
+        mode: "no-cors",
+        cache: "no-store",
+        keepalive: true,
+        headers: {{ "Content-Type": "text/plain;charset=UTF-8" }},
+        body: JSON.stringify(body)
+      }});
+    }} catch (_) {{}}
+  }}
+  const nextFrame = () =>
+    new Promise(resolve => requestAnimationFrame(resolve));
+  async function renderedCanonical(message) {{
+    const frame = document.createElement("iframe");
+    frame.setAttribute("aria-hidden", "true");
+    frame.tabIndex = -1;
+    frame.style.cssText =
+      "position:fixed;left:-100000px;top:0;border:0;opacity:0;" +
+      "pointer-events:none;width:" + Math.max(320, innerWidth) + "px;" +
+      "height:" + Math.max(240, innerHeight) + "px;";
+    const url = new URL(config.canonicalUrl, location.href);
+    url.searchParams.set(
+      "proof",
+      globalThis.crypto?.randomUUID?.() ||
+        Math.random().toString(16).slice(2)
+    );
+    const loaded = new Promise((resolve, reject) => {{
+      const timer = setTimeout(
+        () => reject(new Error("Canonical preview timed out.")),
+        8000
+      );
+      frame.addEventListener("load", () => {{
+        clearTimeout(timer);
+        resolve();
+      }}, {{ once: true }});
+      frame.addEventListener("error", () => {{
+        clearTimeout(timer);
+        reject(new Error("Canonical preview failed to load."));
+      }}, {{ once: true }});
+    }});
+    frame.src = url.toString();
+    document.body.appendChild(frame);
+    try {{
+      await loaded;
+      const proofDocument = frame.contentDocument;
+      if (!proofDocument) {{
+        frame.remove();
+        return null;
+      }}
+      if (proofDocument.fonts?.ready) {{
+        await proofDocument.fonts.ready.catch(() => {{}});
+      }}
+      let previous = null;
+      let stableFrames = 0;
+      let expectedDom = null;
+      for (let count = 0; count < 90; count += 1) {{
+        await nextFrame();
+        const candidate = await semanticFingerprint(proofDocument);
+        if (candidate && candidate === previous) {{
+          stableFrames += 1;
+        }} else {{
+          stableFrames = 0;
+        }}
+        previous = candidate;
+        if (stableFrames >= 2) {{
+          expectedDom = candidate;
+          break;
+        }}
+      }}
+      if (!expectedDom) {{
+        frame.remove();
+        return null;
+      }}
+      const expectedPackage = String(
+        proofDocument
+          .getElementById("ogent-preview-fingerprint")
+          ?.dataset.packageSha256 || packageSha(message)
+      );
+      return {{ frame, expectedDom, expectedPackage }};
+    }} catch (_) {{
+      frame.remove();
+      return null;
+    }}
+  }}
+  async function confirmCanonical(kind, message, dispatchUpdate = false) {{
+    let proof = null;
+    try {{
+      proof = await renderedCanonical(message);
+      if (!proof) return;
+      const {{ frame, expectedDom, expectedPackage }} = proof;
+      if (dispatchUpdate) {{
+        source.dispatchEvent(new MessageEvent("update", {{
+          data: JSON.stringify(message)
+        }}));
+      }}
+      let frames = 0;
+      const check = async () => {{
+        frames += 1;
+        const currentDom = await semanticFingerprint(document);
+        if (currentDom === expectedDom) {{
+          if (marker()) marker().dataset.packageSha256 = expectedPackage;
+          frame.remove();
+          requestAnimationFrame(
+            () => sendAck(
+              kind,
+              message,
+              null,
+              expectedPackage,
+              expectedDom
+            )
+          );
+          return;
+        }}
+        if (frames < 240) {{
+          requestAnimationFrame(check);
+        }} else {{
+          frame.remove();
+        }}
+      }};
+      requestAnimationFrame(check);
+    }} catch (_) {{
+      proof?.frame?.remove();
+    }}
+  }}
+  const source = window._watchEs;
+  if (source && typeof source.addEventListener === "function") {{
+    source.addEventListener("update", event => {{
+      try {{
+        const message = JSON.parse(event.data);
+        if (!mutationActions.has(String(message.action || ""))) return;
+        if (message?._ogent?.control_id) return;
+        confirmCanonical("mutation", message);
+      }} catch (_) {{}}
+    }});
+    const control = new EventSource(config.controlUrl);
+    control.onmessage = event => {{
+      try {{
+        const message = JSON.parse(event.data);
+        if (message.action === "ogent-capture") {{
+          sendAck("viewport", message, visiblePath());
+          return;
+        }}
+        if (message.action === "full") {{
+          confirmCanonical("refresh", message, true);
+        }}
+      }} catch (_) {{
+        return;
+      }}
+    }};
+  }}
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => sendAck("initial")));
+}})();
+</script>
+"""
+
+
+def rewrite_preview_html(
+    html: str,
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    package_fingerprint: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> str:
+    replacements = {
+        "/events": preview_proxy_path(
+            "/preview/events",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        ),
+        "/api/selection": preview_proxy_path(
+            "/preview/api/selection",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        ),
+        "/api/send": preview_proxy_path(
+            "/preview/api/send",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        ),
+    }
+    rewritten = html
+    for original, replacement in replacements.items():
+        for quote in ("'", '"'):
+            rewritten = rewritten.replace(
+                f"{quote}{original}{quote}",
+                f"{quote}{replacement}{quote}",
+            )
+    root = preview_proxy_path(
+        "/preview",
+        session,
+        client_id,
+        channel,
+        document_id=document_id,
+        watch_generation=watch_generation,
+    )
+    rewritten = rewritten.replace("fetch('/')", f"fetch({json.dumps(root)})")
+    rewritten = rewritten.replace('fetch("/")', f"fetch({json.dumps(root)})")
+    injection = preview_ack_script(
+        session,
+        client_id,
+        channel,
+        package_fingerprint,
+        document_id=document_id,
+        watch_generation=watch_generation,
+        comparison_only=comparison_only,
+    )
+    if "</body>" in rewritten:
+        return rewritten.replace("</body>", f"{injection}</body>", 1)
+    return f"{rewritten}{injection}"
+
+
 def port_available(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
@@ -555,6 +1017,7 @@ class SessionState:
             else None
         )
         self.preview_selection = PreviewSelectionState(session_id)
+        self.preview_sync = PreviewSyncState()
         self.selection_multi_mode = False
         self.selection_broker: OfficeCLISelectionBroker | None = None
         self.created_at = time.time()
@@ -569,11 +1032,14 @@ class SessionState:
         self.events: collections.deque[dict[str, Any]] = collections.deque(maxlen=2000)
         self.sequence = 0
         self.transcript: list[dict[str, Any]] = []
+        self.conversation_generation = 1
         self.active_source: Path | None = None
         self.active_doc: Path | None = None
         self.document_mode = "none"
         self.document_id = ""
         self.document_revision = 0
+        self.document_package_sha256 = ""
+        self.document_watch_event_fingerprint = ""
         self.recovery_backup: BackupRecord | None = None
         self.opening_source: Path | None = None
         self.watch_process: subprocess.Popen[str] | None = None
@@ -598,6 +1064,9 @@ class SessionState:
         self.claude_model_id: str | None = None
         self.pending_pdf = False
         self.last_error: str | None = None
+        self.preview_update_status = "idle"
+        self.preview_update_message = ""
+        self.preview_confirmation: dict[str, Any] | None = None
         self.sse_clients = 0
         self.sse_client_refs: collections.Counter[str] = collections.Counter()
         self.orphan_since: float | None = time.time()
@@ -624,15 +1093,36 @@ class SessionState:
         self.last_timing: dict[str, Any] | None = None
         self.last_provider_usage: dict[str, Any] = {}
         self.run_user_sequence: int | None = None
+        self.run_conversation_generation: int | None = None
+        self.run_client_id: str | None = None
         self.closed = False
 
-    def emit(self, event_type: str, data: dict[str, Any]) -> dict[str, Any]:
+    def emit(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
         with self.condition:
+            if (
+                expected_generation is not None
+                and expected_generation != self.conversation_generation
+            ):
+                return {
+                    "seq": self.sequence,
+                    "type": event_type,
+                    "time": now_iso(),
+                    "generation": self.conversation_generation,
+                    "data": data,
+                    "rejected": True,
+                }
             self.sequence += 1
             event = {
                 "seq": self.sequence,
                 "type": event_type,
                 "time": now_iso(),
+                "generation": self.conversation_generation,
                 "data": data,
             }
             self.events.append(event)
@@ -652,48 +1142,89 @@ class SessionState:
         preview_selections: list[dict[str, Any]] | None = None,
         run_outcome: str | None = None,
         verification: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
     ) -> dict[str, Any]:
-        if self.memory is not None:
-            turn = self.memory.append_turn(
-                role,
-                text,
-                provider=provider,
-                model=model,
-                effort=effort,
-                attachment_ids=attachment_ids,
-                attachment_snapshots=attachment_snapshots,
-                preview_selections=preview_selections,
-                run_outcome=run_outcome,
-                verification=verification,
-            )
-            message = turn.public_metadata()
-        else:
-            message = {
-                "role": role,
-                "text": text,
-                "time": now_iso(),
-                "attachments": list(attachment_snapshots or []),
-                "preview_selections": list(preview_selections or []),
-            }
         with self.lock:
-            if self.closed:
-                return message
+            if (
+                self.closed
+                or (
+                    expected_generation is not None
+                    and expected_generation != self.conversation_generation
+                )
+            ):
+                return {
+                    "role": role,
+                    "text": text,
+                    "time": now_iso(),
+                    "attachments": list(attachment_snapshots or []),
+                    "preview_selections": list(preview_selections or []),
+                    "rejected": True,
+                }
+            generation = self.conversation_generation
+            if self.memory is not None:
+                turn = self.memory.append_turn(
+                    role,
+                    text,
+                    provider=provider,
+                    model=model,
+                    effort=effort,
+                    attachment_ids=attachment_ids,
+                    attachment_snapshots=attachment_snapshots,
+                    preview_selections=preview_selections,
+                    run_outcome=run_outcome,
+                    verification=verification,
+                )
+                message = turn.public_metadata()
+            else:
+                message = {
+                    "role": role,
+                    "text": text,
+                    "time": now_iso(),
+                    "attachments": list(attachment_snapshots or []),
+                    "preview_selections": list(preview_selections or []),
+                }
             self.transcript.append(message)
-        self.emit("message", message)
+        self.emit("message", message, expected_generation=generation)
         return message
 
-    def add_activity(self, stream: str, text: str) -> None:
+    def add_activity(
+        self,
+        stream: str,
+        text: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
         if text:
-            self.emit("activity", {"stream": stream, "text": text[-4000:]})
+            self.emit(
+                "activity",
+                {"stream": stream, "text": text[-4000:]},
+                expected_generation=expected_generation,
+            )
 
-    def set_run_status(self, status: str, **extra: Any) -> None:
+    def set_run_status(
+        self,
+        status: str,
+        *,
+        expected_generation: int | None = None,
+        **extra: Any,
+    ) -> None:
         with self.lock:
-            if self.closed:
+            if (
+                self.closed
+                or (
+                    expected_generation is not None
+                    and expected_generation != self.conversation_generation
+                )
+            ):
                 return
             self.run_status = status
             if status in {"starting", "working", "stopping"}:
                 self.last_run_outcome = "working"
-        self.emit("run", {"status": status, **extra})
+        self.emit(
+            "run",
+            {"status": status, **extra},
+            expected_generation=expected_generation,
+        )
 
     def public_snapshot(self, include_watch_probe: bool = True) -> dict[str, Any]:
         with self.reference_lock:
@@ -721,8 +1252,16 @@ class SessionState:
                 "run_status": self.run_status,
                 "last_run_outcome": self.last_run_outcome,
                 "run_id": self.run_id,
+                "conversation_generation": self.conversation_generation,
                 "transcript": list(self.transcript),
                 "last_error": self.last_error,
+                "preview_update_status": self.preview_update_status,
+                "preview_update_message": self.preview_update_message,
+                "preview_confirmation": (
+                    dict(self.preview_confirmation)
+                    if self.preview_confirmation is not None
+                    else None
+                ),
                 "codex_context": bool(self.codex_thread_id),
                 "agent_contexts": {
                     "codex": bool(self.codex_thread_id),
@@ -876,6 +1415,52 @@ class OgentState:
         if session is None or session.closed:
             raise UserFacingError("This Ogent session no longer exists.", 410)
         return session
+
+    @staticmethod
+    def session_is_pristine(session: SessionState) -> bool:
+        with session.reference_lock:
+            has_references = bool(
+                session.pending_references
+                or session.retained_references
+                or session.active_references
+                or session.reference_operations
+            )
+        with session.lock:
+            return not (
+                session.closed
+                or session.active_doc is not None
+                or session.active_source is not None
+                or session.opening_source is not None
+                or session.transcript
+                or has_references
+                or session.run_status in ACTIVE_RUN_STATUSES
+                or session.run_id is not None
+                or session.pending_pdf
+                or session.codex_thread_id
+                or session.claude_session_id
+                or session.preview_selection.targets
+            )
+
+    def allocate_document_session(
+        self,
+        requested: SessionState,
+    ) -> tuple[SessionState, bool]:
+        """Use a truly empty workspace or allocate a clean document workspace."""
+        if self.session_is_pristine(requested):
+            return requested, False
+        return self.create_session(), True
+
+    def find_document_session(self, source: Path) -> SessionState | None:
+        key = self.path_key(source)
+        with self.registry_lock:
+            existing_id = self.path_index.get(key)
+            existing = self.sessions.get(existing_id) if existing_id else None
+            if existing is not None and existing.closed:
+                raise UserFacingError(
+                    "That document's previous workspace is still closing. Try again.",
+                    409,
+                )
+            return existing
 
     def select_shell_session(self) -> tuple[SessionState, bool]:
         """Return the browser workspace Explorer should open into.
@@ -1060,6 +1645,8 @@ class OgentState:
                 session.document_mode = "none"
                 session.document_id = ""
                 session.document_revision = 0
+                session.document_package_sha256 = ""
+                session.document_watch_event_fingerprint = ""
                 session.recovery_backup = None
                 session.selection_multi_mode = False
                 session.watch_generation = ""
@@ -1108,6 +1695,8 @@ class OgentState:
                     ).encode("utf-8")
                 ).hexdigest()[:24]
                 session.document_revision = max(1, session.document_revision + 1)
+                session.document_package_sha256 = package_sha256(working)
+                session.document_watch_event_fingerprint = ""
                 session.recovery_backup = recovery_backup
                 session.selection_multi_mode = False
                 session.pending_pdf = False
@@ -1146,6 +1735,11 @@ class OgentState:
                             else None
                         ),
                     )
+            if session.document_id and session.watch_generation:
+                session.preview_sync.activate_watch(
+                    session.document_id,
+                    session.watch_generation,
+                )
         session.emit("snapshot", self.snapshot_for(session, include_watch_probe=False))
         self.broadcast_sessions()
 
@@ -1253,7 +1847,11 @@ def _public_retained_references(session: SessionState) -> list[dict[str, Any]]:
         ]
 
 
-def emit_references(session: SessionState) -> None:
+def emit_references(
+    session: SessionState,
+    *,
+    expected_generation: int | None = None,
+) -> None:
     if session.closed:
         return
     session.emit(
@@ -1263,6 +1861,7 @@ def emit_references(session: SessionState) -> None:
             "pending": _public_references(session),
             "retained": _public_retained_references(session),
         },
+        expected_generation=expected_generation,
     )
 
 
@@ -2108,9 +2707,17 @@ def _resolve_preview_nodes(
     return resolved
 
 
-def emit_preview_selection(session: SessionState) -> None:
+def emit_preview_selection(
+    session: SessionState,
+    *,
+    expected_generation: int | None = None,
+) -> None:
     if not session.closed:
-        session.emit("preview_selection", preview_selection_public(session))
+        session.emit(
+            "preview_selection",
+            preview_selection_public(session),
+            expected_generation=expected_generation,
+        )
 
 
 def preview_selection_public(session: SessionState) -> dict[str, Any]:
@@ -2132,6 +2739,45 @@ def post_session_watch_selection(
         broker.post_selection(paths)
         return
     post_watch_selection(port, paths)
+
+
+def advance_document_revision(
+    session: SessionState,
+    document: Path,
+    package_fingerprint: str,
+    *,
+    watch_event_fingerprint: str | None = None,
+) -> tuple[int, bool]:
+    """Advance once per watch event, or once for an unobserved package change."""
+    with session.lock:
+        if (
+            session.closed
+            or session.active_doc is None
+            or session.active_doc.resolve() != document.resolve()
+        ):
+            raise PreviewSyncError(
+                "The preview mutation belongs to a stale document."
+            )
+        if watch_event_fingerprint is not None:
+            advanced = (
+                session.document_watch_event_fingerprint
+                != watch_event_fingerprint
+            )
+            session.document_watch_event_fingerprint = (
+                watch_event_fingerprint
+            )
+        else:
+            advanced = (
+                session.document_package_sha256 != package_fingerprint
+            )
+        session.document_package_sha256 = package_fingerprint
+        if advanced:
+            session.document_revision += 1
+            if session.memory is not None:
+                state = dict(session.memory.active_document)
+                state["revision"] = session.document_revision
+                session.memory.set_active_document(**state)
+        return session.document_revision, advanced
 
 
 def start_selection_broker(
@@ -2200,7 +2846,16 @@ def start_selection_broker(
         except PreviewSelectionError as exc:
             session.add_activity("selection", str(exc))
 
-    def on_document_event(_event: dict[str, Any]) -> None:
+    def on_document_event(event: dict[str, Any]) -> None:
+        watch_fingerprint = event_fingerprint(event)
+        try:
+            fingerprint = package_sha256(document)
+        except OSError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview revision observation failed: {exc}",
+            )
+            return
         with session.lock:
             if (
                 session.active_doc is None
@@ -2208,15 +2863,42 @@ def start_selection_broker(
                 or session.closed
             ):
                 return
-            session.document_revision += 1
-            new_revision = session.document_revision
-            if session.memory is not None:
-                state = dict(session.memory.active_document)
-                state["revision"] = new_revision
-                session.memory.set_active_document(**state)
+            document_id = session.document_id
+            watch_generation = session.watch_generation
+        try:
+            new_revision, advanced = advance_document_revision(
+                session,
+                document,
+                fingerprint,
+                watch_event_fingerprint=watch_fingerprint,
+            )
+            mutation = session.preview_sync.observe_mutation(
+                event,
+                document_id=document_id,
+                watch_generation=watch_generation,
+                package_sha256=fingerprint,
+            )
+            if mutation is not None:
+                session.add_activity(
+                    "preview",
+                    (
+                        f"Watch version {mutation.version} observed for "
+                        f"document revision {new_revision}."
+                    ),
+                )
+        except PreviewSyncError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview revision observation failed: {exc}",
+            )
+            return
         session.preview_selection.advance_revision(new_revision)
         emit_preview_selection(session)
-        session.emit("document_revision", {"revision": new_revision})
+        if advanced:
+            session.emit(
+                "document_revision",
+                {"revision": new_revision},
+            )
 
     broker = OfficeCLISelectionBroker(
         port,
@@ -2351,6 +3033,9 @@ def start_watch(session: SessionState, document: Path) -> None:
                     session.active_doc is not None
                     and session.active_doc.resolve() == document.resolve()
                 )
+                document_id = session.document_id
+            if active_document_matches and document_id:
+                session.preview_sync.activate_watch(document_id, generation)
             session.emit(
                 "watch",
                 {
@@ -2463,10 +3148,10 @@ def make_working_copy(session: SessionState, source: Path) -> Path:
 def normalize_existing_path(raw_path: str) -> Path:
     value = raw_path.strip().strip('"').strip("'")
     if not value:
-        raise UserFacingError("Paste an absolute document path.")
+        raise UserFacingError("Paste a document path.")
     path = Path(value).expanduser()
     if not path.is_absolute():
-        raise UserFacingError("Use an absolute path, such as D:\\Reports\\report.docx.")
+        path = Path.cwd() / path
     try:
         resolved = path.resolve(strict=True)
     except FileNotFoundError:
@@ -2529,7 +3214,7 @@ def open_document(
     state_source: Path | None = None,
     preserve_transcript: bool = False,
     remember_source: bool = True,
-    announce: bool = True,
+    announce: bool = False,
     reset_run: bool = True,
     document_mode: str | None = None,
 ) -> dict[str, Any]:
@@ -2746,6 +3431,7 @@ def _finish_session_run(
     status: str,
     *,
     process: subprocess.Popen[str] | None = None,
+    expected_generation: int | None = None,
     **extra: Any,
 ) -> bool:
     outcome = (
@@ -2759,7 +3445,13 @@ def _finish_session_run(
     )
     backend_status = "idle" if status == "completed" else status
     with session.lock:
-        if session.run_id != run_id:
+        if (
+            session.run_id != run_id
+            or (
+                expected_generation is not None
+                and session.conversation_generation != expected_generation
+            )
+        ):
             return False
         if process is None or session.run_process is process:
             session.run_process = None
@@ -2768,6 +3460,8 @@ def _finish_session_run(
         session.stop_requested = False
         session.run_status = backend_status
         session.last_run_outcome = outcome
+        session.run_conversation_generation = None
+        session.run_client_id = None
         session.run_complete.set()
         if session.sse_clients == 0:
             # A tab may close while an agent is working. Never consume the user's
@@ -2781,6 +3475,7 @@ def _finish_session_run(
             "run_id": run_id,
             **extra,
         },
+        expected_generation=expected_generation,
     )
     STATE.broadcast_sessions()
     return True
@@ -2979,6 +3674,8 @@ def dispatch_open_path(
     raw_path: str,
     *,
     origin: str = "local_path",
+    target_session: SessionState | None = None,
+    target_created: bool = False,
 ) -> dict[str, Any]:
     source = normalize_existing_path(raw_path)
     if origin not in {"local_path", "browser_upload"}:
@@ -2988,18 +3685,45 @@ def dispatch_open_path(
             "Supported document types are .docx, .xlsx, .pptx, and .pdf.",
             415,
         )
-    deduped = STATE.claim_source(session, source)
+    existing = STATE.find_document_session(source)
+    if existing is not None:
+        if existing is session:
+            return {
+                "action": "document_already_open",
+                "session_id": existing.session_id,
+                "message": "That document is already open in this workspace.",
+                "url": f"/?s={existing.session_id}",
+            }
+        return {
+            "action": "focus_session",
+            "session_id": existing.session_id,
+            "message": "That document is already open. Switched to its Ogent workspace.",
+            "url": f"/?s={existing.session_id}",
+        }
+    if target_session is None:
+        target_session, target_created = STATE.allocate_document_session(session)
+    target = target_session
+    deduped = STATE.claim_source(target, source)
     if deduped is not None:
+        if target_created:
+            close_session(target)
+        if deduped is session:
+            return {
+                "action": "document_already_open",
+                "session_id": deduped.session_id,
+                "message": "That document is already open in this workspace.",
+                "url": f"/?s={deduped.session_id}",
+            }
         return {
             "action": "focus_session",
             "session_id": deduped.session_id,
-            "message": "That document is already open. Switched to its Ogent session.",
+            "message": "That document is already open. Switched to its Ogent workspace.",
             "url": f"/?s={deduped.session_id}",
         }
     if source.suffix.lower() == ".pdf":
         try:
             run_id = start_pdf_import(
-                session,
+                target,
                 source,
                 f"Open this PDF in Ogent: {source}",
                 browser_upload=origin == "browser_upload",
@@ -3010,20 +3734,26 @@ def dispatch_open_path(
                 else "Preparing a protected PDF working copy. "
                 "The original PDF will remain untouched."
             )
-            session.add_message("assistant", message)
             return {
-                "action": "pdf_import",
-                "session_id": session.session_id,
+                "action": (
+                    "focus_session"
+                    if target is not session
+                    else "pdf_import"
+                ),
+                "session_id": target.session_id,
                 "message": message,
                 "source": str(source),
                 "run_id": run_id,
+                "url": f"/?s={target.session_id}",
             }
         except Exception:
-            STATE.release_claim(session, source)
+            STATE.release_claim(target, source)
+            if target_created:
+                close_session(target)
             raise
     try:
         result = open_document(
-            session,
+            target,
             str(source),
             document_mode=(
                 "browser_import"
@@ -3031,11 +3761,19 @@ def dispatch_open_path(
                 else "local_direct"
             ),
             remember_source=origin == "local_path",
+            announce=False,
         )
-        result["action"] = "document_opened"
+        result["action"] = (
+            "focus_session"
+            if target is not session
+            else "document_opened"
+        )
+        result["url"] = f"/?s={target.session_id}"
         return result
     except Exception:
-        STATE.release_claim(session, source)
+        STATE.release_claim(target, source)
+        if target_created:
+            close_session(target)
         raise
 
 
@@ -3215,6 +3953,7 @@ def _run_codex_once(
     references: list[ReferenceAttachment] | None = None,
     timing: RunTiming | None = None,
     focused: bool = False,
+    conversation_generation: int | None = None,
 ) -> tuple[int, str | None, str | None, list[str]]:
     for image_path in image_paths or []:
         if (
@@ -3270,12 +4009,20 @@ def _run_codex_once(
 
     def on_process(process: subprocess.Popen[str]) -> None:
         with session.lock:
+            if (
+                conversation_generation is not None
+                and session.conversation_generation
+                != conversation_generation
+            ):
+                terminate_process_tree(process)
+                return
             session.run_process = process
 
     def on_activity(stream: str, text: str) -> None:
         session.add_activity(
             stream,
             _redact_reference_detail(text, attachments=references),
+            expected_generation=conversation_generation,
         )
 
     def should_stop() -> bool:
@@ -3284,6 +4031,11 @@ def _run_codex_once(
                 session.stop_requested
                 or session.run_id != run_id
                 or session.closed
+                or (
+                    conversation_generation is not None
+                    and session.conversation_generation
+                    != conversation_generation
+                )
             )
 
     if should_stop():
@@ -3337,6 +4089,7 @@ def _run_claude_once(
     references: list[ReferenceAttachment] | None = None,
     timing: RunTiming | None = None,
     focused: bool = False,
+    conversation_generation: int | None = None,
 ) -> tuple[int, str | None, str | None, list[str]]:
     provider = _provider_or_error("claude")
     del ephemeral, existing_session_id
@@ -3372,12 +4125,20 @@ def _run_claude_once(
 
     def on_process(process: subprocess.Popen[str]) -> None:
         with session.lock:
+            if (
+                conversation_generation is not None
+                and session.conversation_generation
+                != conversation_generation
+            ):
+                terminate_process_tree(process)
+                return
             session.run_process = process
 
     def on_activity(stream: str, text: str) -> None:
         session.add_activity(
             stream,
             _redact_reference_detail(text, attachments=references),
+            expected_generation=conversation_generation,
         )
 
     def should_stop() -> bool:
@@ -3386,6 +4147,11 @@ def _run_claude_once(
                 session.stop_requested
                 or session.run_id != run_id
                 or session.closed
+                or (
+                    conversation_generation is not None
+                    and session.conversation_generation
+                    != conversation_generation
+                )
             )
 
     if should_stop():
@@ -3425,6 +4191,269 @@ def _run_claude_once(
     )
 
 
+PREVIEW_DEGRADED_MESSAGE = (
+    "Preview could not update. Your document was saved; retry preview or "
+    "open Word view."
+)
+
+
+def set_preview_update_status(
+    session: SessionState,
+    status: str,
+    message: str,
+    *,
+    confirmation: PreviewConfirmation | None = None,
+    expected_generation: int,
+) -> bool:
+    with session.lock:
+        if (
+            session.closed
+            or session.conversation_generation != expected_generation
+        ):
+            return False
+        session.preview_update_status = status
+        session.preview_update_message = message
+        session.preview_confirmation = (
+            confirmation.public_metadata()
+            if confirmation is not None
+            else None
+        )
+    session.emit(
+        "preview_status",
+        {
+            "status": status,
+            "message": message,
+            "confirmation": (
+                confirmation.public_metadata()
+                if confirmation is not None
+                else None
+            ),
+        },
+        expected_generation=expected_generation,
+    )
+    return True
+
+
+def confirm_word_preview(
+    session: SessionState,
+    document: Path,
+    baseline: PreviewRunBaseline,
+    package_fingerprint: str,
+    *,
+    expected_generation: int,
+) -> PreviewConfirmation:
+    set_preview_update_status(
+        session,
+        "waiting",
+        "Confirming preview…",
+        expected_generation=expected_generation,
+    )
+    direct = session.preview_sync.wait_for_mutation_confirmation(
+        baseline,
+        package_fingerprint,
+        timeout=3.0,
+    )
+    if direct.confirmed:
+        set_preview_update_status(
+            session,
+            "updated",
+            "Preview updated",
+            confirmation=direct,
+            expected_generation=expected_generation,
+        )
+        return direct
+
+    mutation = direct.mutation or session.preview_sync.matching_mutation(
+        baseline,
+        package_fingerprint,
+    )
+    if baseline.client_id is None:
+        degraded = PreviewConfirmation(
+            confirmed=False,
+            status="degraded",
+            message=PREVIEW_DEGRADED_MESSAGE,
+            mutation=mutation,
+            recovery="no_initiating_client",
+        )
+        set_preview_update_status(
+            session,
+            "degraded",
+            PREVIEW_DEGRADED_MESSAGE,
+            confirmation=degraded,
+            expected_generation=expected_generation,
+        )
+        return degraded
+
+    if baseline.client_id is not None:
+        set_preview_update_status(
+            session,
+            "recovering",
+            "Recovering preview…",
+            expected_generation=expected_generation,
+        )
+        try:
+            control = session.preview_sync.enqueue_control(
+                client_id=baseline.client_id,
+                document_id=baseline.document_id,
+                watch_generation=baseline.watch_generation,
+                action="full",
+                package_sha256=package_fingerprint,
+                version=mutation.version if mutation is not None else 0,
+                event_fingerprint_value=(
+                    mutation.event_fingerprint
+                    if mutation is not None
+                    else None
+                ),
+            )
+            recovery = session.preview_sync.wait_for_control_ack(
+                baseline,
+                package_fingerprint,
+                control_id=str(control["_ogent"]["control_id"]),
+                kind="refresh",
+                timeout=6.0,
+            )
+            if recovery.confirmed:
+                recovered = dataclasses.replace(
+                    recovery,
+                    mutation=mutation,
+                    recovery="full_refresh",
+                )
+                set_preview_update_status(
+                    session,
+                    "updated",
+                    "Preview updated",
+                    confirmation=recovered,
+                    expected_generation=expected_generation,
+                )
+                return recovered
+        except PreviewSyncError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview refresh request was unavailable: {exc}",
+                expected_generation=expected_generation,
+            )
+
+    viewport_path: str | None = None
+    if baseline.client_id is not None:
+        try:
+            capture = session.preview_sync.enqueue_control(
+                client_id=baseline.client_id,
+                document_id=baseline.document_id,
+                watch_generation=baseline.watch_generation,
+                action="ogent-capture",
+                package_sha256=package_fingerprint,
+            )
+            captured = session.preview_sync.wait_for_control_ack(
+                baseline,
+                package_fingerprint,
+                control_id=str(capture["_ogent"]["control_id"]),
+                kind="viewport",
+                timeout=2.0,
+            )
+            if captured.ack is not None:
+                viewport_path = captured.ack.viewport_path
+        except PreviewSyncError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview position capture was unavailable: {exc}",
+                expected_generation=expected_generation,
+            )
+
+    set_preview_update_status(
+        session,
+        "recovering",
+        "Restarting preview…",
+        expected_generation=expected_generation,
+    )
+    try:
+        with session.lock:
+            if (
+                session.closed
+                or session.conversation_generation != expected_generation
+                or session.active_doc is None
+                or session.active_doc.resolve() != document.resolve()
+                or session.document_id != baseline.document_id
+                or session.watch_generation != baseline.watch_generation
+            ):
+                raise PreviewSyncError(
+                    "The document or conversation changed during preview recovery."
+                )
+        start_watch(session, document)
+        with session.lock:
+            document_id = session.document_id
+            watch_generation = session.watch_generation
+        initial = (
+            session.preview_sync.wait_for_initial_ack(
+                client_id=baseline.client_id,
+                document_id=document_id,
+                watch_generation=watch_generation,
+                package_sha256=package_fingerprint,
+                timeout=8.0,
+            )
+            if baseline.client_id is not None
+            else None
+        )
+        if initial is not None:
+            if viewport_path:
+                restored = run_quiet(
+                    [
+                        "officecli",
+                        "watch",
+                        "goto",
+                        str(document),
+                        viewport_path,
+                        "--json",
+                    ],
+                    cwd=document.parent,
+                    timeout=15,
+                )
+                if restored.returncode != 0:
+                    session.add_activity(
+                        "preview",
+                        "The preview restarted, but its prior semantic position "
+                        "could not be restored.",
+                        expected_generation=expected_generation,
+                    )
+            recovered = PreviewConfirmation(
+                confirmed=True,
+                status="recovered",
+                message="Preview updated",
+                mutation=mutation,
+                ack=initial,
+                recovery="watch_restart",
+            )
+            set_preview_update_status(
+                session,
+                "updated",
+                "Preview updated",
+                confirmation=recovered,
+                expected_generation=expected_generation,
+            )
+            return recovered
+    except (OSError, PreviewSyncError, UserFacingError) as exc:
+        session.add_activity(
+            "preview",
+            f"Preview restart failed: {exc}",
+            expected_generation=expected_generation,
+        )
+
+    degraded = PreviewConfirmation(
+        confirmed=False,
+        status="degraded",
+        message=PREVIEW_DEGRADED_MESSAGE,
+        mutation=mutation,
+        recovery="failed",
+    )
+    set_preview_update_status(
+        session,
+        "degraded",
+        PREVIEW_DEGRADED_MESSAGE,
+        confirmation=degraded,
+        expected_generation=expected_generation,
+    )
+    return degraded
+
+
 def _agent_worker(
     session: SessionState,
     message: str,
@@ -3438,7 +4467,17 @@ def _agent_worker(
     selection_snapshot: PreviewSelectionSnapshot | None,
     user_sequence: int | None,
     timing: RunTiming,
+    conversation_generation: int | None = None,
+    client_id: str | None = None,
 ) -> None:
+    with session.lock:
+        if conversation_generation is None:
+            conversation_generation = (
+                session.run_conversation_generation
+                or session.conversation_generation
+            )
+        if client_id is None:
+            client_id = session.run_client_id
     started = time.perf_counter()
     terminal_status = "error"
     terminal_extra: dict[str, Any] = {"kind": provider}
@@ -3448,14 +4487,35 @@ def _agent_worker(
     materialized_references: list[ReferenceAttachment] = []
     prepared_references: list[ReferenceAttachment] = []
     verification: dict[str, Any] = {}
+    preview_baseline: PreviewRunBaseline | None = None
+    initial_package_fingerprint: str | None = None
     try:
         with session.lock:
-            if session.stop_requested or session.run_id != run_id or session.closed:
+            if (
+                session.stop_requested
+                or session.run_id != run_id
+                or session.closed
+                or session.conversation_generation
+                != conversation_generation
+            ):
                 raise UserFacingError("Stopped. No further agent work is running.", 409)
         if document is not None:
             ensure_watch(session)
+            if (
+                document.suffix.casefold() == ".docx"
+                and document.is_file()
+            ):
+                initial_package_fingerprint = package_sha256(document)
+                preview_baseline = session.preview_sync.begin_run(
+                    package_sha256=initial_package_fingerprint,
+                    client_id=client_id,
+                )
         with session.lock:
-            if session.run_id != run_id:
+            if (
+                session.run_id != run_id
+                or session.conversation_generation
+                != conversation_generation
+            ):
                 return
             session.run_status = "working"
             document_mode = session.document_mode
@@ -3471,6 +4531,7 @@ def _agent_worker(
                     else f"Running {provider_name}"
                 ),
             },
+            expected_generation=conversation_generation,
         )
         STATE.broadcast_sessions()
         effort_label = (
@@ -3482,6 +4543,7 @@ def _agent_worker(
             provider,
             f"Using {provider_name} model {model} with {effort_label}; "
             "fresh bounded Ogent memory context.",
+            expected_generation=conversation_generation,
         )
 
         agent_derived: Path | None = None
@@ -3546,6 +4608,7 @@ def _agent_worker(
                 "references",
                 f"Derivative cache: {len(cached_references)} reused, "
                 f"{len(freshly_prepared)} prepared.",
+                expected_generation=conversation_generation,
             )
             with session.reference_lock:
                 for canonical in references:
@@ -3580,9 +4643,18 @@ def _agent_worker(
                 item.byte_size for item in materialized_references
             )
             timing.mark("reference_preparation_end")
-            emit_references(session)
+            emit_references(
+                session,
+                expected_generation=conversation_generation,
+            )
         with session.lock:
-            if session.stop_requested or session.run_id != run_id or session.closed:
+            if (
+                session.stop_requested
+                or session.run_id != run_id
+                or session.closed
+                or session.conversation_generation
+                != conversation_generation
+            ):
                 raise UserFacingError("Stopped. No further agent work is running.", 409)
         image_paths = [
             image_path
@@ -3614,13 +4686,19 @@ def _agent_worker(
                 if prepared_references
                 else f"{provider_name} is editing",
             },
+            expected_generation=conversation_generation,
         )
         selection_payload = (
             selection_snapshot.to_dict()["targets"]
             if selection_snapshot is not None
             else []
         )
-        if session.memory is not None:
+        with session.lock:
+            memory_current = (
+                session.conversation_generation
+                == conversation_generation
+            )
+        if session.memory is not None and memory_current:
             context = session.memory.build_provider_context(
                 message,
                 provider=provider,
@@ -3664,6 +4742,7 @@ def _agent_worker(
                 references=prepared_references,
                 timing=timing,
                 focused=selection_snapshot is not None,
+                conversation_generation=conversation_generation,
             )
         else:
             additional_directories = (
@@ -3685,6 +4764,7 @@ def _agent_worker(
                 references=prepared_references,
                 timing=timing,
                 focused=selection_snapshot is not None,
+                conversation_generation=conversation_generation,
             )
         del new_provider_session_id
         elapsed_ms = round((time.perf_counter() - started) * 1000)
@@ -3693,6 +4773,8 @@ def _agent_worker(
                 session.stop_requested
                 or session.run_id != run_id
                 or session.closed
+                or session.conversation_generation
+                != conversation_generation
             )
         if stopped:
             session.add_message(
@@ -3702,6 +4784,7 @@ def _agent_worker(
                 model=model,
                 effort=effort,
                 run_outcome="stopped",
+                expected_generation=conversation_generation,
             )
             terminal_status = "stopped"
             terminal_extra["elapsed_ms"] = elapsed_ms
@@ -3723,6 +4806,7 @@ def _agent_worker(
                 model=model,
                 effort=effort,
                 run_outcome="error",
+                expected_generation=conversation_generation,
             )
             terminal_status = "error"
             terminal_extra.update(
@@ -3753,6 +4837,98 @@ def _agent_worker(
                     "OfficeCLI validation failed after the provider edit.",
                     500,
                 )
+            if (
+                document.suffix.casefold() == ".docx"
+                and initial_package_fingerprint is not None
+            ):
+                final_package_fingerprint = package_sha256(document)
+                document_mutated = (
+                    final_package_fingerprint
+                    != initial_package_fingerprint
+                )
+                verification["document_mutated"] = document_mutated
+                if document_mutated:
+                    associated_mutation = (
+                        session.preview_sync.associate_latest_mutation(
+                            preview_baseline,
+                            final_package_fingerprint,
+                        )
+                        if preview_baseline is not None
+                        else None
+                    )
+                    revision, advanced = advance_document_revision(
+                        session,
+                        document,
+                        final_package_fingerprint,
+                        watch_event_fingerprint=(
+                            associated_mutation.event_fingerprint
+                            if associated_mutation is not None
+                            else None
+                        ),
+                    )
+                    verification["document_revision"] = revision
+                    if advanced:
+                        session.preview_selection.advance_revision(
+                            revision
+                        )
+                        emit_preview_selection(
+                            session,
+                            expected_generation=conversation_generation,
+                        )
+                        session.emit(
+                            "document_revision",
+                            {"revision": revision},
+                            expected_generation=conversation_generation,
+                        )
+                if document_mutated and preview_baseline is not None:
+                    preview_confirmation = confirm_word_preview(
+                        session,
+                        document,
+                        preview_baseline,
+                        final_package_fingerprint,
+                        expected_generation=conversation_generation,
+                    )
+                    verification["preview"] = (
+                        preview_confirmation.public_metadata()
+                    )
+                    if not preview_confirmation.confirmed:
+                        final_text = (
+                            f"{final_text.rstrip()}\n\n"
+                            f"{PREVIEW_DEGRADED_MESSAGE}"
+                        )
+                elif document_mutated:
+                    preview_confirmation = PreviewConfirmation(
+                        confirmed=False,
+                        status="degraded",
+                        message=PREVIEW_DEGRADED_MESSAGE,
+                        recovery="baseline_unavailable",
+                    )
+                    set_preview_update_status(
+                        session,
+                        "degraded",
+                        PREVIEW_DEGRADED_MESSAGE,
+                        confirmation=preview_confirmation,
+                        expected_generation=conversation_generation,
+                    )
+                    verification["preview"] = (
+                        preview_confirmation.public_metadata()
+                    )
+                    final_text = (
+                        f"{final_text.rstrip()}\n\n"
+                        f"{PREVIEW_DEGRADED_MESSAGE}"
+                    )
+                elif not document_mutated:
+                    set_preview_update_status(
+                        session,
+                        "unchanged",
+                        "No preview refresh needed.",
+                        expected_generation=conversation_generation,
+                    )
+                    verification["preview"] = {
+                        "confirmed": True,
+                        "status": "unchanged",
+                        "message": "No preview refresh needed.",
+                    }
         session.add_message(
             "assistant",
             final_text,
@@ -3761,8 +4937,14 @@ def _agent_worker(
             effort=effort,
             run_outcome="completed",
             verification=verification,
+            expected_generation=conversation_generation,
         )
-        if session.memory is not None:
+        with session.lock:
+            memory_current = (
+                session.conversation_generation
+                == conversation_generation
+            )
+        if session.memory is not None and memory_current:
             if user_sequence is not None:
                 session.memory.update_turn_outcome(
                     user_sequence,
@@ -3804,12 +4986,18 @@ def _agent_worker(
                     "complex_layout": session.complex_layout,
                     "complex_layout_detail": session.complex_layout_detail,
                 },
+                expected_generation=conversation_generation,
             )
         terminal_status = "completed"
         terminal_extra.update({"exit_code": 0, "elapsed_ms": elapsed_ms})
     except Exception as exc:
         with session.lock:
-            stopped = session.stop_requested or session.run_id != run_id
+            stopped = (
+                session.stop_requested
+                or session.run_id != run_id
+                or session.conversation_generation
+                != conversation_generation
+            )
         if stopped:
             session.add_message(
                 "assistant",
@@ -3818,6 +5006,7 @@ def _agent_worker(
                 model=model,
                 effort=effort,
                 run_outcome="stopped",
+                expected_generation=conversation_generation,
             )
             terminal_status = "stopped"
         else:
@@ -3839,9 +5028,15 @@ def _agent_worker(
                 model=model,
                 effort=effort,
                 run_outcome="error",
+                expected_generation=conversation_generation,
             )
             terminal_status = "error"
-        if session.memory is not None:
+        with session.lock:
+            memory_current = (
+                session.conversation_generation
+                == conversation_generation
+            )
+        if session.memory is not None and memory_current:
             outcome = "stopped" if stopped else "error"
             if user_sequence is not None:
                 with contextlib.suppress(SessionMemoryError):
@@ -3867,12 +5062,16 @@ def _agent_worker(
                     for attachment in materialized_references:
                         attachment.status = "Failed"
                         attachment.error_message = detail
-                emit_references(session)
+                emit_references(
+                    session,
+                    expected_generation=conversation_generation,
+                )
                 with session.lock:
                     session.last_error = detail
                 session.add_activity(
                     "references",
                     f"Materialized attachment cleanup failed: {detail}",
+                    expected_generation=conversation_generation,
                 )
                 terminal_status = "error"
             if references_cleaned:
@@ -3880,6 +5079,7 @@ def _agent_worker(
                     "references",
                     "Materialized run copies deleted; canonical attachments "
                     "remain available in this workspace.",
+                    expected_generation=conversation_generation,
                 )
         outcome_for_timing = (
             "completed"
@@ -3890,7 +5090,11 @@ def _agent_worker(
             outcome=outcome_for_timing,
             usage=session.last_provider_usage,
         )
-        session.add_activity("timing", timing.concise_line())
+        session.add_activity(
+            "timing",
+            timing.concise_line(),
+            expected_generation=conversation_generation,
+        )
         with session.lock:
             session.last_timing = timing_result
             session.active_timing = None
@@ -3898,6 +5102,7 @@ def _agent_worker(
             session,
             run_id,
             terminal_status,
+            expected_generation=conversation_generation,
             **terminal_extra,
         )
 
@@ -3910,6 +5115,7 @@ def start_agent_run(
     provider: str = DEFAULT_PROVIDER,
     *,
     selection: AgentSelection | None = None,
+    client_id: str | None = None,
 ) -> str:
     if selection is None:
         selected_model, selected_effort = validate_agent_settings(model, effort)
@@ -3980,7 +5186,13 @@ def start_agent_run(
             session.stop_requested = False
             session.run_complete.clear()
             session.last_provider_usage = {}
+            session.preview_update_status = "idle"
+            session.preview_update_message = ""
+            session.preview_confirmation = None
             run_id = session.run_id
+            conversation_generation = session.conversation_generation
+            session.run_conversation_generation = conversation_generation
+            session.run_client_id = client_id
         try:
             claimed_new, _ = claim_pending_references(session, run_id)
             if {
@@ -4041,6 +5253,7 @@ def start_agent_run(
         attachment_snapshots=attachment_snapshots,
         preview_selections=selection_payload,
         run_outcome="working",
+        expected_generation=conversation_generation,
     )
     user_sequence = (
         int(user_message["sequence"])
@@ -4067,8 +5280,23 @@ def start_agent_run(
     with session.lock:
         session.active_timing = timing
         session.run_user_sequence = user_sequence
-    emit_references(session)
-    emit_preview_selection(session)
+    emit_references(
+        session,
+        expected_generation=conversation_generation,
+    )
+    emit_preview_selection(
+        session,
+        expected_generation=conversation_generation,
+    )
+    session.emit(
+        "preview_status",
+        {
+            "status": "idle",
+            "message": "",
+            "confirmation": None,
+        },
+        expected_generation=conversation_generation,
+    )
     session.emit(
         "run",
         {
@@ -4086,6 +5314,7 @@ def start_agent_run(
             ),
             "analysis_only": document is None,
         },
+        expected_generation=conversation_generation,
     )
     STATE.broadcast_sessions()
     thread = threading.Thread(
@@ -4121,6 +5350,8 @@ def start_agent_run(
                 session.run_status = "error"
                 session.run_id = None
                 session.run_thread = None
+                session.run_conversation_generation = None
+                session.run_client_id = None
                 session.last_run_outcome = "error"
                 session.run_complete.set()
         raise
@@ -4133,6 +5364,7 @@ def handle_chat_message(
     provider: Any = DEFAULT_PROVIDER,
     model: Any = None,
     effort: Any = AUTOMATIC_EFFORT,
+    client_id: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     text = message.strip()
     with session.reference_lock:
@@ -4162,6 +5394,7 @@ def handle_chat_message(
             selection.effort,
             selection.provider_id,
             selection=selection,
+            client_id=client_id,
         )
         return 202, {
             "message": "Run started.",
@@ -4280,12 +5513,17 @@ def accept_postmessage_selection(
         multi_mode = session.selection_multi_mode
     if port is None or document is None:
         raise UserFacingError("The OfficeCLI preview is not available.", 409)
-    expected_origin = f"http://{HOST}:{port}"
+    allowed_origins = {
+        f"http://localhost:{STATE.server_port}",
+        f"http://{HOST}:{port}",
+    }
+    if event_origin not in allowed_origins:
+        raise UserFacingError("Preview selection origin mismatch.", 409)
     try:
         paths = session.preview_selection.validate_bridge_envelope(
             payload,
             event_origin=event_origin,
-            expected_origin=expected_origin,
+            expected_origin=event_origin,
             source_matches=source_matches,
         )
         if multi_mode and len(paths) == 1:
@@ -4432,43 +5670,154 @@ def _focus_submitted_selection_locked(
     }
 
 
-def clear_session_memory(session: SessionState) -> dict[str, Any]:
+def reset_document_conversation(
+    session: SessionState,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    if reason not in {"new_chat", "settings_clear"}:
+        raise UserFacingError("Invalid conversation reset reason.", 400)
+    cleanup_pending = False
+    quarantine: Path | None = None
     with session.reference_lock:
         with session.lock:
-            if session.run_status in ACTIVE_RUN_STATUSES:
+            if (
+                session.run_status in ACTIVE_RUN_STATUSES
+                or (
+                    session.run_thread is not None
+                    and session.run_thread.is_alive()
+                )
+            ):
                 raise UserFacingError(
-                    "Stop the active run before clearing session memory.",
+                    "Stop the active run before starting a new chat.",
+                    409,
+                )
+            if session.opening_source is not None:
+                raise UserFacingError(
+                    "Wait for the document to finish opening before starting a new chat.",
+                    409,
+                )
+            if session.snapshot_in_progress:
+                raise UserFacingError(
+                    "Wait for Word view generation to finish before starting a new chat.",
                     409,
                 )
             if session.reference_operations:
                 raise UserFacingError(
-                    "Wait for attachment uploads to finish before clearing memory.",
+                    "Wait for attachment uploads to finish before starting a new chat.",
                     409,
                 )
-        attachments = list(session.retained_references.values())
-        if session.attachment_store is None or session.memory is None:
-            raise UserFacingError("Session memory is unavailable.", 500)
-        for attachment in attachments:
-            try:
-                session.attachment_store.forget(attachment)
-            except (RetainedAttachmentError, OSError) as exc:
+            if session.active_references or session.reference_run_roots:
                 raise UserFacingError(
-                    "Session memory could not be cleared because an attachment "
-                    "file is still in use.",
+                    "Wait for temporary attachment processing to finish before "
+                    "starting a new chat.",
+                    409,
+                )
+            document = session.active_doc
+            port = session.watch_port
+            has_historical_marks = bool(session.historical_focus.marks)
+            if session.attachment_store is None or session.memory is None:
+                raise UserFacingError("Session memory is unavailable.", 500)
+            try:
+                if port is not None:
+                    post_session_watch_selection(session, port, [])
+                if document is not None and has_historical_marks:
+                    clear_historical_focus(
+                        run_quiet,
+                        document,
+                        session.historical_focus,
+                    )
+                quarantine = (
+                    session.attachment_store.stage_conversation_clear()
+                )
+                try:
+                    session.memory.clear_conversation(
+                        preserve_document=True
+                    )
+                except Exception:
+                    session.attachment_store.rollback_conversation_clear(
+                        quarantine
+                    )
+                    quarantine = None
+                    raise
+            except (
+                HistoricalFocusError,
+                PreviewSelectionError,
+                RetainedAttachmentError,
+                SessionMemoryError,
+                OSError,
+            ) as exc:
+                raise UserFacingError(
+                    "The new chat could not start because the current "
+                    "conversation state could not be cleared safely.",
                     409,
                 ) from exc
-        session.retained_references.clear()
-        session.pending_references.clear()
-        session.memory.clear_conversation(preserve_document=True)
-    with session.lock:
-        session.transcript.clear()
-        session.codex_thread_id = None
-        session.codex_model_id = None
-        session.claude_session_id = None
-        session.claude_model_id = None
-    emit_references(session)
-    session.emit("memory_cleared", session.memory.summary())
-    return session.memory.summary()
+            session.pending_references.clear()
+            session.retained_references.clear()
+            session.active_references.clear()
+            session.run_retained_ids.clear()
+            session.reference_run_roots.clear()
+            session.transcript.clear()
+            session.codex_thread_id = None
+            session.codex_model_id = None
+            session.claude_session_id = None
+            session.claude_model_id = None
+            session.pending_pdf = False
+            session.last_error = None
+            session.last_run_outcome = "neutral"
+            session.run_status = "idle"
+            session.run_id = None
+            session.stop_requested = False
+            session.active_timing = None
+            session.last_timing = None
+            session.last_provider_usage.clear()
+            session.run_user_sequence = None
+            session.run_conversation_generation = None
+            session.run_client_id = None
+            session.selection_multi_mode = False
+            session.preview_selection.clear()
+            session.historical_focus.marks = ()
+            session.historical_focus.selection_id = None
+            session.preview_update_status = "idle"
+            session.preview_update_message = ""
+            session.preview_confirmation = None
+            session.conversation_generation += 1
+            generation = session.conversation_generation
+            summary = session.memory.summary()
+        if quarantine is not None:
+            try:
+                session.attachment_store.commit_conversation_clear(
+                    quarantine
+                )
+            except (RetainedAttachmentError, OSError):
+                cleanup_pending = True
+    event = {
+        "generation": generation,
+        "reason": reason,
+        "transcript": [],
+        "references": [],
+        "retained_attachments": [],
+        "preview_selection": preview_selection_public(session),
+        "session_memory": summary,
+        "cleanup_pending": cleanup_pending,
+    }
+    session.emit("conversation_reset", event)
+    STATE.broadcast_sessions()
+    if cleanup_pending:
+        session.add_activity(
+            "memory",
+            "New chat started; detached attachment files will be removed "
+            "when this workspace closes.",
+        )
+    return event
+
+
+def clear_session_memory(session: SessionState) -> dict[str, Any]:
+    """Compatibility entry point shared by Settings and the New Chat control."""
+    return reset_document_conversation(
+        session,
+        reason="settings_clear",
+    )["session_memory"]
 
 
 def generate_word_snapshot(session: SessionState) -> Path:
@@ -4889,7 +6238,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       min-height: 50px;
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 6px;
       padding: 7px 14px;
       background: var(--navy);
       color: #fff;
@@ -4941,7 +6290,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       margin-left: auto;
     }
     .session-select {
-      width: min(220px, 18vw);
+      width: min(180px, 18vw);
       border: 1px solid rgba(255,255,255,.22);
       border-radius: 8px;
       padding: 5px 7px;
@@ -5063,11 +6412,21 @@ HTML_TEMPLATE = r"""<!doctype html>
     .chat-header h2 { margin: 0; font-size: 17px; letter-spacing: -.01em; }
     .chat-header p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
     .lite-badge {
-      margin-left: auto; color: var(--teal); border: 1px solid color-mix(in srgb, var(--teal) 40%, transparent);
+      color: var(--teal); border: 1px solid color-mix(in srgb, var(--teal) 40%, transparent);
       background: color-mix(in srgb, var(--teal) 10%, transparent);
       border-radius: 999px; padding: 4px 8px; font-size: 10px; font-weight: 750;
       letter-spacing: .08em;
     }
+    .new-chat-button {
+      margin-left: auto; white-space: nowrap; padding: 7px 9px;
+      border: 1px solid var(--line); border-radius: 9px;
+      background: var(--panel); color: var(--ink); font-size: 11px;
+      font-weight: 750;
+    }
+    .new-chat-button:hover, .new-chat-button:focus-visible {
+      color: var(--teal); border-color: var(--teal); outline: none;
+    }
+    .new-chat-button:disabled { opacity: .45; cursor: default; }
     .settings-button {
       width: 34px; height: 34px; display: grid; place-items: center; padding: 7px;
       border: 1px solid var(--line); border-radius: 9px; background: var(--panel);
@@ -5118,6 +6477,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     .secondary:hover { border-color: var(--teal); color: var(--teal); }
     .transcript { padding: 16px 14px 20px; overflow-y: auto; min-height: 0; }
+    .chat-empty-state {
+      min-height: 100%; display: grid; place-items: center;
+      padding: 28px 20px; color: var(--muted); text-align: center;
+      font-size: 12px; line-height: 1.55;
+    }
     .message { display: flex; margin: 0 0 13px; }
     .message.user { justify-content: flex-end; }
     .bubble {
@@ -5382,12 +6746,41 @@ HTML_TEMPLATE = r"""<!doctype html>
     .retained-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .retained-item small { color: var(--muted); }
     .retained-item button { grid-column: 2; grid-row: 1 / 3; }
+    .confirm-overlay {
+      position: fixed; inset: 0; z-index: 120; display: none;
+      align-items: center; justify-content: center; padding: 18px;
+      background: rgba(3,12,22,.62);
+    }
+    .confirm-overlay.open { display: flex; }
+    .confirm-dialog {
+      width: min(430px, 100%); padding: 20px; border-radius: 15px;
+      background: var(--panel); color: var(--ink);
+      border: 1px solid var(--line); box-shadow: 0 24px 80px rgba(0,0,0,.34);
+    }
+    .confirm-dialog h2 { margin: 0 0 9px; font-size: 19px; }
+    .confirm-dialog p {
+      margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.55;
+    }
+    .confirm-dialog ul {
+      margin: 0 0 17px; padding-left: 19px; color: var(--muted);
+      font-size: 11px; line-height: 1.55;
+    }
+    .confirm-actions {
+      display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+    }
+    .danger-action {
+      border: 0; border-radius: 9px; padding: 9px 12px;
+      background: var(--danger); color: #fff; font-weight: 750;
+    }
+    .danger-action:hover { filter: brightness(.92); }
+    .danger-action:disabled { opacity: .5; cursor: default; }
     @media (max-width: 820px) {
       :root { --left: 58%; }
       .chat-pane { min-width: 300px; }
       .status-text { display: none; }
       .session-select { width: 120px; }
       .new-window { display: none; }
+      .lite-badge { display: none; }
       .selection-tray { margin-left: 0; }
       .reference-chip { width: 100%; }
       .agent-settings {
@@ -5426,6 +6819,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       .empty-document .symbol { width: 58px; height: 58px; margin-bottom: 14px; }
       .empty-document h1 { font-size: 22px; }
       .settings-panel { width: 100%; padding: 16px; }
+      .confirm-dialog { padding: 18px; }
+      .confirm-actions { align-items: stretch; flex-direction: column-reverse; }
+      .confirm-actions button { width: 100%; }
     }
   </style>
 </head>
@@ -5491,6 +6887,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           <h2>Ogent</h2>
           <p>Plain-language Office editing</p>
         </div>
+        <button class="new-chat-button" id="newChatButton" type="button">+ New chat</button>
         <span class="lite-badge">LITE __VERSION__</span>
         <button class="settings-button" id="settingsButton" type="button" aria-label="Settings and recovery" title="Settings and recovery">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true" focusable="false">
@@ -5615,8 +7012,27 @@ HTML_TEMPLATE = r"""<!doctype html>
         </dl>
         <p>Memory belongs only to this Ogent workspace and is removed when the workspace closes or the backend stops. Provider-side data policies still apply after Ogent deletes local memory.</p>
         <div class="retained-list" id="retainedAttachmentList" aria-label="Retained attachments"></div>
-        <button class="secondary" id="clearMemoryButton" type="button">Clear session memory</button>
+        <button class="secondary" id="clearMemoryButton" type="button">Start a new chat</button>
       </section>
+    </section>
+  </div>
+  <div class="confirm-overlay" id="newChatOverlay" aria-hidden="true">
+    <section class="confirm-dialog" id="newChatDialog" role="dialog"
+      aria-modal="true" aria-labelledby="newChatTitle"
+      aria-describedby="newChatDescription" tabindex="-1">
+      <h2 id="newChatTitle">Start a new chat?</h2>
+      <p id="newChatDescription">
+        This permanently clears the chat and AI memory for only this document.
+      </p>
+      <ul>
+        <li>Chat messages, retained attachments, and submitted selection history are cleared.</li>
+        <li>The document, its edits, recovery backup, and live-preview position are preserved.</li>
+        <li>Other open documents and their chats are not changed.</li>
+      </ul>
+      <div class="confirm-actions">
+        <button class="secondary" id="newChatCancelButton" type="button">Cancel</button>
+        <button class="danger-action" id="newChatConfirmButton" type="button">Start new chat</button>
+      </div>
     </section>
   </div>
   <div class="toast" id="toast" role="status"></div>
@@ -5640,6 +7056,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       recent: document.getElementById("recentSelect"),
       session: document.getElementById("sessionSelect"),
       newWindow: document.getElementById("newWindowButton"),
+      newChat: document.getElementById("newChatButton"),
+      newChatOverlay: document.getElementById("newChatOverlay"),
+      newChatDialog: document.getElementById("newChatDialog"),
+      newChatCancel: document.getElementById("newChatCancelButton"),
+      newChatConfirm: document.getElementById("newChatConfirmButton"),
       transcript: document.getElementById("transcript"),
       composer: document.getElementById("composer"),
       input: document.getElementById("messageInput"),
@@ -5703,6 +7124,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       preview_identity: null,
       run_status: "idle",
       last_run_outcome: "neutral",
+      conversation_generation: 1,
+      preview_update_status: "idle",
+      preview_update_message: "",
       recent: [],
       sessions: [],
       transcript: [],
@@ -5724,6 +7148,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     let agentCapabilityBusy = false;
     let effortVerificationKey = null;
     let settingsReturnFocus = null;
+    let newChatReturnFocus = null;
+    let newChatBusy = false;
     let loadedPreviewKey = null;
 
     function scopedPath(path) {
@@ -5789,6 +7215,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function appendMessage(message) {
+      elements.transcript.querySelector(".chat-empty-state")?.remove();
       const row = document.createElement("div");
       row.className = `message ${message.role === "user" ? "user" : "assistant"}`;
       const bubble = document.createElement("div");
@@ -5868,7 +7295,19 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     function renderTranscript(messages) {
       elements.transcript.replaceChildren();
-      for (const message of messages || []) appendMessage(message);
+      const values = Array.isArray(messages) ? messages : [];
+      if (!values.length) {
+        const empty = document.createElement("div");
+        empty.className = "chat-empty-state";
+        const documentName = String(state.active_document || "")
+          .split(/[\\/]/).pop();
+        empty.textContent = documentName
+          ? `New chat for ${documentName}. What would you like to do?`
+          : "Open a document to start a new chat.";
+        elements.transcript.appendChild(empty);
+        return;
+      }
+      for (const message of values) appendMessage(message);
     }
 
 
@@ -6039,6 +7478,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function trapSettingsFocus(event) {
+      if (elements.newChatOverlay.classList.contains("open")) return;
       if (!elements.settingsOverlay.classList.contains("open")) return;
       if (event.key === "Escape") {
         event.preventDefault();
@@ -6062,6 +7502,116 @@ HTML_TEMPLATE = r"""<!doctype html>
       } else if (!event.shiftKey && document.activeElement === last) {
         event.preventDefault();
         first.focus();
+      }
+    }
+
+    function openNewChatDialog(trigger = elements.newChat) {
+      if (elements.settingsOverlay.classList.contains("open")) {
+        elements.settingsOverlay.classList.remove("open");
+        elements.settingsOverlay.setAttribute("aria-hidden", "true");
+        settingsReturnFocus = null;
+      }
+      newChatReturnFocus =
+        trigger === elements.clearMemory ? elements.settings : trigger;
+      newChatBusy = false;
+      elements.newChatConfirm.disabled = false;
+      elements.newChatCancel.disabled = false;
+      elements.newChatOverlay.classList.add("open");
+      elements.newChatOverlay.setAttribute("aria-hidden", "false");
+      elements.newChatCancel.focus();
+    }
+
+    function closeNewChatDialog() {
+      if (newChatBusy) return;
+      elements.newChatOverlay.classList.remove("open");
+      elements.newChatOverlay.setAttribute("aria-hidden", "true");
+      if (newChatReturnFocus instanceof HTMLElement) {
+        newChatReturnFocus.focus();
+      }
+      newChatReturnFocus = null;
+    }
+
+    function trapNewChatFocus(event) {
+      if (!elements.newChatOverlay.classList.contains("open")) return false;
+      if (event.key === "Escape" && !newChatBusy) {
+        event.preventDefault();
+        closeNewChatDialog();
+        return true;
+      }
+      if (event.key !== "Tab") return false;
+      const focusable = [...elements.newChatDialog.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )];
+      if (!focusable.length) {
+        event.preventDefault();
+        elements.newChatDialog.focus();
+        return true;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+      return true;
+    }
+
+    function applyConversationReset(data) {
+      const generation = Number(
+        data.generation || data.conversation_generation || 0
+      );
+      if (
+        Number.isSafeInteger(generation) &&
+        generation < Number(state.conversation_generation || 0)
+      ) {
+        return;
+      }
+      if (Number.isSafeInteger(generation) && generation > 0) {
+        state.conversation_generation = generation;
+      }
+      state.transcript = [];
+      state.references = [];
+      state.retained_attachments = [];
+      state.preview_selection =
+        data.preview_selection || { targets: [], multi_select_mode: false };
+      state.session_memory = data.session_memory || {};
+      state.last_run_outcome = "neutral";
+      state.run_status = "idle";
+      state.preview_update_status = "idle";
+      state.preview_update_message = "";
+      clientReferences = [];
+      elements.input.value = "";
+      elements.activityLog.textContent = "";
+      renderTranscript([]);
+      renderReferences();
+      renderPreviewSelections();
+      renderSettings();
+      setRunStatus("idle", "neutral");
+    }
+
+    async function confirmNewChat() {
+      if (newChatBusy) return;
+      newChatBusy = true;
+      elements.newChatConfirm.disabled = true;
+      elements.newChatCancel.disabled = true;
+      try {
+        const result = await api("/conversation/reset", {
+          method: "POST",
+          body: JSON.stringify({ confirm: true })
+        });
+        applyConversationReset(result);
+        newChatBusy = false;
+        closeNewChatDialog();
+        showToast(result.message || "New chat started for this document.");
+      } catch (error) {
+        newChatBusy = false;
+        elements.newChatConfirm.disabled = false;
+        elements.newChatCancel.disabled = false;
+        elements.newChatCancel.focus();
+        showToast(error.message);
       }
     }
 
@@ -6109,25 +7659,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     async function clearWorkspaceMemory() {
-      if (!window.confirm(
-        "Clear all chat memory and retained attachments from this Ogent workspace?"
-      )) return;
-      try {
-        const result = await api("/settings/memory/clear", {
-          method: "POST",
-          body: JSON.stringify({ confirm: true })
-        });
-        state.transcript = [];
-        state.references = [];
-        state.retained_attachments = [];
-        state.session_memory = result.session_memory || {};
-        renderTranscript([]);
-        renderReferences();
-        renderSettings();
-        showToast(result.message || "Session memory cleared.");
-      } catch (error) {
-        showToast(error.message);
-      }
+      openNewChatDialog(elements.clearMemory);
     }
 
     function allRenderedReferences() {
@@ -6586,6 +8118,29 @@ HTML_TEMPLATE = r"""<!doctype html>
       return path && stableUrl ? `fallback|${path}|${stableUrl}` : null;
     }
 
+    function previewFrameUrl(identity, fallbackUrl) {
+      if (
+        identity &&
+        typeof identity === "object" &&
+        String(identity.session_id || "") === SESSION_ID &&
+        String(identity.document_id || "") &&
+        /^[0-9a-f]{32}$/.test(String(identity.watch_generation || ""))
+      ) {
+        const value = new URL(
+          `http://localhost:${window.location.port}/preview`
+        );
+        value.searchParams.set("s", SESSION_ID);
+        value.searchParams.set("client", CLIENT_ID);
+        value.searchParams.set("document", identity.document_id);
+        value.searchParams.set(
+          "generation",
+          identity.watch_generation
+        );
+        return value.href;
+      }
+      return canonicalPreviewUrl(fallbackUrl);
+    }
+
     function setPreview(path, url, identity = null) {
       if (!path) {
         elements.preview.style.display = "none";
@@ -6601,8 +8156,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       elements.empty.style.display = "none";
       elements.preview.style.display = "block";
       elements.documentName.textContent = path.split(/[\\/]/).pop() || path;
-      const target = canonicalPreviewUrl(url || state.watch_url);
-      const key = previewIdentityKey(identity || state.preview_identity, path, target);
+      const currentIdentity = identity || state.preview_identity;
+      const target = previewFrameUrl(
+        currentIdentity,
+        url || state.watch_url
+      );
+      const key = previewIdentityKey(currentIdentity, path, target);
       if (target && key && loadedPreviewKey !== key) {
         elements.preview.src = target;
         loadedPreviewKey = key;
@@ -6628,6 +8187,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       const agentUnavailable = !providerIsReady(selectedProvider);
 
       elements.stop.disabled = !busy;
+      elements.newChat.disabled =
+        interactionBusy || referenceUploadBusy || !state.active_document;
+      elements.clearMemory.disabled =
+        interactionBusy || referenceUploadBusy || !state.active_document;
       elements.send.disabled =
         messageBusy || agentUnavailable || agentCapabilityBusy;
       elements.open.disabled = interactionBusy;
@@ -6667,16 +8230,28 @@ HTML_TEMPLATE = r"""<!doctype html>
       elements.runStatusIcon.className = `run-status ${iconState}`;
       elements.runStatusIcon.title = accessibleStatus;
       elements.runStatusText.textContent = accessibleStatus;
+      const previewStatus = String(state.preview_update_status || "idle");
+      const previewMessage = String(state.preview_update_message || "");
       elements.statusDot.className =
-        `status-dot ${busy ? "busy" : status === "error" ? "error" : state.watch_alive ? "ready" : ""}`;
+        `status-dot ${
+          busy || ["waiting", "recovering"].includes(previewStatus)
+            ? "busy"
+            : status === "error" || previewStatus === "degraded"
+              ? "error"
+              : state.watch_alive ? "ready" : ""
+        }`;
       elements.statusText.textContent =
         referenceUploadBusy ? "Uploading attachment..." :
         uploadBusy ? "Importing file..." :
         snapshotBusy ? "Rendering Word view..." :
+        ["waiting", "recovering"].includes(previewStatus)
+          ? (previewMessage || "Confirming preview…") :
         status === "working" ? `${providerName} is editing...` :
         status === "starting" ? `Starting ${providerName}...` :
         status === "stopping" ? "Stopping..." :
         status === "error" ? "Action needed" :
+        previewStatus === "degraded" ? previewMessage :
+        previewStatus === "updated" ? (previewMessage || "Preview updated") :
         state.active_document
           ? (state.watch_alive ? "Live preview connected" : "Preview reconnecting")
           : "Ready to open a document";
@@ -6719,6 +8294,29 @@ HTML_TEMPLATE = r"""<!doctype html>
       const payload = JSON.parse(event.data);
       const type = payload.type;
       const data = payload.data || {};
+      const eventGeneration = Number(
+        payload.generation || data.generation ||
+        state.conversation_generation || 1
+      );
+      if (type === "conversation_reset") {
+        applyConversationReset(data);
+        return;
+      }
+      const conversationScoped = new Set([
+        "activity",
+        "memory_cleared",
+        "message",
+        "preview_selection",
+        "preview_status",
+        "references",
+        "run"
+      ]);
+      if (
+        conversationScoped.has(type) &&
+        eventGeneration !== Number(state.conversation_generation || 1)
+      ) {
+        return;
+      }
       if (type === "snapshot") applySnapshot(data);
       else if (type === "message") {
         appendMessage(data);
@@ -6756,16 +8354,22 @@ HTML_TEMPLATE = r"""<!doctype html>
         state.preview_selection = data;
         renderPreviewSelections();
       }
+      else if (type === "preview_status") {
+        state.preview_update_status = data.status || "idle";
+        state.preview_update_message = data.message || "";
+        state.preview_confirmation = data.confirmation || null;
+        setRunStatus(state.run_status || "idle");
+      }
       else if (type === "recovery") {
         state.recovery = data;
         renderSettings();
       }
       else if (type === "memory_cleared") {
-        state.session_memory = data;
-        state.transcript = [];
-        state.retained_attachments = [];
-        renderTranscript([]);
-        renderSettings();
+        applyConversationReset({
+          generation: eventGeneration,
+          session_memory: data,
+          preview_selection: { targets: [] }
+        });
       }
       else if (type === "sessions") {
         state.sessions = data.items || [];
@@ -6844,7 +8448,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (!state.watch_url || !elements.preview.contentWindow) return;
       let expectedOrigin;
       try {
-        expectedOrigin = new URL(state.watch_url).origin;
+        expectedOrigin = new URL(elements.preview.src).origin;
       } catch (_) {
         return;
       }
@@ -6876,6 +8480,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         window.location.assign(`/?s=${encodeURIComponent(result.session_id)}`);
         return;
       }
+      if (result.action === "document_already_open") {
+        showToast(result.message || "That document is already open.");
+        return;
+      }
       if (result.action === "pdf_import") {
         showToast(result.message || "Preparing a protected PDF working copy.");
         return;
@@ -6901,6 +8509,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         result.preview_identity
       );
       setRunStatus("idle", "neutral");
+      renderTranscript(state.transcript || []);
       renderPreviewSelections();
       showToast(
         result.document_mode === "browser_import" || result.uploaded
@@ -6913,7 +8522,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     async function openDocument() {
       const path = elements.path.value.trim();
-      if (!path) return showToast("Paste an absolute document path.");
+      if (!path) return showToast("Paste a document path.");
       try {
         elements.open.disabled = true;
         const result = await api("/open", {
@@ -7300,6 +8909,15 @@ HTML_TEMPLATE = r"""<!doctype html>
     });
     elements.referenceClear.addEventListener("click", clearReferences);
     elements.selectionClear.addEventListener("click", clearPreviewSelections);
+    elements.newChat.addEventListener(
+      "click",
+      () => openNewChatDialog(elements.newChat)
+    );
+    elements.newChatCancel.addEventListener("click", closeNewChatDialog);
+    elements.newChatConfirm.addEventListener("click", confirmNewChat);
+    elements.newChatOverlay.addEventListener("click", event => {
+      if (event.target === elements.newChatOverlay) closeNewChatDialog();
+    });
     elements.settings.addEventListener("click", openSettings);
     elements.settingsClose.addEventListener("click", closeSettings);
     elements.settingsOverlay.addEventListener("click", event => {
@@ -7308,7 +8926,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     elements.openBackupFolder.addEventListener("click", openBackupFolder);
     elements.deleteExpired.addEventListener("click", deleteExpiredBackups);
     elements.clearMemory.addEventListener("click", clearWorkspaceMemory);
-    document.addEventListener("keydown", trapSettingsFocus);
+    document.addEventListener("keydown", event => {
+      if (!trapNewChatFocus(event)) trapSettingsFocus(event);
+    });
     elements.composer.addEventListener("dragenter", event => {
       if (!hasDraggedFiles(event)) return;
       event.preventDefault();
@@ -7796,6 +9416,428 @@ class OgentHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         return str((query.get("s") or [""])[0]).strip()
 
+    def _preview_context(
+        self,
+        parsed: urllib.parse.ParseResult,
+        *,
+        register: bool = False,
+    ) -> tuple[SessionState, str, str, Path, int, str, str]:
+        query = urllib.parse.parse_qs(parsed.query)
+        session = STATE.get_session(self._session_id_from_query(parsed))
+        client_id = str((query.get("client") or [""])[0]).strip()
+        document_id = str((query.get("document") or [""])[0]).strip()
+        generation = str((query.get("generation") or [""])[0]).strip()
+        channel = str((query.get("channel") or [""])[0]).strip()
+        try:
+            with session.lock:
+                if (
+                    session.active_doc is None
+                    or session.document_id != document_id
+                    or session.watch_generation != generation
+                    or session.watch_port is None
+                ):
+                    raise UserFacingError("That preview link is stale.", 409)
+                if register and not channel:
+                    if session.sse_client_refs.get(client_id, 0) <= 0:
+                        raise PreviewSyncError(
+                            "The preview client is not attached to this "
+                            "document workspace."
+                        )
+                    channel = session.preview_sync.register_client(
+                        client_id=client_id,
+                        document_id=document_id,
+                        watch_generation=generation,
+                    )
+                else:
+                    session.preview_sync.authorize(
+                        client_id=client_id,
+                        document_id=document_id,
+                        watch_generation=generation,
+                        channel=channel,
+                    )
+                document = session.active_doc
+                port = session.watch_port
+        except PreviewSyncError as exc:
+            raise UserFacingError(str(exc), 403) from exc
+        if document is None or port is None:
+            raise UserFacingError("That preview link is stale.", 409)
+        return (
+            session,
+            client_id,
+            channel,
+            document,
+            port,
+            document_id,
+            generation,
+        )
+
+    def _serve_preview_root(
+        self,
+        parsed: urllib.parse.ParseResult,
+    ) -> None:
+        query = urllib.parse.parse_qs(parsed.query)
+        comparison_only = (
+            str((query.get("canonical") or [""])[0]).strip() == "1"
+        )
+        (
+            session,
+            client_id,
+            channel,
+            document,
+            port,
+            document_id,
+            generation,
+        ) = self._preview_context(
+            parsed,
+            register=True,
+        )
+        try:
+            request = urllib.request.Request(
+                f"http://{HOST}:{port}/",
+                method="GET",
+                headers={"Accept": "text/html"},
+            )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                if response.status != 200:
+                    raise UserFacingError(
+                        "The OfficeCLI preview did not return a document.",
+                        502,
+                    )
+                payload = response.read(32 * 1024 * 1024 + 1)
+            if len(payload) > 32 * 1024 * 1024:
+                raise UserFacingError(
+                    "The OfficeCLI preview exceeded the safe relay limit.",
+                    413,
+                )
+            fingerprint = package_sha256(document)
+            html = rewrite_preview_html(
+                payload.decode("utf-8", errors="replace"),
+                session,
+                client_id,
+                channel,
+                fingerprint,
+                document_id=document_id,
+                watch_generation=generation,
+                comparison_only=comparison_only,
+            )
+        except UserFacingError:
+            raise
+        except (OSError, urllib.error.URLError) as exc:
+            raise UserFacingError(
+                "The OfficeCLI preview could not be relayed.",
+                502,
+            ) from exc
+        self._send_bytes(
+            200,
+            html.encode("utf-8"),
+            "text/html; charset=utf-8",
+            {
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": (
+                    "default-src 'self' data: blob: https:; "
+                    "script-src 'self' 'unsafe-inline' https:; "
+                    "style-src 'self' 'unsafe-inline' https:; "
+                    "img-src 'self' data: blob: https:; "
+                    "font-src 'self' data: https:; "
+                    f"connect-src 'self' http://{HOST}:{STATE.server_port}; "
+                    "object-src 'none'; "
+                    f"frame-ancestors http://{HOST}:{STATE.server_port} "
+                    f"http://localhost:{STATE.server_port}"
+                ),
+            },
+        )
+
+    def _serve_preview_events(
+        self,
+        parsed: urllib.parse.ParseResult,
+    ) -> None:
+        (
+            session,
+            _,
+            _,
+            document,
+            port,
+            document_id,
+            generation,
+        ) = self._preview_context(parsed)
+        request = urllib.request.Request(
+            f"http://{HOST}:{port}/events",
+            method="GET",
+            headers={"Accept": "text/event-stream"},
+        )
+        try:
+            upstream = urllib.request.urlopen(request)
+        except (OSError, urllib.error.URLError) as exc:
+            raise UserFacingError(
+                "The OfficeCLI preview stream is unavailable.",
+                502,
+            ) from exc
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            data_lines: list[str] = []
+            while (
+                not STATE.shutdown_requested
+                and not session.closed
+            ):
+                raw = upstream.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+                    continue
+                if line:
+                    self.wfile.write(f"{line}\n".encode("utf-8"))
+                    self.wfile.flush()
+                    continue
+                if not data_lines:
+                    self.wfile.write(b"\n")
+                    self.wfile.flush()
+                    continue
+                data = "\n".join(data_lines)
+                data_lines.clear()
+                try:
+                    event = json.loads(data)
+                except ValueError:
+                    event = None
+                if (
+                    isinstance(event, dict)
+                    and event.get("action") in PREVIEW_MUTATION_ACTIONS
+                ):
+                    with session.lock:
+                        current = (
+                            session.active_doc is not None
+                            and session.active_doc.resolve()
+                            == document.resolve()
+                            and session.document_id == document_id
+                            and session.watch_generation == generation
+                        )
+                    if not current:
+                        break
+                    try:
+                        event["_ogent"] = {
+                            "event_fingerprint": event_fingerprint(event),
+                            "package_sha256": package_sha256(document),
+                        }
+                    except OSError:
+                        event["_ogent"] = {
+                            "event_fingerprint": event_fingerprint(event),
+                            "package_sha256": "",
+                        }
+                    data = json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        finally:
+            with contextlib.suppress(OSError):
+                upstream.close()
+
+    def _serve_preview_controls(
+        self,
+        parsed: urllib.parse.ParseResult,
+    ) -> None:
+        (
+            session,
+            client_id,
+            channel,
+            _,
+            _,
+            document_id,
+            generation,
+        ) = self._preview_context(parsed)
+        try:
+            cursor = int(self.headers.get("Last-Event-ID", "0"))
+        except ValueError:
+            cursor = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            while not STATE.shutdown_requested and not session.closed:
+                controls = session.preview_sync.controls_after(
+                    client_id=client_id,
+                    document_id=document_id,
+                    watch_generation=generation,
+                    channel=channel,
+                    sequence=cursor,
+                    timeout=15,
+                )
+                if not controls:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                for control in controls:
+                    cursor = int(control["seq"])
+                    data = json.dumps(
+                        {
+                            key: value
+                            for key, value in control.items()
+                            if key != "seq"
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    self.wfile.write(
+                        f"id: {cursor}\ndata: {data}\n\n".encode("utf-8")
+                    )
+                    self.wfile.flush()
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            OSError,
+            PreviewSyncError,
+        ):
+            return
+
+    def _proxy_preview_api(
+        self,
+        parsed: urllib.parse.ParseResult,
+    ) -> None:
+        _, _, _, _, port, _, _ = self._preview_context(parsed)
+        length_value = self.headers.get("Content-Length", "0")
+        try:
+            length = int(length_value)
+        except ValueError:
+            raise UserFacingError("Invalid preview request length.", 400) from None
+        if length < 0 or length > MAX_BODY_BYTES:
+            raise UserFacingError("The preview request is too large.", 413)
+        body = self.rfile.read(length)
+        upstream_path = (
+            "/api/selection"
+            if parsed.path.endswith("/selection")
+            else "/api/send"
+        )
+        request = urllib.request.Request(
+            f"http://{HOST}:{port}{upstream_path}",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": self.headers.get(
+                    "Content-Type",
+                    "application/json",
+                )
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = response.read(MAX_BODY_BYTES + 1)
+                status = response.status
+                content_type = response.headers.get(
+                    "Content-Type",
+                    "application/json",
+                )
+        except urllib.error.HTTPError as exc:
+            payload = exc.read(MAX_BODY_BYTES + 1)
+            status = exc.code
+            content_type = exc.headers.get(
+                "Content-Type",
+                "application/json",
+            )
+        except (OSError, urllib.error.URLError) as exc:
+            raise UserFacingError(
+                "The OfficeCLI preview request failed.",
+                502,
+            ) from exc
+        if len(payload) > MAX_BODY_BYTES:
+            raise UserFacingError(
+                "The OfficeCLI preview response is too large.",
+                502,
+            )
+        self._send_bytes(
+            status,
+            payload,
+            content_type,
+            {"Cache-Control": "no-store"},
+        )
+
+    def _accept_preview_ack(
+        self,
+        parsed: urllib.parse.ParseResult,
+    ) -> None:
+        (
+            session,
+            client_id,
+            channel,
+            _,
+            _,
+            document_id,
+            generation,
+        ) = self._preview_context(parsed)
+        length_value = self.headers.get("Content-Length", "0")
+        try:
+            length = int(length_value)
+        except ValueError:
+            raise UserFacingError("Invalid preview acknowledgment.", 400) from None
+        if length <= 0 or length > 32 * 1024:
+            raise UserFacingError("Invalid preview acknowledgment.", 400)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise UserFacingError("Invalid preview acknowledgment.", 400) from None
+        if not isinstance(payload, dict):
+            raise UserFacingError("Invalid preview acknowledgment.", 400)
+        try:
+            session.preview_sync.acknowledge(
+                client_id=client_id,
+                document_id=document_id,
+                watch_generation=generation,
+                channel=channel,
+                kind=str(payload.get("kind") or ""),
+                version=payload.get("version"),
+                package_sha256=str(payload.get("package_sha256") or ""),
+                event_fingerprint_value=(
+                    str(payload["event_fingerprint"])
+                    if payload.get("event_fingerprint") is not None
+                    else None
+                ),
+                dom_fingerprint=(
+                    str(payload["dom_fingerprint"])
+                    if payload.get("dom_fingerprint") is not None
+                    else None
+                ),
+                canonical_dom_fingerprint=(
+                    str(payload["canonical_dom_fingerprint"])
+                    if payload.get("canonical_dom_fingerprint") is not None
+                    else None
+                ),
+                control_id=(
+                    str(payload["control_id"])
+                    if payload.get("control_id") is not None
+                    else None
+                ),
+                viewport_path=(
+                    str(payload["viewport_path"])
+                    if payload.get("viewport_path") is not None
+                    else None
+                ),
+            )
+        except PreviewSyncError as exc:
+            raise UserFacingError(str(exc), 400) from exc
+        self._send_bytes(
+            204,
+            b"",
+            "text/plain; charset=utf-8",
+            {
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            },
+        )
+
     def _session_for_post(self) -> tuple[SessionState, bool]:
         session_id = self.headers.get("X-Ogent-Session", "").strip()
         if session_id == "new":
@@ -7806,8 +9848,42 @@ class OgentHandler(BaseHTTPRequestHandler):
             raise UserFacingError("Missing Ogent session.", 400)
         return STATE.get_session(session_id), False
 
+    def _require_connected_session_client(
+        self,
+        session: SessionState,
+    ) -> str:
+        client_id = self.headers.get("X-Ogent-Client", "").strip()
+        if not PREVIEW_CLIENT_ID_PATTERN.fullmatch(client_id):
+            raise UserFacingError(
+                "A connected browser client is required for this action.",
+                403,
+            )
+        with session.lock:
+            connected = session.sse_client_refs.get(client_id, 0) > 0
+        if not connected:
+            raise UserFacingError(
+                "That browser client is not attached to this document workspace.",
+                403,
+            )
+        return client_id
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in {
+            "/preview",
+            "/preview/events",
+            "/preview/control",
+        }:
+            try:
+                if parsed.path == "/preview":
+                    self._serve_preview_root(parsed)
+                elif parsed.path == "/preview/events":
+                    self._serve_preview_events(parsed)
+                else:
+                    self._serve_preview_controls(parsed)
+            except UserFacingError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+            return
         if parsed.path == "/":
             session_id = self._session_id_from_query(parsed)
             if not session_id:
@@ -7958,6 +10034,19 @@ class OgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in {
+            "/preview/ack",
+            "/preview/api/selection",
+            "/preview/api/send",
+        }:
+            try:
+                if parsed.path == "/preview/ack":
+                    self._accept_preview_ack(parsed)
+                else:
+                    self._proxy_preview_api(parsed)
+            except UserFacingError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+            return
         document_open_route = parsed.path in {"/open", "/upload"}
         if parsed.path == "/session/close":
             query = urllib.parse.parse_qs(parsed.query)
@@ -7991,19 +10080,6 @@ class OgentHandler(BaseHTTPRequestHandler):
             session, created_for_request = self._session_for_post()
             created_for_open = document_open_route and created_for_request
             if document_open_route:
-                with session.lock:
-                    busy = session.run_status in ACTIVE_RUN_STATUSES
-                    snapshot_busy = session.snapshot_in_progress
-                if busy:
-                    raise UserFacingError(
-                        "Ogent is still working. Stop that run or wait for it to finish.",
-                        409,
-                    )
-                if snapshot_busy:
-                    raise UserFacingError(
-                        "Word view is still being generated. Wait for it to finish.",
-                        409,
-                    )
                 if parsed.path == "/open":
                     payload = self._read_json()
                     result = dispatch_open_path(
@@ -8011,12 +10087,28 @@ class OgentHandler(BaseHTTPRequestHandler):
                         str(payload.get("path", "")),
                     )
                 else:
-                    uploaded_path, original_name = self._read_upload(session)
-                    result = dispatch_open_path(
-                        session,
-                        str(uploaded_path),
-                        origin="browser_upload",
+                    upload_session, upload_created = (
+                        STATE.allocate_document_session(session)
                     )
+                    try:
+                        uploaded_path, original_name = self._read_upload(
+                            upload_session
+                        )
+                        result = dispatch_open_path(
+                            upload_session,
+                            str(uploaded_path),
+                            origin="browser_upload",
+                        )
+                        if (
+                            upload_session is not session
+                            and result.get("action")
+                            == "document_opened"
+                        ):
+                            result["action"] = "focus_session"
+                    except Exception:
+                        if upload_created:
+                            close_session(upload_session)
+                        raise
                     result.update(
                         {
                             "uploaded": True,
@@ -8177,12 +10269,47 @@ class OgentHandler(BaseHTTPRequestHandler):
                     raise UserFacingError(
                         "Confirm session-memory clearing before continuing."
                     )
-                summary = clear_session_memory(session)
+                self._require_connected_session_client(session)
+                with session.lock:
+                    if session.active_doc is None:
+                        raise UserFacingError(
+                            "Open a document before starting a new chat.",
+                            409,
+                        )
+                result = reset_document_conversation(
+                    session,
+                    reason="settings_clear",
+                )
                 self._send_json(
                     200,
                     {
-                        "message": "Session memory cleared.",
-                        "session_memory": summary,
+                        "message": "A new chat was started for this document.",
+                        **result,
+                    },
+                )
+                return
+            if parsed.path == "/conversation/reset":
+                payload = self._read_json()
+                if payload.get("confirm") is not True:
+                    raise UserFacingError(
+                        "Confirm starting a new chat before continuing."
+                    )
+                self._require_connected_session_client(session)
+                with session.lock:
+                    if session.active_doc is None:
+                        raise UserFacingError(
+                            "Open a document before starting a new chat.",
+                            409,
+                        )
+                result = reset_document_conversation(
+                    session,
+                    reason="new_chat",
+                )
+                self._send_json(
+                    200,
+                    {
+                        "message": "New chat started for this document.",
+                        **result,
                     },
                 )
                 return
@@ -8223,6 +10350,11 @@ class OgentHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/chat":
                 payload = self._read_json()
+                client_id = self.headers.get("X-Ogent-Client", "").strip()
+                if client_id and not PREVIEW_CLIENT_ID_PATTERN.fullmatch(
+                    client_id
+                ):
+                    raise UserFacingError("Invalid browser client identity.", 400)
                 status, result = handle_chat_message(
                     session,
                     str(payload.get("message", "")),
@@ -8232,6 +10364,7 @@ class OgentHandler(BaseHTTPRequestHandler):
                         "effort",
                         payload.get("reasoning", AUTOMATIC_EFFORT),
                     ),
+                    client_id or None,
                 )
                 self._send_json(status, result)
                 return
@@ -8285,7 +10418,6 @@ class OgentHandler(BaseHTTPRequestHandler):
                 else:
                     with session.lock:
                         session.last_error = str(exc)
-                    session.add_message("assistant", str(exc))
             error_payload = {"error": str(exc)}
             if (
                 document_open_route
@@ -8302,8 +10434,6 @@ class OgentHandler(BaseHTTPRequestHandler):
                 else:
                     with session.lock:
                         session.last_error = str(exc)
-                if document_open_route and not created_for_open:
-                    session.add_message("assistant", message)
             self._send_json(500, {"error": message})
 
 

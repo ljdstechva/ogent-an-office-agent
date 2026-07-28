@@ -42,27 +42,10 @@ jobs:
         run: python -m unittest discover -s ogent-lite\tests -v
 
       - name: Compile Python modules
-        run: >-
-          python -m py_compile
-          ogent-lite\ogent.py
-          ogent-lite\ogent_agent_catalog.py
-          ogent-lite\ogent_agent_providers.py
-          ogent-lite\ogent_officecli_mcp.py
-          ogent-lite\ogent_preview_selection.py
-          ogent-lite\ogent_references.py
-          ogent-lite\ogent_selection_focus.py
+        run: python -m compileall -q ogent-lite
 
       - name: Run Ruff
-        run: >-
-          python -m ruff check
-          ogent-lite\ogent.py
-          ogent-lite\ogent_agent_catalog.py
-          ogent-lite\ogent_agent_providers.py
-          ogent-lite\ogent_officecli_mcp.py
-          ogent-lite\ogent_preview_selection.py
-          ogent-lite\ogent_references.py
-          ogent-lite\ogent_selection_focus.py
-          ogent-lite\tests
+        run: python -m ruff check ogent-lite
 
       - name: Check whitespace
         run: git diff --check

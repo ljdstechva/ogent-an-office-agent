@@ -404,6 +404,97 @@ class RetainedAttachmentStore:
             if directory.exists():
                 self._remove_tree(directory, self.canonical_root)
 
+    def stage_conversation_clear(self) -> Path:
+        """Atomically detach every canonical/incoming attachment for reset."""
+        with self.lock:
+            if (
+                self.session_memory_root.is_symlink()
+                or not self.session_memory_root.is_dir()
+            ):
+                raise RetainedAttachmentError(
+                    "The session attachment storage root is unsafe."
+                )
+            quarantine = self._require_canonical(
+                self.session_memory_root
+                / f".conversation-reset-{uuid.uuid4().hex}",
+                "conversation attachment reset",
+            )
+            quarantine.mkdir(parents=False, exist_ok=False)
+            moved: list[tuple[Path, Path]] = []
+            try:
+                for root in (self.canonical_root, self.incoming_root):
+                    candidate = self._require_canonical(
+                        root,
+                        "conversation attachment reset",
+                    )
+                    if (
+                        candidate.parent != self.session_memory_root
+                        or candidate.is_symlink()
+                    ):
+                        raise RetainedAttachmentError(
+                            "The session attachment directory is unsafe."
+                        )
+                    destination = quarantine / candidate.name
+                    if candidate.exists():
+                        os.replace(candidate, destination)
+                        moved.append((destination, candidate))
+                    candidate.mkdir(parents=False, exist_ok=False)
+                return quarantine
+            except Exception:
+                for destination, original in reversed(moved):
+                    if original.exists():
+                        with contextlib.suppress(OSError):
+                            original.rmdir()
+                    if destination.exists() and not original.exists():
+                        os.replace(destination, original)
+                with contextlib.suppress(OSError):
+                    quarantine.rmdir()
+                raise
+
+    def rollback_conversation_clear(self, quarantine: Path) -> None:
+        """Restore a staged reset when the memory transaction did not commit."""
+        with self.lock:
+            staged = self._require_canonical(
+                quarantine,
+                "conversation attachment reset rollback",
+            )
+            if (
+                staged.parent != self.session_memory_root
+                or staged.is_symlink()
+                or not staged.is_dir()
+            ):
+                raise RetainedAttachmentError(
+                    "The staged attachment reset is unsafe."
+                )
+            for root in (self.canonical_root, self.incoming_root):
+                candidate = self._require_canonical(
+                    root,
+                    "conversation attachment reset rollback",
+                )
+                restored = staged / candidate.name
+                if candidate.exists():
+                    if any(candidate.iterdir()):
+                        raise RetainedAttachmentError(
+                            "New attachment data appeared during reset rollback."
+                        )
+                    candidate.rmdir()
+                if restored.exists():
+                    os.replace(restored, candidate)
+                else:
+                    candidate.mkdir(parents=False, exist_ok=False)
+            staged.rmdir()
+
+    def commit_conversation_clear(self, quarantine: Path) -> None:
+        """Delete only the validated reset quarantine after memory commits."""
+        with self.lock:
+            staged = self._require_canonical(
+                quarantine,
+                "conversation attachment reset commit",
+            )
+            if not staged.exists():
+                return
+            self._remove_tree(staged, self.session_memory_root)
+
     def cleanup_run(self, run_id: str) -> bool:
         if not _valid_id(run_id):
             raise RetainedAttachmentError("Invalid materialized run id.")

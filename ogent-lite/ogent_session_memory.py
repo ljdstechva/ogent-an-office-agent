@@ -866,16 +866,37 @@ class SessionMemory:
 
     def clear_conversation(self, *, preserve_document: bool = True) -> None:
         with self.lock:
+            previous = {
+                "turns": list(self.turns),
+                "attachments": dict(self.attachments),
+                "preferences": list(self.preferences),
+                "provider_sync": dict(self.provider_sync),
+                "last_run": dict(self.last_run),
+                "active_document": dict(self.active_document),
+                "sequence": self.sequence,
+                "cleared_at": self.cleared_at,
+            }
             document = dict(self.active_document) if preserve_document else {}
-            self.turns.clear()
-            self.attachments.clear()
-            self.preferences.clear()
-            self.provider_sync.clear()
-            self.last_run.clear()
-            self.active_document = document
-            self.sequence = 0
-            self.cleared_at = utc_iso(self._now())
-            self._persist()
+            try:
+                self.turns.clear()
+                self.attachments.clear()
+                self.preferences.clear()
+                self.provider_sync.clear()
+                self.last_run.clear()
+                self.active_document = document
+                self.sequence = 0
+                self.cleared_at = utc_iso(self._now())
+                self._persist()
+            except Exception:
+                self.turns = previous["turns"]
+                self.attachments = previous["attachments"]
+                self.preferences = previous["preferences"]
+                self.provider_sync = previous["provider_sync"]
+                self.last_run = previous["last_run"]
+                self.active_document = previous["active_document"]
+                self.sequence = previous["sequence"]
+                self.cleared_at = previous["cleared_at"]
+                raise
 
 
 class SessionMemoryStore:

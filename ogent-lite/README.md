@@ -4,7 +4,7 @@
 
 # Ogent Lite
 
-Ogent Lite 0.10.1 is a featherweight, local document workspace: OfficeCLI keeps a
+Ogent Lite 0.10.2 is a featherweight, local document workspace: OfficeCLI keeps a
 live Word, Excel, or PowerPoint preview on the left, while either Codex or
 Claude Code handles plain-language editing requests in the chat pane on the
 right.
@@ -21,7 +21,7 @@ become active documents.
 For the AI-agent installation sentence and complete human setup, see the
 [repository README](../README.md). Release details and the temporary verified
 OfficeCLI fork dependency are in
-[RELEASE-NOTES-v0.10.1.md](RELEASE-NOTES-v0.10.1.md).
+[RELEASE-NOTES-v0.10.2.md](RELEASE-NOTES-v0.10.2.md).
 
 ## Start and stop
 
@@ -34,6 +34,20 @@ Set-Location '.\ogent-lite'
 # Stop Ogent and its owned provider/OfficeCLI processes
 .\ogent.cmd stop
 ```
+
+The default URL is `http://127.0.0.1:8765/`; Ogent chooses the next available
+loopback port when needed. The health response exposes no document contents and
+can verify the release and installed provider CLIs:
+
+```powershell
+$health = Invoke-RestMethod 'http://127.0.0.1:8765/health'
+$health.version
+$health.agent_capabilities.providers |
+  Select-Object id, status, installed, authenticated, cliVersion
+```
+
+Each usable provider reports `status` as `ready`. After signing in or upgrading
+a CLI, use the compact Refresh button and check again.
 
 - Drag a `.docx`, `.xlsx`, `.pptx`, or `.pdf` anywhere into the running Ogent
   window. The drop area can also be clicked to choose a file.
@@ -89,8 +103,10 @@ an older icon, run `ie4uinit.exe -show` or restart Explorer to refresh its cache
 2. Choose the agent, model, and effort reported by its installed CLI. Use the
    compact refresh button after signing in or upgrading a CLI.
 3. Describe the change and review it live on the left.
-4. Use **+ New window** for another document. The session dropdown switches
-   among open workspaces without merging their documents or chats.
+4. Open another document in the same browser or use **+ New window** for
+   another client. Each document owns its own chat, memory, attachments,
+   selections, run state, and preview; the session dropdown switches among
+   them without merging state.
 5. For a complex DOCX, use **Word view** when exact floating-shape placement
    matters. It opens a Microsoft Word-rendered PDF in a new browser tab.
 6. To analyze supporting material, click the paperclip or drop files on the
@@ -103,6 +119,10 @@ an older icon, run `ie4uinit.exe -show` or restart Explorer to refresh its cache
 8. After Send, each frozen selection tag under that user message is clickable.
    It centers the exact current target and adds a temporary gold viewer-only
    highlight without changing the current composer selection or Office file.
+9. Use **+ New chat** when you want a clean conversation for only the active
+   document. Cancel or Escape is safe; confirmation preserves the document,
+   recovery backup, watch, preview position, settings, and other document
+   workspaces.
 
 The per-turn icon distinguishes **working**, **completed**, **error**, and
 **stopped**. Agent Activity shows provider/model/effort, preparation and tool
@@ -114,9 +134,21 @@ retention, and session-memory settings.
 Normal completion, provider error, and Stop never reload the preview merely
 because the document revision or run status changed. Ogent keys iframe
 navigation to the session, logical document, watch port, and watch generation.
-OfficeCLI updates content through its live event stream and restores the newest
-semantic Word, Excel, or PowerPoint viewport anchor. A new document, an explicit
-preview repair, or a genuine watch restart may perform one required navigation.
+For Word mutations, a client-scoped relay correlates the validated package
+SHA-256, exact OfficeCLI watch event/version, initiating browser client, and
+that viewer's post-render acknowledgement before the UI says **Preview
+updated**. Every mutation and in-place recovery acknowledgement is accepted
+only when the viewer's semantic DOM equals a fully rendered canonical view of the same
+document and watch generation.
+
+If a healthy watch misses a normal acknowledgement, Ogent requests one
+supported in-place full resynchronization and compares semantic content without
+navigating the iframe. If the watch has died or recovery fails, Ogent captures
+the first visible semantic path, restarts that watch exactly once, performs one
+required iframe navigation, and asks `officecli watch goto` to restore the
+location. If confirmation still fails, it reports:
+`Preview could not update. Your document was saved; retry preview or open Word
+view.` It never calls a validated DOCX alone proof that the browser updated.
 
 Submitted selection cards are accessible buttons. Mouse, touch, Enter, and
 Space replay each tag independently. Ogent accepts only that submitted
@@ -173,10 +205,11 @@ Canonical retained copies live in launch-scoped session memory. Every provider
 turn gets isolated materialized copies, extraction, rendered pages, and
 manifests under `%LOCALAPPDATA%\OgentLite\temporary-references\`. Ogent deletes
 that run directory after success, provider error, Stop, or preparation failure.
-**Forget** removes one canonical attachment. **Settings > Clear session memory**
-removes all retained files and transcript turns in that workspace. Session
-reaping, shutdown, and startup clear launch-scoped memory after owned processes
-release the files.
+**Forget** removes one canonical attachment. **+ New chat** (and Settings'
+**Start a new chat**) clears all retained files, transcript turns, memory,
+pending attachments, and selection context in only that document workspace.
+Session reaping, shutdown, and startup clear launch-scoped memory after owned
+processes release the files.
 
 This is ordinary best-effort local deletion, not secure forensic erasure on
 NTFS, SSDs, backups, antivirus caches, or synchronized storage. Attachment
@@ -195,20 +228,40 @@ under `work`; neither mode overwrites the user's browser source or PDF.
 A backup expires exactly 30 x 24 hours after creation and is removed by the
 first startup, scheduled, or manual cleanup at or after that instant. The gear
 shows backup count and size, opens the recovery folder, runs expired cleanup,
-and clears the current workspace's session memory. To restore manually: stop
+and starts a new chat for the current document. To restore manually: stop
 Ogent, copy the chosen backup over the original, reopen it, and validate it with
 OfficeCLI. Deletion is best-effort, not forensic erasure.
 
 ## Sessions and automatic cleanup
 
-Each fresh browser workspace creates one Ogent session. Each session has its own
-document, transcript, provider-neutral memory, run state, and OfficeCLI watch
-port from 26320-26380. Different sessions may edit different files
-concurrently; one individual session allows one agent run at a time. Each turn
-starts a fresh, non-resumable provider process, while Ogent supplies the
-conversation delta, attachment metadata, document identity, and submitted
-selection. Tabs that navigate to the same deduplicated session share that
-workspace.
+One Ogent session is one document workspace, not merely one browser tab. The
+workspace owns the stable document identity, transcript, provider-neutral
+memory, retained/pending attachments, submitted/current selections, provider
+continuation IDs, conversation generation, run state, recovery metadata, and
+OfficeCLI watch port from 26320-26380.
+
+An empty browser session may bind to its first document. Opening a different
+document creates or focuses that document's workspace and navigates directly
+to it, so the previous transcript is never rendered under the new filename.
+Reopening a document during the same backend lifetime restores only its own
+launch-scoped state. Windows case, separator, dot, relative/absolute, and
+supported path aliases deduplicate; distinct files with the same basename do
+not. Browser imports and PDF working documents follow the same isolation.
+
+Different document workspaces may edit concurrently; one workspace allows one
+agent run at a time. Each turn starts a fresh provider process, while Ogent
+supplies only that document's conversation delta, attachment metadata,
+identity, and submitted selection. Tabs that navigate to the same deduplicated
+session share that workspace and receive the same reset/update broadcasts.
+
+The visible **+ New chat** button opens an accessible application modal with
+Cancel initially focused, trapped keyboard focus, Escape cancellation, and
+focus restoration. Confirmation atomically removes only the active workspace's
+conversation state and increments its generation. Late provider/SSE/browser
+events carrying the old generation are ignored. The document, edits, backup,
+direct-edit mode, watch, preview position, recent path, settings, and all other
+workspaces remain intact. The backend independently rejects reset while a run,
+upload, PDF conversion, Word view, or another reset is active.
 
 Closing the final connected tab starts a 120-second grace window; closing one of
 several tabs attached to the same session does not. Refreshing or reopening the
@@ -334,6 +387,8 @@ dot in `#14b8a6`.
 |---|---|
 | Preferred port 8765 is busy | Ogent automatically tries 8766 and higher. Launch again and use the browser page it opens. |
 | Preview says reconnecting | Click the reload icon. Ogent also restarts the OfficeCLI watch before the next chat run. |
+| Preview says waiting or recovering | Keep the tab open while Ogent correlates the saved package with the exact watch event and viewer acknowledgement. It first attempts an in-place resynchronization. |
+| Preview says it could not update | The document was saved but the browser could not confirm it. Retry the preview or use **Word view**; do not treat the stale view as authoritative. |
 | Ogent says OfficeCLI 1.0.143 is required | Install a compatible upstream 1.0.143-or-later release or the checksum-verified temporary fork prerelease linked above, verify `officecli --version`, then restart Ogent. |
 | A submitted selection says it moved or was removed | Select the current document content again. Ogent rejects missing, cross-document, and ambiguous historical targets instead of guessing. |
 | Codex is not logged in | Run `codex login`, then click the agent refresh button. |
@@ -366,8 +421,9 @@ dot in `#14b8a6`.
 - Composer attachments accept up to 20 supported files per Send, 50 MB each,
   100 MB combined, 100 files/500 MB retained per workspace, three concurrent
   uploads, and 25 pages per PDF.
-- One active document and one agent run per session; provider processes are
-  non-resumable and documents remain session-isolated.
+- One active document and one agent run per document workspace; provider
+  processes are fresh per turn and documents remain isolated. Chat/memory lasts
+  only for the current backend lifetime.
 - Focused selection supports Excel cells/ranges, Word paragraphs/table cells,
   and PowerPoint shapes. Unsupported or stale paths fail closed.
 - Submitted historical focus is viewer-only. It uses one Ogent-owned gold mark,

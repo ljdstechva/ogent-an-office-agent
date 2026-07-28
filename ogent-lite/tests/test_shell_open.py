@@ -108,7 +108,7 @@ class ShellOpenTests(unittest.TestCase):
         self.assertEqual(environment["OFFICECLI_NO_AUTO_RESIDENT"], "1")
         self.assertEqual(environment["OFFICECLI_RESIDENT_FLUSH"], "each")
 
-    def test_busy_shell_open_returns_session_and_transcript_message(self) -> None:
+    def test_invalid_shell_open_does_not_pollute_busy_document_chat(self) -> None:
         session = self.state.create_session()
         session.connect_sse("busy-client")
         with session.lock:
@@ -117,13 +117,10 @@ class ShellOpenTests(unittest.TestCase):
         with self.assertRaises(ogent.UserFacingError) as caught:
             ogent.post_open_to_existing_server(self.port, r"C:\test\busy.docx")
 
-        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.status, 404)
         self.assertEqual(caught.exception.session_id, session.session_id)
         with session.lock:
-            self.assertEqual(
-                session.transcript[-1]["text"],
-                "Ogent is still working. Stop that run or wait for it to finish.",
-            )
+            self.assertEqual(session.transcript, [])
         self.assertEqual(len(self.state.sessions), 1)
 
     def test_warm_shell_open_reuses_connected_workspace(self) -> None:

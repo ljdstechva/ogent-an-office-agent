@@ -37,7 +37,7 @@ from ogent_agent_catalog import (
 )
 
 
-APP_CLIENT_VERSION = "0.10.1"
+APP_CLIENT_VERSION = "0.10.2"
 DEFAULT_DISCOVERY_TIMEOUT = 20.0
 DEFAULT_AGENT_TOOL_ALLOWLIST = ("Read",)
 DEFAULT_AGENT_ALLOWED_TOOLS = ("mcp__officecli__officecli",)

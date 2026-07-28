@@ -1,8 +1,11 @@
 # Ogent Lite Verification Report
 
 Date: 2026-07-28
-Status: v0.10.1 passed deterministic, real-provider, OfficeCLI, security, and
-responsive visual acceptance. The required OfficeCLI viewer is available as a
+Status: v0.10.2 passed focused deterministic, real-provider, OfficeCLI,
+responsive browser, and commit-ready local release gates. Remote CI,
+permanent-install, tag, and preservation evidence is reported in the release
+handoff because those checks occur after the source commit. The required
+OfficeCLI viewer remains available as a
 checksum-verified public fork prerelease while its clean patch is reviewed
 upstream. Earlier release matrices are retained below as historical evidence.
 
@@ -11,7 +14,8 @@ upstream. Earlier release matrices are retained below as historical evidence.
 - Runtime: system Python 3.14.3
 - Application: `ogent.py` with embedded HTML/CSS/JavaScript plus separate
   provider, capability-catalog, recovery, provider-neutral memory, retained
-  attachment, timing, preview-selection, and document-gateway adapters
+  attachment, timing, preview-selection, preview-synchronization, and
+  document-gateway adapters
 - Dependencies: Python standard library, plus the existing pinned reference
   inspection packages
 - Server bind: `127.0.0.1` only
@@ -23,9 +27,9 @@ upstream. Earlier release matrices are retained below as historical evidence.
 - OfficeCLI: public fork prerelease `1.0.143-ogent-preview`; Windows x64 asset
   SHA-256 `F32C6AF1B1AA1ACC70E4128B5E0BED9CA3EF01565DD986DCFD23E704FB0AE6E1`
 
-The v0.10.1 release evidence appears in the final section. Statements in the
-v0.1.0 through v0.10.0 sections describe historical releases and are not the
-current preview-retention or historical-navigation architecture.
+The v0.10.2 release evidence appears in the final section. Statements in the
+v0.1.0 through v0.10.1 sections describe historical releases and are not the
+current document-workspace, reset, or preview-confirmation architecture.
 
 ## Live test matrix
 
@@ -1158,3 +1162,224 @@ required advisory read-only supervisor review was completed. No critical or
 high-severity finding and no unexplained browser error remains. Immediately
 before publication, the known unrelated permanent-checkout files and artifact
 trees still matched their recorded SHA-256 fingerprints.
+
+## v0.10.2 — document-scoped chats, safe New Chat, and confirmed Word preview
+
+Ogent 0.10.2 changes the ownership boundary from a reusable browser/HTTP shell
+to the document workspace. It also adds a transactional conversation reset and
+a viewer acknowledgement protocol for completed Word edits.
+
+### Reproduced root causes
+
+- **Document-history leakage:** v0.10.1 allowed an already-bound `SessionState`
+  to open another path while the same object still owned its transcript,
+  provider-neutral memory, retained attachments, submitted selections, and
+  provider IDs. The displayed document could change before the conversation
+  ownership boundary did, so A state appeared under B.
+- **Stale Word completion:** v0.10.1 correctly kept iframe identity stable to
+  preserve position, but run completion had no proof that the initiating viewer
+  rendered the validated package. OfficeCLI can emit its watch event just
+  before the final package bytes become readable. A live watch and a valid DOCX
+  therefore did not prove that the browser DOM had advanced.
+
+Both defects were reproduced against synthetic documents before the v0.10.2
+implementation. The stale-preview reproduction deliberately interrupted only
+the watch event stream: the DOCX changed and validated while the browser
+remained connected and visibly stale until the stream was restored.
+
+### Document-workspace architecture
+
+- One `SessionState` now represents one document workspace and remains the
+  single source of truth for document identity, transcript, memory,
+  attachments, selections, provider IDs, conversation generation, run state,
+  recovery metadata, and watch association.
+- An empty shell may bind to its first document. Opening B from bound A
+  allocates or focuses B and returns the effective session URL; A is never
+  relabeled or briefly rendered as B.
+- The path index canonicalizes Windows case, separators, dot segments, and
+  relative/absolute aliases. Different documents with the same basename remain
+  distinct. Concurrent claims converge on one owner without merging the losing
+  shell's chat.
+- Reopening an active document during the same backend lifetime restores only
+  that workspace. DOCX, XLSX, PPTX, browser imports, and PDF working documents
+  all use the same isolation rule.
+- Provider-neutral memory remains inside the document workspace, so switching
+  between Codex and Claude retains that document's context without importing
+  another document's context.
+
+### Transactional New Chat
+
+The visible **+ New chat** control opens a centered application modal. Cancel
+is initially focused, Tab/Shift+Tab remain inside the modal, Escape cancels,
+focus returns to the trigger, and the destructive control stacks without
+clipping at 390x844.
+
+The shared reset domain service clears only the active document's transcript,
+memory, retained/pending attachments, submitted/current selections, historical
+marks, provider continuation IDs, and old run/timing summaries. It advances a
+monotonic conversation generation before broadcasting the reset. Provider,
+worker, SSE, and browser writes carrying an older generation are rejected.
+
+The endpoint requires the server token, exact session, and an exact browser
+client currently connected to that session. It accepts no deletion path and
+quarantines only validated attachment directories contained by the
+Ogent-owned session root. Busy run/upload/conversion/Word-view/reset states
+return HTTP 409 independently of UI disabled state.
+
+Reset deliberately preserves the Office package, edits, recovery backup,
+direct-edit mode, document identity, watch process/port/generation, preview
+position, recent paths, catalog/settings, and all other workspaces.
+
+### Preview revision handshake
+
+Each preview client receives an opaque relay channel bound to the exact
+session, document identity, and watch generation. The backend:
+
+1. fingerprints the Office package before and after a run;
+2. associates each unique OfficeCLI mutation event with a backend revision;
+3. augments the event with the canonical document/package/event identity;
+4. accepts an acknowledgement only from the initiating client and matching
+   relay channel;
+5. confirms **Preview updated** only after the exact initiating viewer
+   proves its semantic DOM equals a fully rendered canonical view for the matching event,
+   validated package, document, and watch generation.
+
+Ordinary Word patches, formatting-only replacements, additions, removals, and
+table updates use the same canonical comparison as full events, version gaps,
+and in-place recovery. The relay sends both the viewer's rendered DOM
+fingerprint and the canonical fingerprint; the backend rejects an absent or
+unequal pair. This comparison strips transient current/historical selection
+marks so viewer-only focus cannot cause false revision mismatches.
+
+If normal confirmation is missing, Ogent requests one supported in-place full
+refresh without changing `iframe.src`. If recovery still fails or the watch is
+dead, it captures the first visible semantic path, restarts the watch exactly
+once, waits for the new viewer's initial acknowledgement, and restores the path
+with public `officecli watch goto`. A final failure reports the exact degraded
+message instead of claiming success.
+
+### Real browser and Office evidence
+
+The in-app Browser was attempted first. After an interrupted controller
+session it reported no available browser binding, so the required fallback used
+headed Chromium through Playwright.
+
+**Document A/B flow**
+
+- A session `a03cbd53` submitted a unique message, a retained TXT reference,
+  and a Word selection. The assistant returned `A-CHAT-ACK-102`.
+- Opening B created session `d3658620`. Its initial state contained no A
+  transcript, memory, attachment, or selection. The assistant returned
+  `B-EMPTY-ISOLATED-102`.
+- Reopening A restored its unique message, retained attachment, assistant
+  response, and submitted selection button without B content.
+- Reopening B restored only B. Escape and explicit Cancel left B unchanged.
+- Confirming New Chat changed B's conversation generation from 1 to 2,
+  transcript from two entries to zero, retained turns from one to zero, and
+  retained attachments/selections to zero.
+- B's document SHA-256 and backup SHA-256 both remained
+  `0FE0385D9655B9852DCD3003BB0AA608B213AE7AF2156B512F83BE0B9B12EC45`.
+  Watch port `26322` and watch generation
+  `6a6e97f842bb4f18b5893416a0b637f2` were unchanged. A remained intact.
+
+**Live Word flow**
+
+- Multiple real Codex CLI 0.145.0 `gpt-5.6-sol` edits changed exact synthetic
+  paragraphs through OfficeCLI. Each target was queried back and the DOCX
+  validated with no errors.
+- The direct confirmation run rendered
+  `WORD-LIVE-PARAGRAPH-063-CODEX-EDIT-FOUR-102` while the iframe URL and
+  `scrollY=2262`, first visible `/body/p[70]`, remained unchanged. Confirmation
+  was `status=updated`, `recovery=null`.
+- A deliberately stopped run ended with `Stopped. No further agent work is
+  running.` The next real edit rendered
+  `WORD-LIVE-PARAGRAPH-064-AFTER-STOP-102` with the same iframe, semantic
+  location, watch port, and watch generation and again confirmed directly.
+- A formatting-only OfficeCLI edit changed the live font weight from 400 to 700
+  without changing paragraph text, iframe identity, or first visible path.
+- Adding a third table row rendered
+  `PREVIEW-TABLE-ROW-STRUCTURAL-102 | 84` in place while the viewport remained
+  at `/body/p[58]`.
+- A selected paragraph was submitted with a real edit and rendered as
+  `WORD-LIVE-PARAGRAPH-066-SELECTED-CODEX-102`. Its historical tag then
+  centered the changed target at approximately 50% of the 810-pixel viewer and
+  applied the expected gold `officecli-mark` without changing the package.
+- The earlier acceptance sequence finished at watch version 6 with the exact
+  event/package fingerprints, initiating client, `status=updated`, and
+  `recovery=null`.
+- The final post-review direct mutation returned HTTP 204 with equal live and
+  canonical DOM fingerprints. It retained the same iframe node and URL,
+  `scrollY=2530.666748046875`, and a zero console count.
+- A final real Codex `gpt-5.6-sol` edit rendered
+  `WORD-LIVE-PARAGRAPH-072-FINAL-CODEX-CANONICAL-ACK-102`, again returned HTTP
+  204 with equal fingerprints at watch version 2, kept iframe identity and
+  scroll exactly unchanged, and left the target at 51.195% of the viewport.
+  The UI reported **Preview updated**; OfficeCLI readback found the exact new
+  paragraph, the old text was absent, and validation passed.
+
+Desktop 1440x900 had no horizontal or vertical application overflow and no
+control outside the viewport. Mobile 390x844 had zero horizontal overflow; the
+New Chat modal measured 338.7x311.1 pixels inside the viewport with no clipped
+controls. The current browser console reported zero errors and zero warnings.
+Inspected screenshots are outside committed source:
+
+- `output/playwright/ogent-v0102-desktop-1440x900-A.png`
+- `output/playwright/ogent-v0102-mobile-390x844-new-chat.png`
+
+### Deterministic and security coverage
+
+The v0.10.2 focused module covers A/B restoration, provider switching,
+same-name paths, case/separator/dot/relative aliases, concurrent open claims,
+browser-import/PDF isolation, transactional reset, document/backup hashes,
+attachment containment, provider IDs, reset broadcasts, old-generation
+rejection, HTTP 409, exact-client authorization, exact preview event/client
+matching, early watch-event association, formatting and structural events,
+consecutive revisions, canonical-DOM mismatch rejection, stale-generation
+channel/control/ack rejection, in-place full refresh, one-restart semantic
+restoration, and modal/relay source contracts.
+
+The focused module passed 18/18 methods and 2 subtests, including forced
+memory-persistence rollback and refusal to issue a preview relay channel to a
+client that is not connected to the exact document workspace. The full local
+suite passed 166
+tests and 58 subtests under Pytest, then the same 166 tests under Unittest.
+`compileall`, Ruff, `git diff --check`, three PowerShell parser checks, and all
+13 packaged OfficeCLI fixture validations passed. The rotated current-source
+candidate again passed desktop and mobile layout checks, live iframe loading,
+provider readiness, and the preview-client relay boundary.
+
+The required single read-only supervisor found two high-severity blockers
+before publication: ordinary mutation acknowledgments did not prove equality
+with a canonical render, and relay channel registration/authorization could
+cross a watch-generation change. Both were corrected. Channels and controls
+are now keyed by client, document, and generation under one lock; stale
+authorization and acknowledgment fail closed. Every mutation/recovery
+acknowledgment must contain equal live/canonical fingerprints. The live
+post-review run then exposed that an inert `DOMParser` does not reproduce
+OfficeCLI's runtime typography pass, so the proof now uses an off-screen,
+fully rendered viewer and strips only renderer-owned CJK punctuation wrappers.
+The strict backend equality check remains unchanged. Focused regressions, the
+full suites, and the real HTTP 204 evidence passed; no critical or
+high-severity finding remains.
+
+Remote CI, permanent installation, annotated tag publication, and the final
+dirty-checkout fingerprint comparison are operational release checks performed
+after the commit and are reported in the release handoff.
+
+### Remaining limits
+
+- Conversation history is intentionally launch-scoped and disappears when the
+  backend stops.
+- Multiple browser clients of one document share reset events and chat state.
+  OfficeCLI historical navigation remains watch-scoped, so those viewers move
+  together.
+- Complex Word columns, floating shapes, text boxes, and embedded fonts can
+  remain approximate in the HTML viewer. Word view is the layout-accurate
+  verification surface.
+- Preview recovery is deliberately bounded. If exact confirmation cannot be
+  obtained, Ogent reports the saved-but-unconfirmed state and requires Retry or
+  Word view rather than silently looping or claiming success.
+- If durable memory persistence fails after viewer-only selection/highlight
+  cleanup has started, the reset is rejected and document, chat, attachment,
+  and memory state are restored, but that transient viewer-only mark may need
+  to be selected again.
