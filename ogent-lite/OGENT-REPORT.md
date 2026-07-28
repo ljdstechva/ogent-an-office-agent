@@ -1052,7 +1052,7 @@ were viewer-only; the package hashes did not change after their edit boundary.
 ### Automated and security gate
 
 - Deterministic suite: 148 test methods and 56 executed subtests; all passed in
-  21.110 seconds against the installed public OfficeCLI dependency.
+  20.188 seconds against the installed public OfficeCLI dependency.
 - Coverage includes stable preview identity, cache-buster canonicalization,
   completion/error/Stop reload prevention, genuine-document/watch navigation,
   Word/Excel/PowerPoint anchor contracts, manual-scroll precedence, deleted
@@ -1133,7 +1133,7 @@ Inspected screenshots are outside committed source:
 - `output/ogent-v0.10.1-preview-position-links/playwright/candidate/candidate-mobile-error.png`
 - `output/ogent-v0.10.1-preview-position-links/playwright/candidate/candidate-mobile-empty.png`
 
-### Publication gate and current verdict
+### Publication gate and verdict
 
 The user authorized the maintained fork, public prerelease, and upstream pull
 request. OfficeCLI PR #268 is open, the fork tag and all eight release assets
@@ -1143,7 +1143,7 @@ The public-asset Word, Excel, and PowerPoint matrix then passed viewport
 retention, off-screen historical centering, gold highlighting, package-hash
 integrity, validation, zero-console, and successful loopback-request checks.
 
-Verdict: **SATISFIED for publication**. The deterministic suite passed again
+Verdict: **SATISFIED**. The deterministic suite passed again
 against the installed public dependency, the real-provider and responsive
 acceptance evidence remains valid, and no release blocker remains. The only
 documented viewer limitation is deliberate watch-wide navigation: two browser
@@ -1151,3 +1151,10 @@ clients attached to the same session/watch move together. The temporary fork
 dependency is explicitly labeled unofficial, checksum pinned, and replaceable
 with a compatible official OfficeCLI 1.0.143-or-later release when upstream
 publishes one.
+
+The final source audit also passed compile, Ruff, whitespace, local Markdown
+link, PowerShell syntax, JSON evidence, and credential-pattern checks. The
+required advisory read-only supervisor review was completed. No critical or
+high-severity finding and no unexplained browser error remains. Immediately
+before publication, the known unrelated permanent-checkout files and artifact
+trees still matched their recorded SHA-256 fingerprints.
