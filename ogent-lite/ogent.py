@@ -153,6 +153,7 @@ SESSION_MEMORY_ROOT = LOCAL_DATA / "session-memory"
 RECENT_PATH = LOCAL_DATA / "recent.json"
 SERVER_INFO_PATH = LOCAL_DATA / "server.json"
 AGENT_CAPABILITIES_PATH = LOCAL_DATA / "agent-capabilities-v1.json"
+RUNTIME_LOG_PATH = LOCAL_DATA / "ogent.log"
 
 CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -173,6 +174,7 @@ SERVICES_INITIALIZED = False
 OFFICECLI_RUNTIME_LOCK = threading.RLock()
 OFFICECLI_RUNTIME_VERSION: tuple[int, int, int] | None = None
 OFFICECLI_RUNTIME_VERSION_TEXT: str | None = None
+RUNTIME_LOG_LOCK = threading.RLock()
 
 
 def initialize_owned_stores() -> None:
@@ -201,6 +203,32 @@ class UserFacingError(RuntimeError):
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def backend_log(event: str, **fields: Any) -> None:
+    """Append a bounded, secret-free diagnostic event to Ogent's local log."""
+    payload: dict[str, Any] = {
+        "time": now_iso(),
+        "event": str(event)[:120],
+    }
+    for key, value in fields.items():
+        if value is None or isinstance(value, (bool, int, float)):
+            payload[str(key)[:80]] = value
+        else:
+            payload[str(key)[:80]] = str(value)[:2000]
+    try:
+        RUNTIME_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with RUNTIME_LOG_LOCK:
+            with RUNTIME_LOG_PATH.open("a", encoding="utf-8") as stream:
+                stream.write(f"{line}\n")
+    except OSError:
+        # Diagnostics must never take the preview down with them.
+        return
 
 
 def json_bytes(value: Any) -> bytes:
@@ -505,6 +533,67 @@ def preview_identity_public(session: "SessionState") -> dict[str, Any] | None:
         }
 
 
+def record_preview_client_status(
+    session: "SessionState",
+    client_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    status = str(payload.get("status") or "").strip().casefold()
+    if status not in {"ready", "failed", "meaningless"}:
+        raise UserFacingError("Invalid preview client status.", 400)
+    document_id = str(payload.get("document_id") or "").strip()
+    watch_generation = str(payload.get("watch_generation") or "").strip()
+    message = str(payload.get("message") or "").strip()[:1000]
+    raw_metrics = payload.get("metrics")
+    metrics: dict[str, int] = {}
+    if isinstance(raw_metrics, dict):
+        for key in (
+            "text_length",
+            "visible_visuals",
+            "visible_paths",
+            "document_height",
+        ):
+            try:
+                metrics[key] = max(0, int(raw_metrics.get(key, 0)))
+            except (TypeError, ValueError):
+                raise UserFacingError("Invalid preview readiness metrics.", 400) from None
+    with session.lock:
+        if (
+            session.active_doc is None
+            or session.document_id != document_id
+            or session.watch_generation != watch_generation
+        ):
+            raise UserFacingError("That preview status belongs to a stale document.", 409)
+        document_name = session.active_doc.name
+        revision = session.document_revision
+    backend_log(
+        "preview_client_status",
+        session_id=session.session_id,
+        client_id=client_id,
+        document_id=document_id,
+        document_name=document_name,
+        document_revision=revision,
+        watch_generation=watch_generation,
+        status=status,
+        message=message,
+        metrics=json.dumps(metrics, separators=(",", ":")),
+    )
+    if status != "ready":
+        session.add_activity(
+            "preview",
+            (
+                f"Live View reported {status}: "
+                f"{message or 'no meaningful preview content was available'}"
+            ),
+        )
+    return {
+        "status": status,
+        "document_id": document_id,
+        "watch_generation": watch_generation,
+        "metrics": metrics,
+    }
+
+
 def preview_proxy_parameters(
     session: "SessionState",
     client_id: str,
@@ -587,6 +676,17 @@ def preview_ack_script(
         document_id=document_id,
         watch_generation=watch_generation,
     )
+    with session.lock:
+        status_document_id = (
+            session.document_id
+            if document_id is None
+            else document_id
+        )
+        status_watch_generation = (
+            session.watch_generation
+            if watch_generation is None
+            else watch_generation
+        )
     config = json.dumps(
         {
             "ackUrl": ack_url,
@@ -602,6 +702,8 @@ def preview_ack_script(
             ),
             "packageSha256": package_fingerprint,
             "comparisonOnly": comparison_only,
+            "documentId": status_document_id,
+            "watchGeneration": status_watch_generation,
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -614,6 +716,60 @@ def preview_ack_script(
   "use strict";
   const config = {config};
   if (config.comparisonOnly) return;
+  const postStatus = (type, detail = {{}}) => {{
+    try {{
+      window.parent.postMessage(
+        Object.assign(
+          {{
+            protocol: "ogent-preview-status",
+            version: 1,
+            type,
+            document_id: config.documentId,
+            watch_generation: config.watchGeneration
+          }},
+          detail
+        ),
+        "*"
+      );
+    }} catch (_) {{}}
+  }};
+  function previewMetrics() {{
+    const bodyText = String(document.body?.innerText || "")
+      .replace(/\\s+/g, " ")
+      .trim();
+    const visible = element => {{
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity || "1") > 0 &&
+        rect.width > 1 &&
+        rect.height > 1
+      );
+    }};
+    const visibleVisuals = Array.from(
+      document.querySelectorAll("img,svg,canvas,video,object,embed")
+    ).filter(visible).length;
+    const visiblePaths = Array.from(
+      document.querySelectorAll("[data-path]")
+    ).filter(visible).length;
+    const metrics = {{
+      text_length: bodyText.length,
+      visible_visuals: visibleVisuals,
+      visible_paths: visiblePaths,
+      document_height: Math.max(
+        Number(document.documentElement?.scrollHeight || 0),
+        Number(document.body?.scrollHeight || 0)
+      )
+    }};
+    return {{
+      meaningful:
+        metrics.text_length >= 24 ||
+        metrics.visible_visuals > 0,
+      metrics
+    }};
+  }}
   const mutationActions = new Set([
     "add", "doc-switched", "excel-patch", "full",
     "remove", "replace", "word-patch"
@@ -880,8 +1036,21 @@ def preview_ack_script(
       }}
     }};
   }}
+  async function announceInitialPreview() {{
+    try {{
+      await nextFrame();
+      await nextFrame();
+      await sendAck("initial");
+      const readiness = previewMetrics();
+      postStatus("preview.ready", readiness);
+    }} catch (error) {{
+      postStatus("preview.failed", {{
+        message: String(error?.message || error || "Live View initialization failed.")
+      }});
+    }}
+  }}
   requestAnimationFrame(() =>
-    requestAnimationFrame(() => sendAck("initial")));
+    requestAnimationFrame(announceInitialPreview));
 }})();
 </script>
 """
@@ -1078,6 +1247,11 @@ class SessionState:
         self.snapshot_complete.set()
         self.snapshot_pid_file: Path | None = None
         self.snapshot_path: Path | None = None
+        self.snapshot_cache_key: str | None = None
+        self.snapshot_document_id: str | None = None
+        self.snapshot_document_revision = 0
+        self.snapshot_package_sha256 = ""
+        self.snapshot_error: str | None = None
         self.pending_references: list[ReferenceAttachment] = []
         self.retained_references: dict[str, ReferenceAttachment] = {}
         self.active_references: dict[str, list[ReferenceAttachment]] = {}
@@ -1276,6 +1450,10 @@ class SessionState:
                 "snapshot_available": bool(
                     self.snapshot_path and self.snapshot_path.is_file()
                 ),
+                "snapshot_cache_key": self.snapshot_cache_key,
+                "snapshot_document_id": self.snapshot_document_id,
+                "snapshot_document_revision": self.snapshot_document_revision,
+                "snapshot_error": self.snapshot_error,
                 "references": references,
                 "retained_attachments": retained,
                 "document_mode": self.document_mode,
@@ -1360,6 +1538,16 @@ class SessionState:
             self.sse_clients = sum(self.sse_client_refs.values())
             if self.sse_clients == 0:
                 self.orphan_since = time.time()
+
+
+def invalidate_word_snapshot_locked(session: SessionState) -> None:
+    """Invalidate the session pointer without deleting Ogent-owned cache files."""
+    session.snapshot_path = None
+    session.snapshot_cache_key = None
+    session.snapshot_document_id = None
+    session.snapshot_document_revision = 0
+    session.snapshot_package_sha256 = ""
+    session.snapshot_error = None
 
 
 class OgentState:
@@ -1653,7 +1841,7 @@ class OgentState:
                 session.historical_focus.marks = ()
                 session.historical_focus.selection_id = None
                 session.pending_pdf = False
-                session.snapshot_path = None
+                invalidate_word_snapshot_locked(session)
                 session.complex_layout = False
                 session.complex_layout_detail = None
                 session.preview_selection.clear()
@@ -1703,7 +1891,7 @@ class OgentState:
                 session.last_error = None
                 session.complex_layout = complex_layout
                 session.complex_layout_detail = complex_layout_detail
-                session.snapshot_path = None
+                invalidate_word_snapshot_locked(session)
                 if session.sse_clients == 0:
                     # Opening can outlast the original orphan grace (notably
                     # PDF conversion and large DOCX inspection). Give the
@@ -2789,6 +2977,7 @@ def advance_document_revision(
         session.document_package_sha256 = package_fingerprint
         if advanced:
             session.document_revision += 1
+            invalidate_word_snapshot_locked(session)
             if session.memory is not None:
                 state = dict(session.memory.active_document)
                 state["revision"] = session.document_revision
@@ -5836,6 +6025,16 @@ def clear_session_memory(session: SessionState) -> dict[str, Any]:
     )["session_memory"]
 
 
+def valid_pdf_file(path: Path | None) -> bool:
+    if path is None or not path.is_file() or path.stat().st_size <= 5:
+        return False
+    try:
+        with path.open("rb") as stream:
+            return stream.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def generate_word_snapshot(session: SessionState) -> Path:
     with session.lock:
         if session.closed:
@@ -5854,21 +6053,109 @@ def generate_word_snapshot(session: SessionState) -> Path:
             raise UserFacingError("Word view is currently available only for DOCX files.", 415)
         if not document.exists():
             raise UserFacingError(f"The working document no longer exists: {document}", 404)
+        document_id = session.document_id
+        document_revision = session.document_revision
         session.snapshot_in_progress = True
-        output = document.parent / f"{safe_name(document.stem)}-word-view.pdf"
-        pid_file = document.parent / f".{safe_name(document.stem)}-word-process.pid"
-        with contextlib.suppress(OSError):
-            pid_file.unlink()
         session.snapshot_complete.clear()
-        session.snapshot_pid_file = pid_file
-        session.snapshot_path = None
-    session.emit("snapshot_status", {"status": "working"})
+        session.snapshot_error = None
+    session.emit(
+        "snapshot_status",
+        {
+            "status": "working",
+            "document_id": document_id,
+            "document_revision": document_revision,
+        },
+    )
 
     process: subprocess.Popen[str] | None = None
+    pid_file: Path | None = None
     try:
+        package_fingerprint = package_sha256(document)
+        cache_key = hashlib.sha256(
+            (
+                f"{document_id}|{document_revision}|{package_fingerprint}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        snapshot_root = WORK_ROOT / session.session_id / "word-view"
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        if not path_is_within(snapshot_root, WORK_ROOT / session.session_id):
+            raise UserFacingError(
+                "Word View temporary storage escaped the Ogent workspace.",
+                500,
+            )
+        output = snapshot_root / f"{cache_key}.pdf"
+        pid_file = snapshot_root / f".{cache_key}-word-process.pid"
+        with contextlib.suppress(OSError):
+            pid_file.unlink()
         with session.lock:
-            if session.closed:
-                raise UserFacingError("This Ogent session has closed.", 410)
+            if (
+                session.closed
+                or session.active_doc is None
+                or session.active_doc.resolve() != document.resolve()
+                or session.document_id != document_id
+                or session.document_revision != document_revision
+            ):
+                raise UserFacingError(
+                    "The document changed before Word View could start. Retry.",
+                    409,
+                )
+            session.snapshot_pid_file = pid_file
+            session.snapshot_path = None
+            session.snapshot_cache_key = None
+            session.snapshot_document_id = None
+            session.snapshot_document_revision = 0
+            session.snapshot_package_sha256 = ""
+        if valid_pdf_file(output):
+            if package_sha256(document) != package_fingerprint:
+                raise UserFacingError(
+                    "The document changed while Word View was opening. Retry.",
+                    409,
+                )
+            with session.lock:
+                if (
+                    session.closed
+                    or session.active_doc is None
+                    or session.active_doc.resolve() != document.resolve()
+                    or session.document_id != document_id
+                    or session.document_revision != document_revision
+                ):
+                    raise UserFacingError(
+                        "The document changed while Word View was opening. Retry.",
+                        409,
+                    )
+                session.snapshot_path = output
+                session.snapshot_cache_key = cache_key
+                session.snapshot_document_id = document_id
+                session.snapshot_document_revision = document_revision
+                session.snapshot_package_sha256 = package_fingerprint
+                session.snapshot_in_progress = False
+                session.snapshot_error = None
+                if session.sse_clients == 0:
+                    session.orphan_since = time.time()
+            session.emit(
+                "snapshot_status",
+                {
+                    "status": "ready",
+                    "url": f"/snapshot.pdf?s={session.session_id}",
+                    "cache_key": cache_key,
+                    "document_id": document_id,
+                    "document_revision": document_revision,
+                    "cached": True,
+                },
+            )
+            backend_log(
+                "word_view_ready",
+                session_id=session.session_id,
+                document_id=document_id,
+                document_name=document.name,
+                document_revision=document_revision,
+                cache_key=cache_key,
+                cached=True,
+                bytes=output.stat().st_size,
+            )
+            return output
+
+        with session.lock:
             process = subprocess.Popen(
                 [
                     "powershell.exe",
@@ -5907,15 +6194,34 @@ def generate_word_snapshot(session: SessionState) -> Path:
                 f"Word view failed with exit code {process.returncode}. {tail}".strip(),
                 500,
             )
-        if not output.is_file() or output.stat().st_size <= 5:
+        if not valid_pdf_file(output):
             raise UserFacingError("Word view did not create a valid PDF.", 500)
-        with output.open("rb") as stream:
-            if stream.read(5) != b"%PDF-":
-                raise UserFacingError("Word view output is not a valid PDF.", 500)
+        if package_sha256(document) != package_fingerprint:
+            raise UserFacingError(
+                "The source document changed during Word View generation. "
+                "Retry after document editing is complete.",
+                409,
+            )
         with session.lock:
+            if (
+                session.closed
+                or session.active_doc is None
+                or session.active_doc.resolve() != document.resolve()
+                or session.document_id != document_id
+                or session.document_revision != document_revision
+            ):
+                raise UserFacingError(
+                    "The document changed during Word View generation. Retry.",
+                    409,
+                )
             session.snapshot_path = output
+            session.snapshot_cache_key = cache_key
+            session.snapshot_document_id = document_id
+            session.snapshot_document_revision = document_revision
+            session.snapshot_package_sha256 = package_fingerprint
             session.snapshot_in_progress = False
             session.snapshot_process = None
+            session.snapshot_error = None
             if session.sse_clients == 0:
                 session.orphan_since = time.time()
         session.emit(
@@ -5923,17 +6229,48 @@ def generate_word_snapshot(session: SessionState) -> Path:
             {
                 "status": "ready",
                 "url": f"/snapshot.pdf?s={session.session_id}",
+                "cache_key": cache_key,
+                "document_id": document_id,
+                "document_revision": document_revision,
+                "cached": False,
             },
         )
+        backend_log(
+            "word_view_ready",
+            session_id=session.session_id,
+            document_id=document_id,
+            document_name=document.name,
+            document_revision=document_revision,
+            cache_key=cache_key,
+            cached=False,
+            bytes=output.stat().st_size,
+        )
         return output
-    except UserFacingError:
+    except UserFacingError as exc:
         with session.lock:
             session.snapshot_in_progress = False
             if session.snapshot_process is process:
                 session.snapshot_process = None
+            session.snapshot_error = str(exc)
             if session.sse_clients == 0:
                 session.orphan_since = time.time()
-        session.emit("snapshot_status", {"status": "error"})
+        session.emit(
+            "snapshot_status",
+            {
+                "status": "error",
+                "error": str(exc),
+                "document_id": document_id,
+                "document_revision": document_revision,
+            },
+        )
+        backend_log(
+            "word_view_failed",
+            session_id=session.session_id,
+            document_id=document_id,
+            document_name=document.name,
+            document_revision=document_revision,
+            error=str(exc),
+        )
         raise
     except Exception as exc:
         with session.lock:
@@ -5941,9 +6278,26 @@ def generate_word_snapshot(session: SessionState) -> Path:
             if session.snapshot_process is process:
                 session.snapshot_process = None
             session.last_error = str(exc)
+            session.snapshot_error = str(exc)
             if session.sse_clients == 0:
                 session.orphan_since = time.time()
-        session.emit("snapshot_status", {"status": "error"})
+        session.emit(
+            "snapshot_status",
+            {
+                "status": "error",
+                "error": str(exc),
+                "document_id": document_id,
+                "document_revision": document_revision,
+            },
+        )
+        backend_log(
+            "word_view_failed",
+            session_id=session.session_id,
+            document_id=document_id,
+            document_name=document.name,
+            document_revision=document_revision,
+            error=str(exc),
+        )
         raise UserFacingError(f"Word view failed: {exc}", 500) from exc
     finally:
         cleanup_word_snapshot_process(process, pid_file)
@@ -6299,6 +6653,23 @@ HTML_TEMPLATE = r"""<!doctype html>
       text-transform: none;
     }
     .complex-note.visible { display: block; }
+    .preview-mode {
+      display: none;
+      flex: 0 0 auto;
+      border: 1px solid rgba(255,255,255,.24);
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: rgba(255,255,255,.09);
+      color: #dce9f2;
+      font-size: 9px;
+      font-weight: 750;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .preview-mode.visible { display: inline-flex; }
+    .preview-mode.word-view { border-color: #5eead4; color: #ccfbf1; }
+    .preview-mode.error { border-color: #fda4af; color: #ffe4e6; }
     .session-controls {
       display: flex;
       align-items: center;
@@ -6375,10 +6746,58 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     .icon-button:disabled { opacity: .4; cursor: default; }
     .new-window { white-space: nowrap; font-size: 10px; }
-    .preview-shell { position: relative; flex: 1; min-height: 0; padding: 14px; }
+    .preview-shell {
+      position: relative; flex: 1; min-height: 0; padding: 14px;
+      display: flex; flex-direction: column; gap: 9px;
+    }
+    .preview-banner {
+      display: none;
+      flex: 0 0 auto;
+      border: 1px solid #99f6e4;
+      border-radius: 10px;
+      padding: 8px 11px;
+      background: #ecfdf5;
+      color: #115e59;
+      font-size: 11px;
+      font-weight: 650;
+      line-height: 1.4;
+      box-shadow: 0 5px 18px rgba(15,118,110,.08);
+    }
+    .preview-banner.visible { display: block; }
+    .preview-stage { position: relative; flex: 1 1 auto; min-height: 0; }
     #preview {
       width: 100%; height: 100%; border: 0; border-radius: 12px; background: #fff;
       box-shadow: var(--shadow); display: none;
+    }
+    .preview-state-card {
+      width: min(470px, calc(100% - 28px));
+      position: absolute;
+      left: 50%; top: 48%;
+      transform: translate(-50%, -50%);
+      padding: 25px 24px;
+      text-align: center;
+      border-radius: 16px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+      z-index: 1;
+    }
+    .preview-state-card h2 { margin: 0 0 7px; font-size: 18px; }
+    .preview-state-card p {
+      margin: 0; color: var(--muted); font-size: 12px; line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+    .preview-state-actions {
+      display: flex; justify-content: center; flex-wrap: wrap;
+      gap: 8px; margin-top: 15px;
+    }
+    .preview-state-actions button {
+      border: 1px solid var(--line); border-radius: 9px;
+      padding: 8px 11px; background: var(--panel); color: var(--ink);
+      font-size: 11px; font-weight: 700;
+    }
+    .preview-state-actions .primary {
+      border-color: var(--teal); background: var(--teal); color: #fff;
     }
     .empty-document {
       width: min(560px, 75%);
@@ -6812,6 +7231,21 @@ HTML_TEMPLATE = r"""<!doctype html>
         min-height: 100vh;
         flex-direction: column;
       }
+      .document-toolbar {
+        min-height: 0;
+        flex-wrap: wrap;
+        align-items: center;
+        padding: 7px 10px;
+      }
+      .doc-title { flex: 1 1 120px; }
+      .doc-title .complex-note { display: none; }
+      .session-controls { flex: 0 0 auto; }
+      .session-select { width: 118px; }
+      .status-cluster {
+        order: 3;
+        flex: 0 0 100%;
+        justify-content: flex-end;
+      }
       .document-pane {
         width: 100%;
         min-width: 0;
@@ -6828,6 +7262,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       .transcript { max-height: min(320px, 38vh); }
       .preview-shell { padding: 10px; }
+      .preview-banner { font-size: 10px; }
+      .preview-state-card { padding: 20px 17px; }
       .empty-document {
         width: calc(100% - 28px);
         padding: 24px 20px;
@@ -6861,13 +7297,14 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="doc-title">
           <small id="documentMode">Ready for a protected open</small>
           <span id="documentName">No document open</span>
-          <span class="complex-note" id="complexNote">Complex layout detected — live view approximates floating shapes. Use Word view for exact rendering.</span>
+          <span class="complex-note" id="complexNote">Complex layout detected. Live View is approximate; use Word View for exact rendering.</span>
         </div>
         <div class="session-controls">
           <select class="session-select" id="sessionSelect" aria-label="Open Ogent sessions"></select>
           <button class="icon-button new-window" id="newWindowButton" type="button" title="Open an independent Ogent workspace">+ New window</button>
         </div>
         <div class="status-cluster">
+          <span class="preview-mode" id="previewModeIndicator"></span>
           <span class="status-dot" id="statusDot"></span>
           <span class="status-text" id="statusText">Ready to open a document</span>
           <button class="icon-button" id="multiSelectButton" type="button" aria-pressed="false" title="Touch multi-select mode" hidden>Multi-select</button>
@@ -6876,24 +7313,35 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </header>
       <div class="preview-shell">
-        <div class="empty-document" id="emptyDocument">
-          <div class="symbol" aria-hidden="true">
-            <svg viewBox="0 0 256 256" focusable="false">
-              <defs>
-                <linearGradient id="empty-mark-gradient" x1="0" y1="0" x2="1" y2="1">
-                  <stop offset="0" stop-color="#17324d"/>
-                  <stop offset="1" stop-color="#0d9488"/>
-                </linearGradient>
-              </defs>
-              <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#empty-mark-gradient)"/>
-              <circle cx="128" cy="120" r="66" fill="none" stroke="#fff" stroke-width="30"/>
-              <circle cx="175" cy="167" r="16" fill="#14b8a6" stroke="#fff" stroke-width="3"/>
-            </svg>
+        <div class="preview-banner" id="previewBanner" role="status"></div>
+        <div class="preview-stage">
+          <div class="empty-document" id="emptyDocument">
+            <div class="symbol" aria-hidden="true">
+              <svg viewBox="0 0 256 256" focusable="false">
+                <defs>
+                  <linearGradient id="empty-mark-gradient" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0" stop-color="#17324d"/>
+                    <stop offset="1" stop-color="#0d9488"/>
+                  </linearGradient>
+                </defs>
+                <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#empty-mark-gradient)"/>
+                <circle cx="128" cy="120" r="66" fill="none" stroke="#fff" stroke-width="30"/>
+                <circle cx="175" cy="167" r="16" fill="#14b8a6" stroke="#fff" stroke-width="3"/>
+              </svg>
+            </div>
+            <h1>Your document, live.</h1>
+            <p>Local Office files open for direct editing only after a verified recovery backup. Browser uploads remain imported copies; PDFs remain protected conversions.</p>
           </div>
-          <h1>Your document, live.</h1>
-          <p>Local Office files open for direct editing only after a verified recovery backup. Browser uploads remain imported copies; PDFs remain protected conversions.</p>
+          <div class="preview-state-card" id="previewStateCard" role="status" aria-live="polite" hidden>
+            <h2 id="previewStateTitle">Opening Live View</h2>
+            <p id="previewStateMessage">Waiting for the protected preview connection.</p>
+            <div class="preview-state-actions" id="previewStateActions" hidden>
+              <button class="primary" id="previewRetryButton" type="button">Retry Live View</button>
+              <button id="previewWordButton" type="button">Open Word View</button>
+            </div>
+          </div>
+          <iframe id="preview" title="OfficeCLI document preview"></iframe>
         </div>
-        <iframe id="preview" title="OfficeCLI live preview"></iframe>
       </div>
     </section>
     <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize panes"></div>
@@ -7062,6 +7510,20 @@ HTML_TEMPLATE = r"""<!doctype html>
         : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
     const AGENT_SETTINGS_KEY = "ogent-agent-settings-v2";
     const LEGACY_AGENT_SETTINGS_KEY = "ogent-agent-settings-v1";
+    const PREVIEW_STATES = new Set([
+      "loading",
+      "live",
+      "live-complex",
+      "word-view-loading",
+      "word-view",
+      "error"
+    ]);
+    const PREVIEW_READY_TIMEOUT_MS = 12000;
+    const WORD_VIEW_READY_TIMEOUT_MS = 20000;
+    const COMPLEX_LAYOUT_WARNING =
+      "Complex layout detected. Live View is approximate; use Word View for exact rendering.";
+    const AUTO_WORD_VIEW_MESSAGE =
+      "This document uses a complex Word layout. Word View was opened automatically for accurate rendering.";
     const elements = {
       path: document.getElementById("pathInput"),
       open: document.getElementById("openButton"),
@@ -7098,6 +7560,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       stop: document.getElementById("stopButton"),
       preview: document.getElementById("preview"),
       empty: document.getElementById("emptyDocument"),
+      previewBanner: document.getElementById("previewBanner"),
+      previewStateCard: document.getElementById("previewStateCard"),
+      previewStateTitle: document.getElementById("previewStateTitle"),
+      previewStateMessage: document.getElementById("previewStateMessage"),
+      previewStateActions: document.getElementById("previewStateActions"),
+      previewRetry: document.getElementById("previewRetryButton"),
+      previewWord: document.getElementById("previewWordButton"),
+      previewMode: document.getElementById("previewModeIndicator"),
       documentName: document.getElementById("documentName"),
       documentMode: document.getElementById("documentMode"),
       statusDot: document.getElementById("statusDot"),
@@ -7167,6 +7637,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     let newChatReturnFocus = null;
     let newChatBusy = false;
     let loadedPreviewKey = null;
+    let eventStreamReady = false;
+    let pendingPreview = null;
+    let previewMachine = {
+      state: null,
+      mode: "none",
+      identityKey: null,
+      documentKey: null,
+      frameUrl: null,
+      attempt: 0,
+      timeoutId: null,
+      automaticWordView: false,
+      lastError: null
+    };
 
     function scopedPath(path) {
       const url = new URL(path, window.location.origin);
@@ -7767,6 +8250,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         "visible",
         Boolean(isDocx && state.complex_layout)
       );
+      elements.complexNote.textContent = COMPLEX_LAYOUT_WARNING;
       if (state.complex_layout_detail) {
         elements.complexNote.title = state.complex_layout_detail;
       }
@@ -8142,9 +8626,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         String(identity.document_id || "") &&
         /^[0-9a-f]{32}$/.test(String(identity.watch_generation || ""))
       ) {
-        const value = new URL(
-          `http://localhost:${window.location.port}/preview`
-        );
+        const value = new URL("/preview", window.location.origin);
         value.searchParams.set("s", SESSION_ID);
         value.searchParams.set("client", CLIENT_ID);
         value.searchParams.set("document", identity.document_id);
@@ -8157,31 +8639,266 @@ HTML_TEMPLATE = r"""<!doctype html>
       return canonicalPreviewUrl(fallbackUrl);
     }
 
-    function setPreview(path, url, identity = null) {
+    function currentDocumentIdentity() {
+      const identity = state.preview_identity;
+      if (
+        !state.active_document ||
+        !identity ||
+        String(identity.session_id || "") !== SESSION_ID ||
+        !String(identity.document_id || "")
+      ) {
+        return null;
+      }
+      return {
+        sessionId: SESSION_ID,
+        documentId: String(identity.document_id),
+        watchGeneration: String(identity.watch_generation || ""),
+        revision: Number(state.document_revision || 0),
+        path: String(state.active_document)
+      };
+    }
+
+    function documentIdentityKey(identity = currentDocumentIdentity()) {
+      if (!identity) return null;
+      return [
+        identity.sessionId,
+        identity.documentId,
+        identity.revision,
+        identity.path
+      ].join("|");
+    }
+
+    function sameDocumentIdentity(left, right) {
+      return Boolean(
+        left &&
+        right &&
+        left.sessionId === right.sessionId &&
+        left.documentId === right.documentId &&
+        left.watchGeneration === right.watchGeneration &&
+        left.revision === right.revision &&
+        left.path === right.path
+      );
+    }
+
+    function clearPreviewTimeout() {
+      if (previewMachine.timeoutId !== null) {
+        clearTimeout(previewMachine.timeoutId);
+        previewMachine.timeoutId = null;
+      }
+    }
+
+    function previewIsDocx() {
+      return String(state.active_document || "").toLowerCase().endsWith(".docx");
+    }
+
+    function transitionPreview(nextState, detail = {}) {
+      if (!PREVIEW_STATES.has(nextState)) {
+        throw new Error(`Unknown preview state: ${nextState}`);
+      }
+      if (!["loading", "word-view-loading"].includes(nextState)) {
+        clearPreviewTimeout();
+      }
+      previewMachine.state = nextState;
+      previewMachine.mode = nextState.startsWith("word-view") ? "word" : "live";
+      previewMachine.lastError =
+        nextState === "error" ? String(detail.message || "Preview failed.") : null;
+
+      const labels = {
+        loading: "Live View loading",
+        live: "Live View",
+        "live-complex": "Live View approximate",
+        "word-view-loading": "Word View loading",
+        "word-view": "Word View",
+        error: "Preview error"
+      };
+      elements.previewMode.textContent = labels[nextState];
+      elements.previewMode.className =
+        `preview-mode visible${
+          nextState.startsWith("word-view") ? " word-view" :
+          nextState === "error" ? " error" : ""
+        }`;
+
+      const loading = nextState === "loading";
+      const wordLoading = nextState === "word-view-loading";
+      const failed = nextState === "error";
+      elements.previewStateCard.hidden = !(loading || wordLoading || failed);
+      elements.previewStateActions.hidden = !failed;
+      elements.previewRetry.hidden = !failed;
+      elements.previewWord.hidden = !failed || !previewIsDocx();
+      if (loading) {
+        elements.previewStateTitle.textContent = "Opening Live View";
+        elements.previewStateMessage.textContent =
+          detail.message || "Waiting for the protected preview connection.";
+      } else if (wordLoading) {
+        elements.previewStateTitle.textContent = "Opening Word View";
+        elements.previewStateMessage.textContent =
+          detail.message || "Rendering an accurate, read-only PDF preview.";
+      } else if (failed) {
+        elements.previewStateTitle.textContent = detail.title || "Preview unavailable";
+        elements.previewStateMessage.textContent =
+          detail.message || "The document preview could not be opened.";
+      }
+
+      const automaticWordView = Boolean(
+        previewMachine.automaticWordView &&
+        ["word-view-loading", "word-view", "error"].includes(nextState)
+      );
+      const banner = String(
+        detail.banner ||
+        (automaticWordView ? AUTO_WORD_VIEW_MESSAGE : "")
+      );
+      elements.previewBanner.textContent = banner;
+      elements.previewBanner.classList.toggle("visible", Boolean(banner));
+      elements.preview.style.display =
+        ["loading", "live", "live-complex", "word-view-loading", "word-view"]
+          .includes(nextState)
+          ? "block"
+          : "none";
+      elements.empty.style.display = "none";
+      setRunStatus(state.run_status || "idle");
+    }
+
+    function resetPreviewMachine() {
+      clearPreviewTimeout();
+      pendingPreview = null;
+      loadedPreviewKey = null;
+      previewMachine = {
+        state: null,
+        mode: "none",
+        identityKey: null,
+        documentKey: null,
+        frameUrl: null,
+        attempt: previewMachine.attempt + 1,
+        timeoutId: null,
+        automaticWordView: false,
+        lastError: null
+      };
+      elements.preview.removeAttribute("src");
+      elements.preview.style.display = "none";
+      elements.previewStateCard.hidden = true;
+      elements.previewStateActions.hidden = true;
+      elements.previewBanner.textContent = "";
+      elements.previewBanner.classList.remove("visible");
+      elements.previewMode.textContent = "";
+      elements.previewMode.className = "preview-mode";
+    }
+
+    function mountLivePreview(path, url, identity, options = {}) {
+      const target = previewFrameUrl(identity, url);
+      const identityKey = previewIdentityKey(identity, path, target);
+      if (!target || !identityKey) {
+        failLivePreview("Live View does not have a valid document identity.", {
+          automatic: false
+        });
+        return;
+      }
+      const attempt = previewMachine.attempt + 1;
+      previewMachine.attempt = attempt;
+      previewMachine.identityKey = identityKey;
+      previewMachine.documentKey = documentIdentityKey();
+      previewMachine.frameUrl = target;
+      previewMachine.automaticWordView = false;
+      transitionPreview("loading", {
+        message: options.message || "Waiting for Live View to confirm document content."
+      });
+      clearPreviewTimeout();
+      previewMachine.timeoutId = setTimeout(() => {
+        if (
+          previewMachine.attempt === attempt &&
+          previewMachine.state === "loading" &&
+          previewMachine.identityKey === identityKey
+        ) {
+          failLivePreview(
+            "Live View did not confirm usable content before the safety timeout."
+          );
+        }
+      }, PREVIEW_READY_TIMEOUT_MS);
+      const reloadUrl = new URL(target);
+      reloadUrl.searchParams.set("attempt", String(attempt));
+      previewMachine.frameUrl = reloadUrl.href;
+      loadedPreviewKey = identityKey;
+      elements.preview.src = reloadUrl.href;
+    }
+
+    function beginLivePreview(path, url, identity = null, options = {}) {
+      if (!path) return;
+      const currentIdentity = identity || state.preview_identity;
+      const target = previewFrameUrl(currentIdentity, url || state.watch_url);
+      const identityKey = previewIdentityKey(currentIdentity, path, target);
+      if (
+        !options.force &&
+        identityKey &&
+        previewMachine.identityKey === identityKey &&
+        ["loading", "live", "live-complex"].includes(previewMachine.state)
+      ) {
+        return;
+      }
+      pendingPreview = { path, url, identity: currentIdentity, options };
+      previewMachine.identityKey = identityKey;
+      previewMachine.documentKey = documentIdentityKey();
+      previewMachine.automaticWordView = false;
+      transitionPreview("loading", {
+        message: eventStreamReady
+          ? "Waiting for Live View to confirm document content."
+          : "Connecting the protected preview stream before opening Live View."
+      });
+      if (!eventStreamReady) {
+        const attempt = previewMachine.attempt + 1;
+        previewMachine.attempt = attempt;
+        clearPreviewTimeout();
+        previewMachine.timeoutId = setTimeout(() => {
+          if (
+            previewMachine.attempt === attempt &&
+            previewMachine.state === "loading" &&
+            pendingPreview
+          ) {
+            failLivePreview(
+              "The protected preview stream did not connect before the safety timeout."
+            );
+          }
+        }, PREVIEW_READY_TIMEOUT_MS);
+        return;
+      }
+      const pending = pendingPreview;
+      pendingPreview = null;
+      mountLivePreview(
+        pending.path,
+        pending.url,
+        pending.identity,
+        pending.options
+      );
+    }
+
+    function setPreview(path, url, identity = null, options = {}) {
       if (!path) {
-        elements.preview.style.display = "none";
+        resetPreviewMachine();
         elements.empty.style.display = "block";
         elements.documentName.textContent = "No document open";
-        if (loadedPreviewKey !== null || elements.preview.hasAttribute("src")) {
-          elements.preview.removeAttribute("src");
-          loadedPreviewKey = null;
-        }
         renderDocumentControls();
         return;
       }
-      elements.empty.style.display = "none";
-      elements.preview.style.display = "block";
       elements.documentName.textContent = path.split(/[\\/]/).pop() || path;
       const currentIdentity = identity || state.preview_identity;
-      const target = previewFrameUrl(
-        currentIdentity,
-        url || state.watch_url
-      );
+      const target = previewFrameUrl(currentIdentity, url || state.watch_url);
       const key = previewIdentityKey(currentIdentity, path, target);
-      if (target && key && loadedPreviewKey !== key) {
-        elements.preview.src = target;
-        loadedPreviewKey = key;
+      const needsLiveLoad = options.force || loadedPreviewKey !== key;
+      if (
+        !options.force &&
+        key &&
+        previewMachine.identityKey === key &&
+        ["word-view-loading", "word-view"].includes(previewMachine.state)
+      ) {
+        renderDocumentControls();
+        return;
       }
+      if (
+        !needsLiveLoad &&
+        ["loading", "live", "live-complex"].includes(previewMachine.state)
+      ) {
+        renderDocumentControls();
+        return;
+      }
+      beginLivePreview(path, url, currentIdentity, options);
       renderDocumentControls();
     }
 
@@ -8207,6 +8924,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         interactionBusy || referenceUploadBusy || !state.active_document;
       elements.clearMemory.disabled =
         interactionBusy || referenceUploadBusy || !state.active_document;
+      elements.wordView.disabled = interactionBusy || !previewIsDocx();
+      elements.previewRetry.disabled = interactionBusy;
+      elements.previewWord.disabled = interactionBusy || !previewIsDocx();
       elements.send.disabled =
         messageBusy || agentUnavailable || agentCapabilityBusy;
       elements.open.disabled = interactionBusy;
@@ -8248,28 +8968,41 @@ HTML_TEMPLATE = r"""<!doctype html>
       elements.runStatusText.textContent = accessibleStatus;
       const previewStatus = String(state.preview_update_status || "idle");
       const previewMessage = String(state.preview_update_message || "");
+      const previewState = previewMachine.state;
       elements.statusDot.className =
         `status-dot ${
-          busy || ["waiting", "recovering"].includes(previewStatus)
+          busy ||
+          ["loading", "word-view-loading"].includes(previewState) ||
+          ["waiting", "recovering"].includes(previewStatus)
             ? "busy"
-            : status === "error" || previewStatus === "degraded"
+            : status === "error" ||
+              previewState === "error" ||
+              previewStatus === "degraded"
               ? "error"
-              : state.watch_alive ? "ready" : ""
+              : ["live", "live-complex", "word-view"].includes(previewState)
+                ? "ready"
+                : ""
         }`;
       elements.statusText.textContent =
         referenceUploadBusy ? "Uploading attachment..." :
         uploadBusy ? "Importing file..." :
-        snapshotBusy ? "Rendering Word view..." :
+        previewState === "word-view-loading" || snapshotBusy
+          ? "Rendering Word View..." :
+        previewState === "loading" ? "Opening Live View..." :
         ["waiting", "recovering"].includes(previewStatus)
           ? (previewMessage || "Confirming preview…") :
         status === "working" ? `${providerName} is editing...` :
         status === "starting" ? `Starting ${providerName}...` :
         status === "stopping" ? "Stopping..." :
         status === "error" ? "Action needed" :
+        previewState === "error" ? "Preview action needed" :
         previewStatus === "degraded" ? previewMessage :
         previewStatus === "updated" ? (previewMessage || "Preview updated") :
+        previewState === "live-complex" ? "Live View approximate" :
+        previewState === "live" ? "Live View connected" :
+        previewState === "word-view" ? "Word View ready" :
         state.active_document
-          ? (state.watch_alive ? "Live preview connected" : "Preview reconnecting")
+          ? "Preview reconnecting"
           : "Ready to open a document";
       renderAgentStatus();
       renderDocumentControls();
@@ -8278,6 +9011,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function applySnapshot(snapshot) {
+      const previousDocumentKey = documentIdentityKey();
       state = Object.assign(state, snapshot);
       renderTranscript(state.transcript || []);
       renderRecent(state.recent || []);
@@ -8290,7 +9024,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       setPreview(
         state.active_document,
         state.active_document && state.watch_url ? state.watch_url : null,
-        state.preview_identity
+        state.preview_identity,
+        {
+          force: Boolean(
+            previousDocumentKey &&
+            previousDocumentKey !== documentIdentityKey() &&
+            ["word-view-loading", "word-view"].includes(previewMachine.state)
+          )
+        }
       );
       setRunStatus(
         state.run_status || "idle",
@@ -8418,6 +9159,15 @@ HTML_TEMPLATE = r"""<!doctype html>
             state.preview_identity
           );
         }
+        if (
+          data.status !== "ready" &&
+          ["loading", "live", "live-complex"].includes(previewMachine.state)
+        ) {
+          failLivePreview(
+            String(data.error || "") ||
+            "The OfficeCLI Live View process stopped responding."
+          );
+        }
         setRunStatus(state.run_status || "idle");
       } else if (type === "document") {
         state.active_document = data.working;
@@ -8440,25 +9190,95 @@ HTML_TEMPLATE = r"""<!doctype html>
         );
         setRunStatus(state.run_status || "idle");
       } else if (type === "document_revision") {
+        const previousRevision = Number(state.document_revision || 0);
         state.document_revision = data.revision || state.document_revision;
+        if (
+          Number(state.document_revision || 0) !== previousRevision &&
+          ["word-view-loading", "word-view"].includes(previewMachine.state)
+        ) {
+          setPreview(
+            state.active_document,
+            state.watch_url,
+            state.preview_identity,
+            { force: true }
+          );
+        }
       } else if (type === "snapshot_status") {
         state.snapshot_in_progress = data.status === "working";
+        if (
+          data.status === "error" &&
+          previewMachine.state === "word-view-loading"
+        ) {
+          failWordView(data.error || "Word View generation failed.");
+        }
         setRunStatus(state.run_status || "idle");
       }
     }
 
-    const eventSource = new EventSource(
-      `/events?s=${encodeURIComponent(SESSION_ID)}` +
-      `&token=${encodeURIComponent(TOKEN)}` +
-      `&client=${encodeURIComponent(CLIENT_ID)}`
-    );
-    eventSource.onmessage = event => {
-      try { handleEvent(event); } catch (error) { console.error(error); }
-    };
-    eventSource.onerror = () => {
-      state.watch_alive = false;
-      setRunStatus(state.run_status || "idle");
-    };
+    let eventSource = null;
+    let eventStreamAttempt = 0;
+    function activatePendingPreview() {
+      eventStreamReady = true;
+      if (!pendingPreview) return;
+      const pending = pendingPreview;
+      pendingPreview = null;
+      const pendingKey = previewIdentityKey(
+        pending.identity,
+        pending.path,
+        previewFrameUrl(pending.identity, pending.url)
+      );
+      if (
+        pending.path !== state.active_document ||
+        pendingKey !== previewMachine.identityKey
+      ) {
+        return;
+      }
+      mountLivePreview(
+        pending.path,
+        pending.url,
+        pending.identity,
+        pending.options
+      );
+    }
+
+    function connectEventStream(options = {}) {
+      const streamAttempt = eventStreamAttempt + 1;
+      eventStreamAttempt = streamAttempt;
+      if (eventSource && options.force) {
+        eventSource.close();
+        eventSource = null;
+      }
+      eventStreamReady = false;
+      const source = new EventSource(
+        `/events?s=${encodeURIComponent(SESSION_ID)}` +
+        `&token=${encodeURIComponent(TOKEN)}` +
+        `&client=${encodeURIComponent(CLIENT_ID)}`
+      );
+      eventSource = source;
+      source.onopen = () => {
+        if (eventStreamAttempt !== streamAttempt || eventSource !== source) return;
+        activatePendingPreview();
+      };
+      source.onmessage = event => {
+        if (eventStreamAttempt !== streamAttempt || eventSource !== source) return;
+        activatePendingPreview();
+        try { handleEvent(event); } catch (error) { console.error(error); }
+      };
+      source.onerror = () => {
+        if (eventStreamAttempt !== streamAttempt || eventSource !== source) return;
+        eventStreamReady = false;
+        if (
+          state.active_document &&
+          ["loading", "live", "live-complex"].includes(previewMachine.state)
+        ) {
+          failLivePreview(
+            "The protected Live View connection was interrupted."
+          );
+        }
+        setRunStatus(state.run_status || "idle");
+      };
+    }
+    connectEventStream();
 
     window.addEventListener("message", event => {
       if (!state.watch_url || !elements.preview.contentWindow) return;
@@ -8471,7 +9291,68 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (
         event.origin !== expectedOrigin ||
         event.source !== elements.preview.contentWindow ||
-        !event.data ||
+        !event.data
+      ) {
+        return;
+      }
+      if (
+        event.data.protocol === "ogent-preview-status" &&
+        event.data.version === 1
+      ) {
+        const identity = state.preview_identity || {};
+        if (
+          previewMachine.mode !== "live" ||
+          event.data.document_id !== identity.document_id ||
+          event.data.watch_generation !== identity.watch_generation ||
+          previewMachine.identityKey !== previewIdentityKey(
+            identity,
+            state.active_document,
+            elements.preview.src
+          )
+        ) {
+          return;
+        }
+        if (event.data.type === "preview.ready") {
+          const metrics =
+            event.data.metrics && typeof event.data.metrics === "object"
+              ? event.data.metrics
+              : {};
+          if (event.data.meaningful === true) {
+            reportPreviewStatus("ready", "Live View confirmed usable content.", metrics);
+            transitionPreview(
+              state.complex_layout ? "live-complex" : "live",
+              state.complex_layout
+                ? { banner: COMPLEX_LAYOUT_WARNING }
+                : {}
+            );
+          } else {
+            const reason =
+              "Live View opened but did not contain meaningful document content.";
+            reportPreviewStatus("meaningless", reason, metrics);
+            if (previewIsDocx() && state.complex_layout) {
+              openWordView({ automatic: true, reason }).catch(error => {
+                failWordView(error.message);
+              });
+            } else {
+              transitionPreview("error", {
+                title: "Live View contained no document content",
+                message: reason
+              });
+            }
+          }
+          return;
+        }
+        if (event.data.type === "preview.failed") {
+          const reason =
+            String(event.data.message || "") ||
+            "Live View reported an initialization failure.";
+          reportPreviewStatus("failed", reason);
+          failLivePreview(reason, { report: false });
+          return;
+        }
+        return;
+      }
+      if (
         event.data.protocol !== "officecli-preview-selection" ||
         event.data.version !== 1 ||
         event.data.type !== "selection.changed"
@@ -8804,28 +9685,194 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
     }
 
-    async function openWordView() {
-      const popup = window.open("about:blank", "_blank");
+    function reportPreviewStatus(status, message = "", metrics = {}) {
+      const identity = currentDocumentIdentity();
+      if (!identity) return;
+      api("/preview/status", {
+        method: "POST",
+        body: JSON.stringify({
+          status,
+          document_id: identity.documentId,
+          watch_generation: identity.watchGeneration,
+          message: String(message || ""),
+          metrics
+        })
+      }).catch(error => console.warn("Preview status was not recorded:", error));
+    }
+
+    function failWordView(message) {
+      clearPreviewTimeout();
+      transitionPreview("error", {
+        title: "Word View unavailable",
+        message:
+          String(message || "") ||
+          "Word View could not render this document. Retry Live View or Word View."
+      });
+    }
+
+    function failLivePreview(message, options = {}) {
+      clearPreviewTimeout();
+      pendingPreview = null;
+      const reason =
+        String(message || "") ||
+        "Live View could not confirm usable document content.";
+      if (options.report !== false) {
+        reportPreviewStatus("failed", reason);
+      }
+      if (
+        options.automatic !== false &&
+        previewIsDocx() &&
+        Boolean(state.complex_layout)
+      ) {
+        openWordView({ automatic: true, reason }).catch(error => {
+          failWordView(error.message);
+        });
+        return;
+      }
+      transitionPreview("error", {
+        title: "Live View unavailable",
+        message: reason
+      });
+    }
+
+    async function openWordView(options = {}) {
+      const requestedIdentity = currentDocumentIdentity();
+      if (!previewIsDocx() || !requestedIdentity) {
+        failWordView("Word View is available only for an open DOCX document.");
+        return;
+      }
+      const requestKey = documentIdentityKey(requestedIdentity);
+      const attempt = previewMachine.attempt + 1;
+      previewMachine.attempt = attempt;
+      previewMachine.mode = "word";
+      previewMachine.documentKey = requestKey;
+      previewMachine.identityKey = previewIdentityKey(
+        state.preview_identity,
+        state.active_document,
+        state.watch_url
+      );
+      previewMachine.automaticWordView = Boolean(options.automatic);
+      previewMachine.frameUrl = null;
+      clearPreviewTimeout();
+      transitionPreview("word-view-loading", {
+        message: options.reason
+          ? `Live View was unavailable. Rendering Word View: ${options.reason}`
+          : "Rendering an accurate, read-only PDF preview."
+      });
+      state.snapshot_in_progress = true;
+      setRunStatus(state.run_status || "idle");
       try {
-        state.snapshot_in_progress = true;
-        setRunStatus(state.run_status || "idle");
         const result = await api("/snapshot", {
           method: "POST",
           body: "{}"
         });
-        const snapshotUrl = new URL(result.url || "/snapshot.pdf", window.location.origin);
+        const activeIdentity = currentDocumentIdentity();
+        if (
+          previewMachine.attempt !== attempt ||
+          !sameDocumentIdentity(requestedIdentity, activeIdentity)
+        ) {
+          return;
+        }
+        if (
+          String(result.document_id || "") !== requestedIdentity.documentId ||
+          Number(result.document_revision || 0) !== requestedIdentity.revision
+        ) {
+          throw new Error(
+            "Word View finished for an older document revision. Retry."
+          );
+        }
+        const snapshotUrl = new URL(
+          result.url || "/snapshot.pdf",
+          window.location.origin
+        );
         snapshotUrl.searchParams.set("s", SESSION_ID);
         snapshotUrl.searchParams.set("token", TOKEN);
-        snapshotUrl.searchParams.set("v", Date.now().toString());
-        const target = `${snapshotUrl.pathname}${snapshotUrl.search}`;
-        if (popup) popup.location.replace(target);
-        else window.open(target, "_blank");
+        if (result.cache_key) {
+          snapshotUrl.searchParams.set("cache", String(result.cache_key));
+        }
+        previewMachine.frameUrl = snapshotUrl.href;
+        loadedPreviewKey =
+          `word|${requestKey}|${String(result.cache_key || "")}`;
+        clearPreviewTimeout();
+        previewMachine.timeoutId = setTimeout(() => {
+          if (
+            previewMachine.attempt === attempt &&
+            previewMachine.state === "word-view-loading"
+          ) {
+            failWordView(
+              "Word View did not finish loading before the safety timeout."
+            );
+          }
+        }, WORD_VIEW_READY_TIMEOUT_MS);
+        elements.preview.src = snapshotUrl.href;
       } catch (error) {
-        if (popup) popup.close();
-        showToast(error.message);
+        if (
+          previewMachine.attempt === attempt &&
+          sameDocumentIdentity(requestedIdentity, currentDocumentIdentity())
+        ) {
+          failWordView(error.message);
+        }
       } finally {
-        state.snapshot_in_progress = false;
-        setRunStatus(state.run_status || "idle");
+        if (sameDocumentIdentity(requestedIdentity, currentDocumentIdentity())) {
+          state.snapshot_in_progress = false;
+          setRunStatus(state.run_status || "idle");
+        }
+      }
+    }
+
+    function handlePreviewFrameLoad() {
+      const expectedUrl = previewMachine.frameUrl;
+      if (!expectedUrl || elements.preview.src !== expectedUrl) return;
+      if (previewMachine.state === "word-view-loading") {
+        let errorText = "";
+        try {
+          const contentType =
+            elements.preview.contentDocument?.contentType || "";
+          const text =
+            elements.preview.contentDocument?.body?.innerText?.trim() || "";
+          if (/json/i.test(contentType) || /^\{\s*"error"/i.test(text)) {
+            errorText = text;
+          }
+        } catch (_) {}
+        if (errorText) {
+          failWordView(`Word View could not be displayed: ${errorText}`);
+          return;
+        }
+        transitionPreview("word-view");
+        return;
+      }
+      if (previewMachine.state !== "loading") return;
+      requestAnimationFrame(() => {
+        if (
+          previewMachine.state !== "loading" ||
+          elements.preview.src !== expectedUrl
+        ) {
+          return;
+        }
+        try {
+          const frameDocument = elements.preview.contentDocument;
+          const contentType = frameDocument?.contentType || "";
+          const text = frameDocument?.body?.innerText?.trim() || "";
+          const hasMarker = Boolean(
+            frameDocument?.getElementById("ogent-preview-fingerprint")
+          );
+          if (
+            !hasMarker &&
+            (/json/i.test(contentType) || /^\{\s*"error"/i.test(text))
+          ) {
+            failLivePreview(
+              `Live View could not attach to this workspace: ${text}`
+            );
+          }
+        } catch (_) {}
+      });
+    }
+
+    function handlePreviewFrameError() {
+      if (previewMachine.mode === "word") {
+        failWordView("The browser could not display the generated Word View.");
+      } else {
+        failLivePreview("The browser could not load Live View.");
       }
     }
 
@@ -8886,13 +9933,16 @@ HTML_TEMPLATE = r"""<!doctype html>
           result.watch_generation || state.watch_generation;
         state.preview_identity =
           result.preview_identity || state.preview_identity;
+        connectEventStream({ force: true });
         setPreview(
           state.active_document,
           state.watch_url,
-          state.preview_identity
+          state.preview_identity,
+          { force: true }
         );
       } catch (error) {
         state.watch_alive = false;
+        failLivePreview(error.message);
         showToast(error.message);
       } finally {
         repairing = false;
@@ -9002,7 +10052,15 @@ HTML_TEMPLATE = r"""<!doctype html>
     });
     elements.send.addEventListener("click", sendMessage);
     elements.stop.addEventListener("click", stopRun);
-    elements.wordView.addEventListener("click", openWordView);
+    elements.wordView.addEventListener(
+      "click",
+      () => openWordView({ automatic: false })
+    );
+    elements.previewWord.addEventListener(
+      "click",
+      () => openWordView({ automatic: false })
+    );
+    elements.previewRetry.addEventListener("click", repairWatch);
     elements.multiSelect.addEventListener("click", () => {
       toggleMultiSelectMode().catch(error => showToast(error.message));
     });
@@ -9029,7 +10087,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       () => refreshAgentCapabilities(elements.provider.value || null)
     );
     elements.reload.addEventListener("click", repairWatch);
-    elements.preview.addEventListener("error", repairWatch);
+    elements.preview.addEventListener("load", handlePreviewFrameLoad);
+    elements.preview.addEventListener("error", handlePreviewFrameError);
     elements.recent.addEventListener("change", () => {
       if (elements.recent.value) elements.path.value = elements.recent.value;
     });
@@ -9075,7 +10134,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     function announceClose() {
       if (closeSent) return;
       closeSent = true;
-      eventSource.close();
+      if (eventSource) eventSource.close();
       const url =
          `/session/close?s=${encodeURIComponent(SESSION_ID)}` +
         `&token=${encodeURIComponent(TOKEN)}` +
@@ -9452,9 +10511,27 @@ class OgentHandler(BaseHTTPRequestHandler):
                     or session.watch_generation != generation
                     or session.watch_port is None
                 ):
+                    backend_log(
+                        "preview_proxy_rejected",
+                        session_id=session.session_id,
+                        client_id=client_id,
+                        requested_document_id=document_id,
+                        active_document_id=session.document_id,
+                        requested_generation=generation,
+                        active_generation=session.watch_generation,
+                        reason="stale_preview_identity",
+                    )
                     raise UserFacingError("That preview link is stale.", 409)
                 if register and not channel:
                     if session.sse_client_refs.get(client_id, 0) <= 0:
+                        backend_log(
+                            "preview_proxy_rejected",
+                            session_id=session.session_id,
+                            client_id=client_id,
+                            document_id=document_id,
+                            watch_generation=generation,
+                            reason="event_stream_not_registered",
+                        )
                         raise PreviewSyncError(
                             "The preview client is not attached to this "
                             "document workspace."
@@ -9977,13 +11054,34 @@ class OgentHandler(BaseHTTPRequestHandler):
                 session = STATE.get_session(self._session_id_from_query(parsed))
                 with session.lock:
                     snapshot_path = session.snapshot_path
-                session_root = WORK_ROOT / session.session_id
+                    snapshot_document_id = session.snapshot_document_id
+                    snapshot_document_revision = (
+                        session.snapshot_document_revision
+                    )
+                    snapshot_package_sha256 = (
+                        session.snapshot_package_sha256
+                    )
+                    active_document = session.active_doc
+                    document_id = session.document_id
+                    document_revision = session.document_revision
+                snapshot_root = WORK_ROOT / session.session_id / "word-view"
                 if (
                     snapshot_path is None
-                    or not snapshot_path.is_file()
-                    or not path_is_within(snapshot_path, session_root)
+                    or not valid_pdf_file(snapshot_path)
+                    or not path_is_within(snapshot_path, snapshot_root)
+                    or active_document is None
+                    or snapshot_document_id != document_id
+                    or snapshot_document_revision != document_revision
+                    or not snapshot_package_sha256
                 ):
                     raise UserFacingError("No Word view is ready for this session.", 404)
+                if package_sha256(active_document) != snapshot_package_sha256:
+                    with session.lock:
+                        invalidate_word_snapshot_locked(session)
+                    raise UserFacingError(
+                        "The document changed after Word View was generated. Retry.",
+                        409,
+                    )
                 self._send_bytes(
                     200,
                     snapshot_path.read_bytes(),
@@ -10135,6 +11233,23 @@ class OgentHandler(BaseHTTPRequestHandler):
                 if created_for_open and result.get("action") == "focus_session":
                     close_session(session)
                 self._send_json(200, result)
+                return
+            if parsed.path == "/preview/status":
+                payload = self._read_json()
+                client_id = self.headers.get("X-Ogent-Client", "").strip()
+                if not PREVIEW_CLIENT_ID_PATTERN.fullmatch(client_id):
+                    raise UserFacingError(
+                        "Invalid browser client identity.",
+                        400,
+                    )
+                self._send_json(
+                    200,
+                    record_preview_client_status(
+                        session,
+                        client_id,
+                        payload,
+                    ),
+                )
                 return
             if parsed.path == "/session/focus":
                 self._read_json()
@@ -10418,11 +11533,20 @@ class OgentHandler(BaseHTTPRequestHandler):
             if parsed.path == "/snapshot":
                 self._read_json()
                 generate_word_snapshot(session)
+                with session.lock:
+                    cache_key = session.snapshot_cache_key
+                    document_id = session.snapshot_document_id
+                    document_revision = session.snapshot_document_revision
+                    package_fingerprint = session.snapshot_package_sha256
                 self._send_json(
                     200,
                     {
                         "url": f"/snapshot.pdf?s={session.session_id}",
                         "session_id": session.session_id,
+                        "cache_key": cache_key,
+                        "document_id": document_id,
+                        "document_revision": document_revision,
+                        "package_sha256": package_fingerprint,
                     },
                 )
                 return
