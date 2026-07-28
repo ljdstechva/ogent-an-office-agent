@@ -47,7 +47,10 @@ jobs:
           ogent-lite\ogent.py
           ogent-lite\ogent_agent_catalog.py
           ogent-lite\ogent_agent_providers.py
+          ogent-lite\ogent_officecli_mcp.py
+          ogent-lite\ogent_preview_selection.py
           ogent-lite\ogent_references.py
+          ogent-lite\ogent_selection_focus.py
 
       - name: Run Ruff
         run: >-
@@ -55,7 +58,10 @@ jobs:
           ogent-lite\ogent.py
           ogent-lite\ogent_agent_catalog.py
           ogent-lite\ogent_agent_providers.py
+          ogent-lite\ogent_officecli_mcp.py
+          ogent-lite\ogent_preview_selection.py
           ogent-lite\ogent_references.py
+          ogent-lite\ogent_selection_focus.py
           ogent-lite\tests
 
       - name: Check whitespace

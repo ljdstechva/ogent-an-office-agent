@@ -70,6 +70,17 @@ DOCUMENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CHANNEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,160}$")
 WATCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
+DOCUMENT_MUTATION_ACTIONS = frozenset(
+    {
+        "add",
+        "doc-switched",
+        "excel-patch",
+        "full",
+        "remove",
+        "replace",
+        "word-patch",
+    }
+)
 
 
 class PreviewSelectionError(RuntimeError):
@@ -220,6 +231,7 @@ class PreviewSelectionTarget:
     document_name: str
     document_format: str
     path: str
+    watch_path: str
     kind: str
     label: str
     order: int
@@ -228,7 +240,7 @@ class PreviewSelectionTarget:
     revision: int
     selected_at: str
     excerpt: str
-    text_range_anchor: dict[str, int] | None = None
+    text_range_anchor: dict[str, Any] | None = None
     stale: bool = False
 
     def to_dict(self, *, include_excerpt: bool = True) -> dict[str, Any]:
@@ -500,6 +512,7 @@ class PreviewSelectionState:
                     document_name=self.document_name,
                     document_format=self.document_format,
                     path=canonical_path,
+                    watch_path=requested_path,
                     kind=kind,
                     label=_target_label(
                         self.document_format,
@@ -763,7 +776,7 @@ class OfficeCLISelectionBroker:
                     self.on_selection(normalized)
             return
         if (
-            payload.get("action") not in {"mark-update"}
+            payload.get("action") in DOCUMENT_MUTATION_ACTIONS
             and self.on_document_event is not None
         ):
             self.on_document_event(payload)

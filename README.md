@@ -12,9 +12,11 @@ beside a Codex or Claude Code chat and runs on `127.0.0.1`. Files opened by
 local path are edited directly after Ogent creates and verifies a physical
 recovery backup. Browser uploads and PDFs remain copy-based.
 
-The current app is **Ogent Lite 0.10.0**. It uses the selected CLI's existing
+This source tree is **Ogent Lite 0.10.1**. It uses the selected CLI's existing
 sign-in and never asks you to enter an OpenAI or Anthropic API key. Ogent is
-open source under the [MIT License](LICENSE).
+open source under the [MIT License](LICENSE). See the
+[v0.10.1 release notes](ogent-lite/RELEASE-NOTES-v0.10.1.md) for the stable
+preview, submitted-selection behavior, and temporary OfficeCLI dependency.
 
 ## Install Ogent
 
@@ -24,7 +26,7 @@ Copy and paste this one sentence into Codex or another local AI agent that can
 run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; preserve unrelated files and reuse compatible tools already installed; install or update Git, Python 3, OfficeCLI 1.0.142 or later, and at least one supported agent CLI—OpenAI Codex CLI, Anthropic Claude Code, or both—only from official sources; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete unavoidable Windows elevation or interactive provider sign-in without asking me to paste secrets into chat; verify py -3, git, officecli, and every installed agent CLI; discover the live models and effort choices for my signed-in account instead of hard-coding names; register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut, launch Ogent, and verify that health reports version 0.10.0; exercise direct local DOCX/XLSX/PPTX edits and confirm each recovery backup matches the pre-edit hash; confirm browser uploads and PDF edits remain copy-based; verify provider-neutral Codex/Claude memory, focused preview selections, run status icons, Settings recovery controls, a 20-attachment Send followed by retained cross-provider use, Stop, tab cleanup, and right-click integration; validate every edited Office file with OfficeCLI and report measured performance, security checks, remaining limitations, and exact paths without pushing unless I explicitly request it.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; preserve unrelated files and reuse compatible tools already installed; install or update Git, Python 3, and at least one supported agent CLI—OpenAI Codex CLI, Anthropic Claude Code, or both—only from official sources; install OfficeCLI 1.0.143 or later, using the checksum-verified Ogent viewer fork prerelease documented below only while the compatible upstream release is unavailable; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete unavoidable Windows elevation or interactive provider sign-in without asking me to paste secrets into chat; verify py -3, git, officecli, and every installed agent CLI; discover the live models and effort choices for my signed-in account instead of hard-coding names; register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut, launch Ogent, and verify that health reports version 0.10.1; exercise direct local DOCX/XLSX/PPTX edits and confirm each recovery backup matches the pre-edit hash; confirm normal completion, error, and Stop do not reload or reset the live preview; click submitted selection tags and verify that each exact target centers with a temporary gold highlight without changing the Office package or composer selection; confirm browser uploads and PDF edits remain copy-based; verify provider-neutral Codex/Claude memory, run status icons, Settings recovery controls, a 20-attachment Send followed by retained cross-provider use, Stop, tab cleanup, and right-click integration; validate every edited Office file with OfficeCLI and report measured performance, security checks, remaining limitations, and exact paths without pushing unless I explicitly request it.
 ```
 
 The prompt deliberately leaves sign-in and elevation with the human and never
@@ -85,6 +87,37 @@ asks for a password, token, or API key.
    irm https://d.officecli.ai/install.ps1 | iex
    officecli --version
    ```
+
+   Ogent 0.10.1 requires OfficeCLI 1.0.143 or later. If the official installer
+   still reports an older version, Windows x64 users can install the temporary,
+   public [1.0.143 Ogent viewer preview fork prerelease](https://github.com/ljdstechva/OfficeCLI/releases/tag/v1.0.143-ogent-preview):
+
+   ```powershell
+   $officeCliUri = 'https://github.com/ljdstechva/OfficeCLI/releases/download/v1.0.143-ogent-preview/officecli-win-x64.exe'
+   $officeCliDownload = Join-Path $env:TEMP 'officecli-win-x64.exe'
+   Invoke-WebRequest $officeCliUri -OutFile $officeCliDownload
+   $expected = 'F32C6AF1B1AA1ACC70E4128B5E0BED9CA3EF01565DD986DCFD23E704FB0AE6E1'
+   if ((Get-FileHash $officeCliDownload -Algorithm SHA256).Hash -ne $expected) {
+       throw 'OfficeCLI SHA-256 verification failed.'
+   }
+   $officeCliDir = Join-Path $env:LOCALAPPDATA 'OfficeCLI'
+   $officeCliExe = Join-Path $officeCliDir 'officecli.exe'
+   New-Item -ItemType Directory -Force $officeCliDir | Out-Null
+   if (Test-Path $officeCliExe) {
+       Copy-Item $officeCliExe "${officeCliExe}.pre-ogent-preview" -Force
+   }
+   Copy-Item $officeCliDownload $officeCliExe -Force
+   & $officeCliExe --version
+   ```
+
+   The release publishes `SHA256SUMS` and was built by public GitHub Actions.
+   Its clean viewer patch is under review in
+   [upstream PR #268](https://github.com/iOfficeAI/OfficeCLI/pull/268).
+   The fork's macOS assets are unsigned and unnotarized; the verified Ogent
+   installation uses the Windows x64 asset. The viewer contract supplies the
+   semantic viewport anchor and public `watch goto`/exact-mark cleanup commands.
+   Ogent checks the version before starting a watch and fails closed on older
+   builds.
 
 6. Register **Open in Ogent** for your Windows account and launch the app:
 
@@ -154,6 +187,13 @@ Ogent with that file immediately.
    on-demand PDF rendered by Microsoft Word. The normal live preview stays
    faster and editable; Word view is the layout-accurate verification surface.
 
+Normal run completion, provider error, and Stop update status without navigating
+the preview iframe. The latest position you manually chose while the agent was
+working therefore remains authoritative, while OfficeCLI's live event stream
+updates the document in place. Opening another document, explicitly repairing a
+dead preview, or restarting its watch is a genuine identity change and may
+perform one required iframe navigation.
+
 The run-status icon beside each submitted turn distinguishes **working**,
 **completed**, **error**, and **stopped** outcomes. Agent Activity also records
 the provider, model, effort, major preparation phases, OfficeCLI calls, and
@@ -166,8 +206,28 @@ range to add a focused target chip above the composer. Turn on multi-select to
 keep as many as 20 targets. Ogent resolves labels and excerpts again on the
 server; it does not trust preview-supplied HTML or text. A submitted selection
 is frozen into that chat turn, survives provider/model switching, and is
-cleared from the composer. If the document changes first, the chip becomes
-stale and Send fails closed until you select the current revision.
+cleared from the composer. Its tag under the submitted user message is a
+button: click it (or focus it and press Enter or Space) to center the exact
+current Word text, Excel cell/range, or PowerPoint shape/slide and show a
+temporary gold viewer-only highlight. This does not reload the iframe, edit the
+Office package, change the current composer selection, submit a new message, or
+alter chat memory. Multiple tags replay independently.
+
+Navigation is isolated by Ogent document session because every session owns a
+separate OfficeCLI watch. OfficeCLI currently broadcasts `watch goto` to every
+browser viewer attached to that same watch, however, so two tabs displaying the
+same Ogent session will move together when either tab clicks a historical tag.
+The current watch protocol has no client-scoped focus channel.
+
+Ogent resolves historical targets only from the trusted selection snapshot in
+its own session memory. If a target moved, it permits only one conservative,
+unambiguous relocation; otherwise it reports that the section moved or was
+removed and asks you to select it again. Current composer selection remains
+teal, so it is visually distinct from historical gold focus. A composer chip
+from an older revision still blocks Send until you reselect current content.
+Excel ranges of at most 100 cells receive cell-by-cell viewer marks. For a
+larger range, Ogent centers and highlights only its primary top-left cell to
+keep the operation bounded.
 
 ### Choose an agent, model, and effort
 
@@ -375,40 +435,54 @@ Browser UI (127.0.0.1) -> Ogent session memory -> fresh selected agent CLI
   MCP configuration, no session persistence, and only the document gateway
   and/or read-only run-reference access needed for that turn.
 - OfficeCLI performs and validates the actual Office-file changes.
+- Preview navigation identity is the Ogent session, logical document, watch
+  port, and watch generation—not the document revision. OfficeCLI's live
+  renderer preserves the newest semantic Word/Excel/PowerPoint viewport anchor.
+- Historical selection focus accepts only a submitted message sequence and
+  selection ID from the browser. The server revalidates canonical session
+  memory and invokes public OfficeCLI commands as argument arrays without a
+  shell.
 - AionUi is optional. The earlier AionUi workflow remains documented in
   [AIONUI-WORKFLOW.md](AIONUI-WORKFLOW.md), but it is not required to run the
   Ogent app.
 
-## Verified v0.10.0 workstation (2026-07-27)
+## Verified v0.10.1 release (2026-07-28)
 
 - Windows 11
-- Ogent Lite 0.10.0
+- Ogent Lite 0.10.1
 - Python 3.14.3 with pypdfium2 5.12.1 and Pillow 12.1.1
-- OfficeCLI 1.0.142
+- Public OfficeCLI 1.0.143-ogent-preview Windows x64 fork prerelease
 - Codex CLI 0.145.0
 - Claude Code 2.1.220
 - Live, zero-inference CLI capability discovery for both installed providers
 - Native Microsoft Word, Excel, and PowerPoint rendering
 
-Automated coverage passed with 137 tests and 46 subtests on the exact release
-build. Live checks covered direct Word/Excel/PowerPoint edits with unchanged
-backups, protected PDF conversion/editing, provider-neutral Codex -> Claude ->
-Codex memory, 20 retained attachments plus a second batch, preview-selection
-protocol cases, and fail-closed gateway/security paths. The controlled
-simple-edit medians improved from 142.228 s to 48.393 s for Codex and from
-47.306 s to 21.501 s for Claude.
+Automated coverage passed with 148 test methods and 56 executed subtests. Real Codex
+`gpt-5.6-sol` edits in synthetic Word, Excel, and PowerPoint files retained the
+latest manually chosen viewport with zero iframe load events. Submitted
+selection buttons centered their exact targets at 49-51% of preview height,
+showed a gold viewer-only mark, and preserved composer selection, draft text,
+transcript, and provider-neutral memory. OfficeCLI validation returned zero
+errors for all three edited files, and each recovery backup matched its
+pre-edit SHA-256.
 
-The final responsive gate used real Chromium through the project-approved
-Playwright fallback after the in-app browser returned no available binding.
-All ten 1440x900 and 390x844 screenshots were inspected. Version identity,
-recovery and memory settings, attachment and two-target selection context,
-working/completed/stopped/error states, responsive Office page scaling, and
-mobile transcript/composer separation passed with no unexpected console, page,
-HTTP, or request failures. The real Codex `gpt-5.6-sol` selected-text edit
-changed only the two target paragraphs; its physical recovery backup matched
-the pre-edit SHA-256 exactly. See
+The responsive gate used headed Microsoft Edge through the project-approved
+Playwright fallback after the in-app browser reported `No browser is
+available`. Both 1440x900 and 390x844 passed with no horizontal page overflow
+or transcript/composer overlap. Hover, keyboard focus, loading, empty,
+completed, stopped, and controlled-error states were exercised; the current
+console was clean and the only HTTP conflict was the intentional
+cross-document selection rejection. See
 [ogent-lite/OGENT-REPORT.md](ogent-lite/OGENT-REPORT.md) for the detailed
 evidence.
+
+The required viewer is temporarily supplied by the checksum-verified public
+fork prerelease above while [upstream PR #268](https://github.com/iOfficeAI/OfficeCLI/pull/268)
+is reviewed. Fresh acceptance against the downloaded release asset preserved
+all three format viewports exactly, centered the Word, Excel, and PowerPoint
+historical targets at `50.05%`, `(49.11%,50.49%)`, and `49.96%`, and left the
+three Office package hashes unchanged during mark/navigation operations.
+
 The repository's 13 original Office test artifacts also pass OpenXML validation;
 see [TEST-REPORT.md](TEST-REPORT.md).
 
@@ -522,7 +596,7 @@ for the complete agent workflow.
 
 ## Visio note
 
-OfficeCLI 1.0.142 or later is required for Ogent v0.10. It supports `.docx`,
+OfficeCLI 1.0.143 or later is required for Ogent v0.10.1. It supports `.docx`,
 `.xlsx`, and `.pptx`, but not `.vsdx`. Ogent demonstrates a native editable
 Word drawing as the current alternative. A future OfficeCLI format-handler
 plugin or a separate Python `vsdx` workflow could add real Visio output.

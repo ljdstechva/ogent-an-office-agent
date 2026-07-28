@@ -93,6 +93,7 @@ class PreviewSelectionTests(unittest.TestCase):
             targets[0].excerpt,
             "Server excerpt for /body/p[1]",
         )
+        self.assertEqual(targets[0].watch_path, "/body/p[1]")
         self.assertNotIn("FORGED", targets[0].excerpt)
         self.assertTrue(targets[0].primary)
 
@@ -276,6 +277,8 @@ class PreviewSelectionTests(unittest.TestCase):
             )
         )
         broker._dispatch(json.dumps({"action": "mark-update", "marks": []}))
+        broker._dispatch(json.dumps({"action": "scroll", "scrollTo": "#target"}))
+        broker._dispatch(json.dumps({"action": "error", "message": "ignored"}))
         broker._dispatch(json.dumps({"action": "replace", "html": "ignored"}))
         broker._dispatch("not json")
 

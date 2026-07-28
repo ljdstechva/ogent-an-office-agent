@@ -4,7 +4,7 @@
 
 # Ogent Lite
 
-Ogent Lite 0.10.0 is a featherweight, local document workspace: OfficeCLI keeps a
+Ogent Lite 0.10.1 is a featherweight, local document workspace: OfficeCLI keeps a
 live Word, Excel, or PowerPoint preview on the left, while either Codex or
 Claude Code handles plain-language editing requests in the chat pane on the
 right.
@@ -19,7 +19,9 @@ Composer attachments follow a retained, read-only session lifecycle and never
 become active documents.
 
 For the AI-agent installation sentence and complete human setup, see the
-[repository README](../README.md).
+[repository README](../README.md). Release details and the temporary verified
+OfficeCLI fork dependency are in
+[RELEASE-NOTES-v0.10.1.md](RELEASE-NOTES-v0.10.1.md).
 
 ## Start and stop
 
@@ -98,11 +100,47 @@ an older icon, run `ie4uinit.exe -show` or restart Explorer to refresh its cache
    are Word paragraphs/table cells, PowerPoint shapes, and Excel cells/ranges.
    Multi-select retains up to 20 targets. A document revision makes old targets
    visibly stale and blocks Send.
+8. After Send, each frozen selection tag under that user message is clickable.
+   It centers the exact current target and adds a temporary gold viewer-only
+   highlight without changing the current composer selection or Office file.
 
 The per-turn icon distinguishes **working**, **completed**, **error**, and
 **stopped**. Agent Activity shows provider/model/effort, preparation and tool
 phases, OfficeCLI call counts, and elapsed time. The gear opens recovery,
 retention, and session-memory settings.
+
+## Stable preview and submitted selection links
+
+Normal completion, provider error, and Stop never reload the preview merely
+because the document revision or run status changed. Ogent keys iframe
+navigation to the session, logical document, watch port, and watch generation.
+OfficeCLI updates content through its live event stream and restores the newest
+semantic Word, Excel, or PowerPoint viewport anchor. A new document, an explicit
+preview repair, or a genuine watch restart may perform one required navigation.
+
+Submitted selection cards are accessible buttons. Mouse, touch, Enter, and
+Space replay each tag independently. Ogent accepts only that submitted
+message's sequence and selection ID from the browser, resolves the canonical
+snapshot from its own session memory, revalidates the current OfficeCLI target,
+and invokes OfficeCLI with argument arrays rather than a shell. The target
+finishes in the central portion of the preview with a temporary gold highlight;
+current composer selection remains teal.
+
+Historical navigation does not reload the iframe, mutate the Office package,
+change composer chips or draft text, start an agent, submit a chat turn, or
+alter provider-neutral memory. When an exact target no longer resolves, Ogent
+allows only a unique conservative relocation. A missing or ambiguous target
+fails closed with a prompt to select it again.
+
+Each Ogent document session has its own watch, so historical focus cannot move
+an unrelated document session. OfficeCLI's current navigation event is
+watch-scoped rather than browser-client-scoped: if two tabs display the same
+Ogent session/watch, both viewers center the clicked target. No supported
+client-scoped focus channel is available yet.
+
+Excel ranges of at most 100 cells receive cell-by-cell gold viewer marks. For a
+larger range, Ogent centers and highlights only the primary top-left cell so
+historical navigation cannot spawn an unbounded number of OfficeCLI commands.
 
 For PDFs, drag the PDF into Ogent or start with “Edit my PDF,” then paste its
 absolute path. Ogent copies the PDF, converts the copy to a working DOCX through
@@ -212,7 +250,7 @@ Composer attachments are not written to recents or the active-document index.
 ## Requirements
 
 - Windows 11 with Python 3 (`py -3 --version`)
-- OfficeCLI 1.0.142 or later (`officecli --version`)
+- OfficeCLI 1.0.143 or later (`officecli --version`)
 - At least one supported agent CLI, installed and signed in:
   - Codex: `codex --version` and `codex login status`
   - Claude Code: `claude --version` and `claude auth status --json`
@@ -224,6 +262,16 @@ Composer attachments are not written to recents or the active-document index.
 
   The tested pins are pypdfium2 5.12.1 for PDF inspection/rendering and
   Pillow 12.1.1 for image validation/normalization.
+
+OfficeCLI 1.0.143 supplies the semantic viewport-preservation and public
+`watch goto`/exact-mark cleanup commands required by this release. Ogent checks
+the installed version before starting a watch and reports an actionable error
+instead of silently running with an incompatible viewer.
+
+Until the compatible change is available upstream, use the checksum-verified
+[OfficeCLI 1.0.143 Ogent viewer preview fork prerelease](https://github.com/ljdstechva/OfficeCLI/releases/tag/v1.0.143-ogent-preview)
+documented in the [repository install steps](../README.md#option-2--human-install-on-windows).
+The clean patch is proposed in [upstream PR #268](https://github.com/iOfficeAI/OfficeCLI/pull/268).
 
 ## Agents, models, and effort
 
@@ -286,6 +334,8 @@ dot in `#14b8a6`.
 |---|---|
 | Preferred port 8765 is busy | Ogent automatically tries 8766 and higher. Launch again and use the browser page it opens. |
 | Preview says reconnecting | Click the reload icon. Ogent also restarts the OfficeCLI watch before the next chat run. |
+| Ogent says OfficeCLI 1.0.143 is required | Install a compatible upstream 1.0.143-or-later release or the checksum-verified temporary fork prerelease linked above, verify `officecli --version`, then restart Ogent. |
+| A submitted selection says it moved or was removed | Select the current document content again. Ogent rejects missing, cross-document, and ambiguous historical targets instead of guessing. |
 | Codex is not logged in | Run `codex login`, then click the agent refresh button. |
 | Claude Code is not logged in | Run `claude auth login`, then click the agent refresh button. |
 | Models are unavailable | Confirm the selected CLI's version and auth-status commands work, then refresh. Choices are account- and CLI-specific. |
@@ -320,6 +370,9 @@ dot in `#14b8a6`.
   non-resumable and documents remain session-isolated.
 - Focused selection supports Excel cells/ranges, Word paragraphs/table cells,
   and PowerPoint shapes. Unsupported or stale paths fail closed.
+- Submitted historical focus is viewer-only. It uses one Ogent-owned gold mark,
+  preserves unrelated/current selection marks, and never writes highlight
+  formatting into the Office package.
 - Recovery backups expire at the first cleanup at or after exactly 30 days.
 - PDF editing happens in a converted DOCX, never in the PDF itself.
 - Word view currently supports DOCX only and requires Microsoft Word.

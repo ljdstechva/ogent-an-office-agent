@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.10.1"
 MAX_COMMAND_CHARACTERS = 256 * 1024
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)

@@ -69,6 +69,15 @@ from ogent_preview_selection import (  # noqa: E402
     PreviewSelectionState,
     post_watch_selection,
 )
+from ogent_selection_focus import (  # noqa: E402
+    HistoricalFocusError,
+    HistoricalFocusState,
+    focus_historical_target,
+    package_sha256,
+    resolve_current_target,
+    resolve_memory_selection,
+    validate_focus_payload,
+)
 from ogent_retained_attachments import (  # noqa: E402
     RetainedAttachmentError,
     RetainedAttachmentStore,
@@ -96,7 +105,9 @@ from ogent_agent_providers import (  # noqa: E402
 )
 
 APP_NAME = "Ogent Lite"
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.10.1"
+MIN_OFFICECLI_VERSION = (1, 0, 143)
+MIN_OFFICECLI_VERSION_TEXT = ".".join(str(item) for item in MIN_OFFICECLI_VERSION)
 HOST = "127.0.0.1"
 BASE_PORT = 8765
 WATCH_PORT_FIRST = 26320
@@ -147,6 +158,9 @@ BACKUP_STORE = BackupStore(BACKUP_ROOT, application_version=APP_VERSION)
 SESSION_MEMORY_STORE = SessionMemoryStore(SESSION_MEMORY_ROOT)
 SERVICE_INITIALIZATION_LOCK = threading.RLock()
 SERVICES_INITIALIZED = False
+OFFICECLI_RUNTIME_LOCK = threading.RLock()
+OFFICECLI_RUNTIME_VERSION: tuple[int, int, int] | None = None
+OFFICECLI_RUNTIME_VERSION_TEXT: str | None = None
 
 
 def initialize_owned_stores() -> None:
@@ -334,6 +348,47 @@ def run_quiet(
     )
 
 
+def ensure_officecli_compatible() -> str:
+    """Fail closed before starting a watch with an incompatible renderer."""
+    global OFFICECLI_RUNTIME_VERSION, OFFICECLI_RUNTIME_VERSION_TEXT
+    with OFFICECLI_RUNTIME_LOCK:
+        if (
+            OFFICECLI_RUNTIME_VERSION is not None
+            and OFFICECLI_RUNTIME_VERSION_TEXT is not None
+        ):
+            return OFFICECLI_RUNTIME_VERSION_TEXT
+        try:
+            result = run_quiet(["officecli", "--version"], timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise UserFacingError(
+                f"OfficeCLI {MIN_OFFICECLI_VERSION_TEXT} or later is required.",
+                503,
+            ) from exc
+        output = "\n".join(
+            item.strip()
+            for item in (result.stdout, result.stderr)
+            if item and item.strip()
+        )
+        match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", output)
+        if result.returncode != 0 or match is None:
+            raise UserFacingError(
+                "Ogent could not verify the installed OfficeCLI version. "
+                f"Install OfficeCLI {MIN_OFFICECLI_VERSION_TEXT} or later.",
+                503,
+            )
+        version = tuple(int(match.group(index)) for index in range(1, 4))
+        if version < MIN_OFFICECLI_VERSION:
+            raise UserFacingError(
+                f"OfficeCLI {MIN_OFFICECLI_VERSION_TEXT} or later is required "
+                f"for stable preview position and historical selection links; "
+                f"found {match.group(0)}.",
+                503,
+            )
+        OFFICECLI_RUNTIME_VERSION = version
+        OFFICECLI_RUNTIME_VERSION_TEXT = match.group(0)
+        return OFFICECLI_RUNTIME_VERSION_TEXT
+
+
 def terminate_process_tree(process: subprocess.Popen[str] | None) -> None:
     if process is None or process.poll() is not None:
         return
@@ -406,6 +461,36 @@ def watch_http_alive(port: int | None) -> bool:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
+
+
+def stable_watch_url(
+    port: int | None,
+    watch_generation: str | None,
+) -> str | None:
+    if port is None:
+        return None
+    base = f"http://{HOST}:{int(port)}/"
+    generation = str(watch_generation or "")
+    if re.fullmatch(r"[0-9a-f]{32}", generation):
+        return f"{base}?generation={generation}"
+    return base
+
+
+def preview_identity_public(session: "SessionState") -> dict[str, Any] | None:
+    with session.lock:
+        if (
+            session.active_doc is None
+            or not session.document_id
+            or session.watch_port is None
+            or not session.watch_generation
+        ):
+            return None
+        return {
+            "session_id": session.session_id,
+            "document_id": session.document_id,
+            "watch_port": session.watch_port,
+            "watch_generation": session.watch_generation,
+        }
 
 
 def port_available(port: int) -> bool:
@@ -493,6 +578,8 @@ class SessionState:
         self.opening_source: Path | None = None
         self.watch_process: subprocess.Popen[str] | None = None
         self.watch_port: int | None = None
+        self.watch_generation = ""
+        self.historical_focus = HistoricalFocusState(session_id)
         self.retired_watches: list[
             tuple[Path | None, subprocess.Popen[str] | None, int | None]
         ] = []
@@ -622,13 +709,15 @@ class SessionState:
             active_doc = str(self.active_doc) if self.active_doc else None
             active_source = str(self.active_source) if self.active_source else None
             watch_port = self.watch_port
+            watch_generation = self.watch_generation
             snapshot = {
                 "session_id": self.session_id,
                 "created_at": self.created_at_iso,
                 "active_document": active_doc,
                 "source_document": active_source,
                 "watch_port": watch_port,
-                "watch_url": f"http://{HOST}:{watch_port}/" if watch_port else None,
+                "watch_generation": watch_generation or None,
+                "watch_url": stable_watch_url(watch_port, watch_generation),
                 "run_status": self.run_status,
                 "last_run_outcome": self.last_run_outcome,
                 "run_id": self.run_id,
@@ -674,6 +763,19 @@ class SessionState:
                 if self.last_timing
                 else None,
             }
+            snapshot["preview_identity"] = (
+                {
+                    "session_id": self.session_id,
+                    "document_id": self.document_id,
+                    "watch_port": watch_port,
+                    "watch_generation": watch_generation,
+                }
+                if active_doc
+                and self.document_id
+                and watch_port is not None
+                and watch_generation
+                else None
+            )
         snapshot["watch_alive"] = (
             bool(active_doc) and watch_http_alive(watch_port)
             if include_watch_probe
@@ -960,6 +1062,9 @@ class OgentState:
                 session.document_revision = 0
                 session.recovery_backup = None
                 session.selection_multi_mode = False
+                session.watch_generation = ""
+                session.historical_focus.marks = ()
+                session.historical_focus.selection_id = None
                 session.pending_pdf = False
                 session.snapshot_path = None
                 session.complex_layout = False
@@ -1025,6 +1130,8 @@ class OgentState:
                     document_format=working.suffix,
                     revision=session.document_revision,
                 )
+                session.historical_focus.marks = ()
+                session.historical_focus.selection_id = None
                 if session.memory is not None:
                     session.memory.set_active_document(
                         document_id=session.document_id,
@@ -2157,6 +2264,7 @@ def start_watch(session: SessionState, document: Path) -> None:
     with session.watch_lock:
         if not document.exists():
             raise UserFacingError(f"The working document no longer exists: {document}", 404)
+        ensure_officecli_compatible()
 
         with session.lock:
             previous_document = session.active_doc
@@ -2228,6 +2336,38 @@ def start_watch(session: SessionState, document: Path) -> None:
         )
         reader.start()
 
+        def publish_watch_ready() -> None:
+            generation = uuid.uuid4().hex
+            with session.lock:
+                if session.watch_process is not process or session.closed:
+                    raise UserFacingError(
+                        "The OfficeCLI watch changed before it became ready.",
+                        409,
+                    )
+                session.watch_generation = generation
+                session.historical_focus.marks = ()
+                session.historical_focus.selection_id = None
+                active_document_matches = (
+                    session.active_doc is not None
+                    and session.active_doc.resolve() == document.resolve()
+                )
+            session.emit(
+                "watch",
+                {
+                    "status": "ready",
+                    "port": port,
+                    "document": str(document),
+                    "watch_generation": generation,
+                    "watch_url": stable_watch_url(port, generation),
+                    "preview_identity": (
+                        preview_identity_public(session)
+                        if active_document_matches
+                        else None
+                    ),
+                },
+            )
+            STATE.broadcast_sessions()
+
         deadline = time.monotonic() + 18
         last_line = ""
         while True:
@@ -2259,11 +2399,7 @@ def start_watch(session: SessionState, document: Path) -> None:
                     previous_process,
                     previous_port,
                 )
-                session.emit(
-                    "watch",
-                    {"status": "ready", "port": port, "document": str(document)},
-                )
-                STATE.broadcast_sessions()
+                publish_watch_ready()
                 if same_document:
                     start_selection_broker(
                         session,
@@ -2278,11 +2414,7 @@ def start_watch(session: SessionState, document: Path) -> None:
                 previous_process,
                 previous_port,
             )
-            session.emit(
-                "watch",
-                {"status": "ready", "port": port, "document": str(document)},
-            )
-            STATE.broadcast_sessions()
+            publish_watch_ready()
             if same_document:
                 start_selection_broker(
                     session,
@@ -2527,11 +2659,14 @@ def open_document(
             "session_id": session.session_id,
             "source": str(protected_source),
             "working": str(working),
-            "watch_url": (
-                f"http://{HOST}:{session.watch_port}/"
-                if session.watch_port
-                else None
+            "watch_url": stable_watch_url(
+                session.watch_port,
+                session.watch_generation,
             ),
+            "watch_port": session.watch_port,
+            "watch_generation": session.watch_generation,
+            "document_revision": session.document_revision,
+            "preview_identity": preview_identity_public(session),
             "complex_layout": complex_layout,
             "complex_layout_detail": complex_detail,
             "document_mode": document_mode,
@@ -2553,11 +2688,14 @@ def open_document(
         "session_id": session.session_id,
         "source": str(protected_source),
         "active_document": str(working),
-        "watch_url": (
-            f"http://{HOST}:{session.watch_port}/"
-            if session.watch_port
-            else None
+        "watch_url": stable_watch_url(
+            session.watch_port,
+            session.watch_generation,
         ),
+        "watch_port": session.watch_port,
+        "watch_generation": session.watch_generation,
+        "document_revision": session.document_revision,
+        "preview_identity": preview_identity_public(session),
         "complex_layout": complex_layout,
         "complex_layout_detail": complex_detail,
         "document_mode": document_mode,
@@ -3646,16 +3784,23 @@ def _agent_worker(
             )
         if document is not None:
             ensure_watch(session)
+            with session.lock:
+                watch_port = session.watch_port
+                watch_generation = session.watch_generation
+                document_revision = session.document_revision
             session.emit(
                 "document",
                 {
                     "source": str(source) if source else None,
                     "working": str(document),
-                    "watch_url": (
-                        f"http://{HOST}:{session.watch_port}/?refresh={time.time_ns()}"
-                        if session.watch_port
-                        else None
+                    "watch_url": stable_watch_url(
+                        watch_port,
+                        watch_generation,
                     ),
+                    "watch_port": watch_port,
+                    "watch_generation": watch_generation,
+                    "document_revision": document_revision,
+                    "preview_identity": preview_identity_public(session),
                     "complex_layout": session.complex_layout,
                     "complex_layout_detail": session.complex_layout_detail,
                 },
@@ -4168,6 +4313,123 @@ def accept_postmessage_selection(
     except PreviewSelectionError as exc:
         raise UserFacingError(str(exc), 409) from exc
     emit_preview_selection(session)
+
+
+def focus_submitted_selection(
+    session: SessionState,
+    payload: Any,
+) -> dict[str, Any]:
+    """Resolve a submitted selection from canonical memory and focus its watch target."""
+    with session.watch_lock:
+        return _focus_submitted_selection_locked(session, payload)
+
+
+def _focus_submitted_selection_locked(
+    session: SessionState,
+    payload: Any,
+) -> dict[str, Any]:
+    """Focus one historical target while preview lifecycle changes are excluded."""
+    try:
+        message_sequence, selection_id = validate_focus_payload(payload)
+    except HistoricalFocusError as exc:
+        raise UserFacingError(str(exc), exc.status) from exc
+
+    with session.lock:
+        if session.closed:
+            raise UserFacingError("This Ogent session has closed.", 410)
+        if session.opening_source is not None:
+            raise UserFacingError(
+                "Wait for the Office document to finish opening before focusing history.",
+                409,
+            )
+        if session.run_status in ACTIVE_RUN_STATUSES:
+            raise UserFacingError(
+                "Wait for the active agent run to finish before focusing history.",
+                409,
+            )
+        document = session.active_doc
+        document_id = session.document_id
+        document_revision = session.document_revision
+        watch_port = session.watch_port
+        watch_generation = session.watch_generation
+        memory = session.memory
+    if document is None or not document_id:
+        raise UserFacingError("Open the selection's Office document first.", 409)
+    if watch_port is None or not watch_generation or not watch_http_alive(watch_port):
+        raise UserFacingError(
+            "The live preview is unavailable. Reload it, then try the selection again.",
+            409,
+        )
+
+    try:
+        reference = resolve_memory_selection(
+            memory,
+            expected_session_id=session.session_id,
+            message_sequence=message_sequence,
+            selection_id=selection_id,
+        )
+        if reference.document_id != document_id:
+            raise HistoricalFocusError(
+                "That selection belongs to a different Office document.",
+                409,
+            )
+        if reference.document_format != document.suffix.casefold().lstrip("."):
+            raise HistoricalFocusError(
+                "That selection no longer matches the active Office document.",
+                409,
+            )
+        before_sha256 = package_sha256(document)
+        target = resolve_current_target(
+            run_quiet,
+            document,
+            reference,
+            current_revision=document_revision,
+        )
+        result = focus_historical_target(
+            run_quiet,
+            document,
+            target,
+            session.historical_focus,
+        )
+        after_sha256 = package_sha256(document)
+    except HistoricalFocusError as exc:
+        raise UserFacingError(str(exc), exc.status) from exc
+    except PreviewSelectionError as exc:
+        raise UserFacingError(str(exc), 409) from exc
+    except OSError as exc:
+        raise UserFacingError(
+            "The Office document could not be verified after focusing history.",
+            503,
+        ) from exc
+
+    if after_sha256 != before_sha256:
+        raise UserFacingError(
+            "The Office document changed while the historical selection was focused. "
+            "Try again after editing finishes.",
+            409,
+        )
+    with session.lock:
+        if (
+            session.closed
+            or session.active_doc is None
+            or session.active_doc.resolve() != document.resolve()
+            or session.document_id != document_id
+            or session.document_revision != document_revision
+            or session.watch_port != watch_port
+            or session.watch_generation != watch_generation
+            or session.run_status in ACTIVE_RUN_STATUSES
+        ):
+            raise UserFacingError(
+                "The active document changed while the historical selection was focused.",
+                409,
+            )
+    return {
+        **result.public_state(),
+        "message": f"Focused {result.label}.",
+        "document_revision": document_revision,
+        "document_sha256": after_sha256,
+        "preview_identity": preview_identity_public(session),
+    }
 
 
 def clear_session_memory(session: SessionState) -> dict[str, Any]:
@@ -4877,7 +5139,31 @@ HTML_TEMPLATE = r"""<!doctype html>
     .message-context-card .context-name {
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
-    .message-context-card.selection { border-style: dashed; }
+    .message-context-card.selection {
+      min-height: 36px; appearance: none; border-style: dashed;
+      background: transparent; color: inherit; font: inherit; text-align: left;
+      cursor: pointer; transition: background .14s ease, border-color .14s ease;
+    }
+    .message-context-card.selection .focus-icon {
+      flex: 0 0 auto; opacity: .7; font-size: 11px;
+    }
+    .message-context-card.selection:hover {
+      border-color: currentColor; background: rgba(255,255,255,.1);
+    }
+    .assistant .message-context-card.selection:hover {
+      background: color-mix(in srgb, var(--teal) 9%, var(--panel));
+      border-color: var(--teal); color: var(--teal);
+    }
+    .message-context-card.selection:focus-visible {
+      outline: 2px solid currentColor; outline-offset: 2px;
+    }
+    .message-context-card.selection[aria-busy="true"] {
+      cursor: wait; opacity: .72;
+    }
+    .message-context-card.selection:disabled { cursor: default; }
+    @media (pointer: coarse) {
+      .message-context-card.selection { min-height: 44px; padding: 7px 9px; }
+    }
     .assistant .bubble { background: var(--soft); border: 1px solid var(--line); border-top-left-radius: 4px; }
     .user .bubble { background: var(--navy); color: #fff; border-top-right-radius: 4px; }
     .activity {
@@ -5414,6 +5700,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       session_id: SESSION_ID,
       active_document: null,
       watch_url: null,
+      preview_identity: null,
       run_status: "idle",
       last_run_outcome: "neutral",
       recent: [],
@@ -5437,6 +5724,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     let agentCapabilityBusy = false;
     let effortVerificationKey = null;
     let settingsReturnFocus = null;
+    let loadedPreviewKey = null;
 
     function scopedPath(path) {
       const url = new URL(path, window.location.origin);
@@ -5450,6 +5738,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       if ((options.method || "GET") !== "GET") {
         headers["X-Ogent-Token"] = TOKEN;
         headers["X-Ogent-Session"] = SESSION_ID;
+        headers["X-Ogent-Client"] = CLIENT_ID;
       }
       const response = await fetch(
         scopedPath(path),
@@ -5466,6 +5755,37 @@ HTML_TEMPLATE = r"""<!doctype html>
       elements.toast.classList.add("show");
       clearTimeout(toastTimer);
       toastTimer = setTimeout(() => elements.toast.classList.remove("show"), 3600);
+    }
+
+    async function focusHistoricalSelection(button, message, item) {
+      const messageSequence = Number(message.sequence);
+      const selectionId = String(item.selection_id || "");
+      if (
+        !Number.isSafeInteger(messageSequence) ||
+        messageSequence <= 0 ||
+        !/^[0-9a-f]{32}$/.test(selectionId) ||
+        button.getAttribute("aria-busy") === "true"
+      ) {
+        showToast("That submitted selection is no longer available.");
+        return;
+      }
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      try {
+        const result = await api("/selection/focus", {
+          method: "POST",
+          body: JSON.stringify({
+            message_sequence: messageSequence,
+            selection_id: selectionId
+          })
+        });
+        showToast(result.message || "Focused the submitted selection.");
+      } catch (error) {
+        showToast(error.message);
+      } finally {
+        button.removeAttribute("aria-busy");
+        button.disabled = false;
+      }
     }
 
     function appendMessage(message) {
@@ -5505,16 +5825,38 @@ HTML_TEMPLATE = r"""<!doctype html>
           context.appendChild(card);
         }
         for (const item of selections) {
-          const card = document.createElement("span");
+          const focusable =
+            message.role === "user" &&
+            Number.isSafeInteger(Number(message.sequence)) &&
+            /^[0-9a-f]{32}$/.test(String(item.selection_id || ""));
+          const card = document.createElement(focusable ? "button" : "span");
+          if (focusable) card.type = "button";
           card.className = "message-context-card selection";
-          card.title = `${item.document_name || "Document"} - ${item.path || ""}`;
+          const focusLabel = item.label || item.path || "Selected target";
+          card.title = focusable
+            ? `Focus ${focusLabel} in ${item.document_name || "Document"}`
+            : `${item.document_name || "Document"} - ${item.path || ""}`;
+          if (focusable) {
+            card.setAttribute(
+              "aria-label",
+              `Focus submitted selection: ${focusLabel}`
+            );
+            card.addEventListener(
+              "click",
+              () => focusHistoricalSelection(card, message, item)
+            );
+          }
           const icon = document.createElement("span");
           icon.setAttribute("aria-hidden", "true");
           icon.textContent = selectionIcon(item.kind);
           const label = document.createElement("span");
           label.className = "context-name";
-          label.textContent = item.label || item.path || "Selected target";
-          card.append(icon, label);
+          label.textContent = focusLabel;
+          const focusIcon = document.createElement("span");
+          focusIcon.className = "focus-icon";
+          focusIcon.setAttribute("aria-hidden", "true");
+          focusIcon.textContent = focusable ? "\u2316" : "";
+          card.append(icon, label, focusIcon);
           context.appendChild(card);
         }
         bubble.appendChild(context);
@@ -6209,19 +6551,62 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
     }
 
-    function setPreview(path, url) {
+    function canonicalPreviewUrl(url) {
+      if (!url) return null;
+      try {
+        const value = new URL(url, window.location.href);
+        for (const key of ["v", "refresh", "revision", "cache", "_"]) {
+          value.searchParams.delete(key);
+        }
+        value.searchParams.sort();
+        return value.href;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function previewIdentityKey(identity, path, url) {
+      if (
+        identity &&
+        typeof identity === "object" &&
+        String(identity.session_id || "") &&
+        String(identity.document_id || "") &&
+        Number.isInteger(Number(identity.watch_port)) &&
+        /^[0-9a-f]{32}$/.test(String(identity.watch_generation || ""))
+      ) {
+        return [
+          "identity",
+          identity.session_id,
+          identity.document_id,
+          Number(identity.watch_port),
+          identity.watch_generation
+        ].join("|");
+      }
+      const stableUrl = canonicalPreviewUrl(url);
+      return path && stableUrl ? `fallback|${path}|${stableUrl}` : null;
+    }
+
+    function setPreview(path, url, identity = null) {
       if (!path) {
         elements.preview.style.display = "none";
         elements.empty.style.display = "block";
         elements.documentName.textContent = "No document open";
+        if (loadedPreviewKey !== null || elements.preview.hasAttribute("src")) {
+          elements.preview.removeAttribute("src");
+          loadedPreviewKey = null;
+        }
         renderDocumentControls();
         return;
       }
       elements.empty.style.display = "none";
       elements.preview.style.display = "block";
       elements.documentName.textContent = path.split(/[\\/]/).pop() || path;
-      const target = url || state.watch_url;
-      if (target && elements.preview.src !== target) elements.preview.src = target;
+      const target = canonicalPreviewUrl(url || state.watch_url);
+      const key = previewIdentityKey(identity || state.preview_identity, path, target);
+      if (target && key && loadedPreviewKey !== key) {
+        elements.preview.src = target;
+        loadedPreviewKey = key;
+      }
       renderDocumentControls();
     }
 
@@ -6313,9 +6698,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       setPreview(
         state.active_document,
-        state.active_document && state.watch_url
-          ? `${state.watch_url}?v=${Date.now()}`
-          : null
+        state.active_document && state.watch_url ? state.watch_url : null,
+        state.preview_identity
       );
       setRunStatus(
         state.run_status || "idle",
@@ -6403,17 +6787,40 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       else if (type === "watch") {
         state.watch_alive = data.status === "ready";
-        if (data.port) state.watch_url = `http://127.0.0.1:${data.port}/`;
+        if (data.watch_url) state.watch_url = data.watch_url;
+        if (data.watch_generation) state.watch_generation = data.watch_generation;
+        if (data.port) state.watch_port = data.port;
+        if (data.preview_identity) {
+          state.preview_identity = data.preview_identity;
+          setPreview(
+            state.active_document,
+            state.watch_url,
+            state.preview_identity
+          );
+        }
         setRunStatus(state.run_status || "idle");
       } else if (type === "document") {
         state.active_document = data.working;
         state.watch_url = data.watch_url || state.watch_url;
+        state.watch_port = data.watch_port || state.watch_port;
+        state.watch_generation =
+          data.watch_generation || state.watch_generation;
+        state.document_revision =
+          data.document_revision || state.document_revision;
+        state.preview_identity =
+          data.preview_identity || state.preview_identity;
         state.complex_layout = Boolean(data.complex_layout);
         state.complex_layout_detail = data.complex_layout_detail || null;
         if (data.document_mode) state.document_mode = data.document_mode;
         state.watch_alive = true;
-        setPreview(data.working, data.watch_url);
+        setPreview(
+          data.working,
+          data.watch_url || state.watch_url,
+          state.preview_identity
+        );
         setRunStatus(state.run_status || "idle");
+      } else if (type === "document_revision") {
+        state.document_revision = data.revision || state.document_revision;
       } else if (type === "snapshot_status") {
         state.snapshot_in_progress = data.status === "working";
         setRunStatus(state.run_status || "idle");
@@ -6475,6 +6882,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       state.active_document = result.active_document;
       state.watch_url = result.watch_url || null;
+      state.watch_port = result.watch_port || null;
+      state.watch_generation = result.watch_generation || null;
+      state.document_revision = result.document_revision || 0;
+      state.preview_identity = result.preview_identity || null;
       state.complex_layout = Boolean(result.complex_layout);
       state.complex_layout_detail = result.complex_layout_detail || null;
       state.document_mode = result.document_mode || (
@@ -6484,7 +6895,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       state.last_run_outcome = "neutral";
       state.preview_selection = { targets: [] };
       state.watch_alive = true;
-      setPreview(result.active_document, `${result.watch_url}?v=${Date.now()}`);
+      setPreview(
+        result.active_document,
+        result.watch_url,
+        result.preview_identity
+      );
       setRunStatus("idle", "neutral");
       renderPreviewSelections();
       showToast(
@@ -6841,9 +7256,16 @@ HTML_TEMPLATE = r"""<!doctype html>
         const result = await api("/watch/restart", { method: "POST", body: "{}" });
         state.watch_alive = true;
         state.watch_url = result.watch_url || state.watch_url;
-        if (state.watch_url) {
-          elements.preview.src = `${state.watch_url}?v=${Date.now()}`;
-        }
+        state.watch_port = result.watch_port || state.watch_port;
+        state.watch_generation =
+          result.watch_generation || state.watch_generation;
+        state.preview_identity =
+          result.preview_identity || state.preview_identity;
+        setPreview(
+          state.active_document,
+          state.watch_url,
+          state.preview_identity
+        );
       } catch (error) {
         state.watch_alive = false;
         showToast(error.message);
@@ -7664,6 +8086,13 @@ class OgentHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parsed.path == "/selection/focus":
+                payload = self._read_json()
+                self._send_json(
+                    200,
+                    focus_submitted_selection(session, payload),
+                )
+                return
             if parsed.path == "/selection/remove":
                 payload = self._read_json()
                 selection_id = str(payload.get("selection_id", "")).strip()
@@ -7823,11 +8252,12 @@ class OgentHandler(BaseHTTPRequestHandler):
                     {
                         "watch_alive": True,
                         "watch_port": session.watch_port,
-                        "watch_url": (
-                            f"http://{HOST}:{session.watch_port}/"
-                            if session.watch_port
-                            else None
+                        "watch_generation": session.watch_generation,
+                        "watch_url": stable_watch_url(
+                            session.watch_port,
+                            session.watch_generation,
                         ),
+                        "preview_identity": preview_identity_public(session),
                     },
                 )
                 return

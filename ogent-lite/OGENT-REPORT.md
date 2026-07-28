@@ -1,9 +1,10 @@
 # Ogent Lite Verification Report
 
-Date: 2026-07-27
-Status: v0.10.0 automated, live-provider, recovery, and responsive visual
-acceptance passed. Earlier release matrices are retained below as historical
-evidence.
+Date: 2026-07-28
+Status: v0.10.1 passed deterministic, real-provider, OfficeCLI, security, and
+responsive visual acceptance. The required OfficeCLI viewer is available as a
+checksum-verified public fork prerelease while its clean patch is reviewed
+upstream. Earlier release matrices are retained below as historical evidence.
 
 ## Current runtime and architecture
 
@@ -19,11 +20,12 @@ evidence.
 - Agent backends observed live: Codex CLI 0.145.0 and Claude Code 2.1.220
 - Model and effort source: the installed, authenticated provider CLI; Ogent has
   no static provider model or effort catalog
-- OfficeCLI: 1.0.142
+- OfficeCLI: public fork prerelease `1.0.143-ogent-preview`; Windows x64 asset
+  SHA-256 `F32C6AF1B1AA1ACC70E4128B5E0BED9CA3EF01565DD986DCFD23E704FB0AE6E1`
 
-The v0.10.0 acceptance evidence appears in the final section. Statements in the
-v0.1.0 through v0.9.0 sections describe those historical releases and are not
-the current edit, memory, attachment, or provider-isolation architecture.
+The v0.10.1 release evidence appears in the final section. Statements in the
+v0.1.0 through v0.10.0 sections describe historical releases and are not the
+current preview-retention or historical-navigation architecture.
 
 ## Live test matrix
 
@@ -922,3 +924,230 @@ than 10% median regression).
   could collapse touch multi-select context, and a 390 px transcript/composer
   grid overlap. Regression coverage was added for the selection echo and
   mobile layout contract.
+
+## v0.10.1 — stable live-preview position and clickable submitted selections
+
+Release verification completed on 2026-07-28 with Windows 11, Python 3.14.3,
+Codex CLI 0.145.0, headed Microsoft Edge, and native Microsoft Word, Excel, and
+PowerPoint rendering. The first live matrix used an isolated build identified
+as `1.0.143-ogent-preview`; a fresh three-format matrix then passed against the
+downloaded public Windows x64 release asset with the same product version.
+
+### Confirmed root causes and architecture
+
+- Ogent v0.10.0 changed the iframe URL after document revisions by appending
+  timestamps in both completion events and `applySnapshot()`. The browser
+  treated each URL as a new navigation, fired a new iframe load event, and
+  returned the OfficeCLI viewer to its initial position. The isolated Word
+  reproduction measured one additional iframe load and moved the visible
+  document from page 5 back to page 1. The accepted v0.10.1 Word, Excel, and
+  PowerPoint completion flows each measured zero additional iframe loads.
+- v0.10.1 keys preview identity to the Ogent session, logical document, watch
+  port, and watch generation. Document revision and run state update browser
+  state without assigning `iframe.src`. New documents, explicit repair, and a
+  genuine watch restart remain valid navigation boundaries.
+- Removing the parent reload exposed a second independent defect in the
+  official OfficeCLI 1.0.142 viewer: a PowerPoint `replace` update
+  unconditionally called `scrollToSlide(slideNum)`. Word and Excel also needed
+  a format-aware semantic anchor for height and two-axis layout changes.
+- The prepared OfficeCLI source patch captures the newest visible `data-path`
+  immediately before mutation, preserves Word offset, Excel active sheet plus
+  vertical/horizontal position, and PowerPoint main-slide position, then
+  restores after render completion. A trusted wheel, touch, pointer, or
+  navigation key cancels an older queued restore, so manual movement during a
+  run wins.
+- Historical focus is capability-like. The browser can send only
+  `message_sequence` and a 32-character `selection_id`. The server resolves the
+  canonical submitted turn, session, logical document, revision, format, path,
+  kind, and text fingerprint from provider-neutral memory. Exact-path
+  revalidation is attempted first; only one conservative relocation is
+  accepted, and ambiguity fails closed.
+- Production navigation invokes public OfficeCLI argument arrays without a
+  shell: `watch mark`, `watch goto <path>`, `watch goto --mark-id`, and
+  `watch unmark --id`. Browser-provided paths, selectors, ports, URLs, and file
+  paths are never accepted. One Ogent-owned gold mark is replaced by exact ID;
+  unrelated marks and teal composer selection remain intact.
+- OfficeCLI sends navigation through its watch-wide SSE broadcast. Separate
+  Ogent document sessions remain isolated because each owns a distinct watch,
+  but multiple browser clients attached to one session/watch move together.
+  The current protocol has no supported client-scoped focus channel, so this is
+  documented rather than presented as per-tab isolation.
+- Excel ranges of at most 100 cells receive individual viewer marks. Larger
+  ranges center and mark only their primary top-left cell, bounding CLI process
+  creation while retaining the user's logical range target in memory.
+
+The Ogent release changes are limited to:
+
+- `ogent-lite/ogent.py`
+- `ogent-lite/ogent_preview_selection.py`
+- `ogent-lite/ogent_selection_focus.py`
+- `ogent-lite/ogent_agent_providers.py`
+- `ogent-lite/ogent_officecli_mcp.py`
+- `ogent-lite/tests/test_preview_selection.py`
+- `ogent-lite/tests/test_v0101_preview_focus.py`
+- `.github/workflows/ci.yml`
+- the root and Ogent READMEs and this report
+
+### Published OfficeCLI dependency and upstream proposal
+
+The clean source change is commit
+`9972f815fd81467a0dc284a72640aa2f12f32b0c` on branch
+`codex/ogent-v0101-viewer-contract`. It is proposed to the official repository
+in [OfficeCLI PR #268](https://github.com/iOfficeAI/OfficeCLI/pull/268) and
+changes exactly seven files:
+
+- `CommandBuilder.Goto.cs` and `CommandBuilder.Mark.cs`
+- `WatchMark.cs`, `WatchNotifier.cs`, and `WatchServer.cs`
+- `WordHandler.HtmlPreview.cs`
+- `Resources/watch-sse-core.js`
+
+The patch adds public format-neutral path/mark centering, exact mark-ID removal,
+the path-safe watch protocol, semantic viewport restoration, manual-input
+precedence, closest surviving sibling/parent fallback, reduced-motion
+behavior, and PowerPoint-main-view preference over thumbnail clones. It does
+not accept arbitrary CSS and does not write navigation highlights into Office
+packages.
+
+The change was also exported as
+`output/ogent-v0.10.1-preview-position-links/officecli-v1.0.143-ogent-preview.patch`
+(42,803 bytes, SHA-256
+`BB774C6C51878BCE3970E802E7936A57D28E87EEC9DBE9021521694A31985CBC`).
+`git apply --check --whitespace=error-all` passed against the freshly fetched
+upstream source.
+
+`node --check`, `git diff --check`, and the .NET 10.0.302 Release publish
+passed. The build emitted one pre-existing nullable warning in
+`ExcelHandler.SheetShift.cs:538` and zero errors.
+
+The maintained fork release is
+[v1.0.143-ogent-preview](https://github.com/ljdstechva/OfficeCLI/releases/tag/v1.0.143-ogent-preview),
+built from fork commit `6f6100f4152e630883b3c44fdfc35b144c6942b0` by a public eight-platform
+[GitHub Actions run](https://github.com/ljdstechva/OfficeCLI/actions/runs/30322972864).
+The annotated tag object is `0ea41a4c38c0de8de3567ea2af849ee04b593053`.
+All eight published assets matched `SHA256SUMS`; the installed Windows x64
+asset reports `1.0.143-ogent-preview` and has SHA-256
+`F32C6AF1B1AA1ACC70E4128B5E0BED9CA3EF01565DD986DCFD23E704FB0AE6E1`.
+The fork release is explicitly labeled unofficial. Its macOS assets are
+unsigned and unnotarized; Ogent acceptance and installation used Windows x64.
+
+The fork workflow resolves the repository's skill symlink into the full payload
+before packaging. The five installed user skill copies are 26,391 bytes with
+common SHA-256
+`4E2A2F8C704F1418CAEE14EA3C9B6347240821416D5D6541C3695365C77D67EF`.
+The earlier isolated-probe side effect was removed and preserved only as a
+local evidence copy; the public asset installation left the expected skill
+state intact.
+
+Fresh direct-viewer acceptance against that public asset produced:
+
+| Format | Position before/after edit | Historical focus | Package integrity |
+|---|---|---|---|
+| Word | `/body/p[41]`: top `331.5`, center `359.59375/720`, `scrollY=5970`; exact after | From `scrollY=8367` to `50.0543%`, gold | Viewer operations kept `E83AB0A6BE6A980EFBA7A2A9324D795BB3B79091A3C5F45D40A2FEBC35187C76` |
+| Excel | `Sheet1!J225`: top `353.5`, left `859.71875`, wrapper scroll `(315,4189)`; exact after | `Sheet1!F220` centered at `50.4861%` vertical and `49.1101%` horizontal, gold | Viewer operations kept `3388A8CC00F54C768F0934183F72E82F4772278901E0367B9F5A221715C2D691` |
+| PowerPoint | slide 12: top `324.09375`, center `359.9765625/720`, `scrollTop=9037`; exact after | Slide-9 shape centered at `49.9620%`, gold | Viewer operations kept `D72B5E7042CB4C936F3F924117C6C3C0D447878A0B667515D1465E954447DBDF` |
+
+All three files validated with zero OfficeCLI errors. Mark, goto, and unmark
+were viewer-only; the package hashes did not change after their edit boundary.
+
+### Automated and security gate
+
+- Deterministic suite: 148 test methods and 56 executed subtests; all passed in
+  21.110 seconds against the installed public OfficeCLI dependency.
+- Coverage includes stable preview identity, cache-buster canonicalization,
+  completion/error/Stop reload prevention, genuine-document/watch navigation,
+  Word/Excel/PowerPoint anchor contracts, manual-scroll precedence, deleted
+  anchor fallback, exact and relocated historical targets, cross-session and
+  cross-document rejection, path/selector/URL/port/traversal rejection,
+  argument-array execution, immutable composer/transcript/memory behavior,
+  duplicate-request loading state, accessible selection buttons, and
+  temporary viewer-only marking.
+- Unknown, wrong-turn, cross-session, cross-document, missing, moved, and
+  ambiguous targets fail closed. A real clicked Word tag while PowerPoint was
+  active returned the expected HTTP 409 message and changed neither document,
+  viewport, iframe, composer, transcript, nor retained memory.
+- Exact mark ownership was tested with two marks on one path: removing the
+  Ogent-owned ID preserved the unrelated reviewer mark.
+- A two-viewer watch test began at `scrollY=900` and `scrollY=6500`.
+  One public `watch goto /body/p[32]` broadcast moved both viewers to
+  `scrollY=4644`, with the target centered at `55.8691%` of each 700 px
+  viewport. The Office package remained at SHA-256
+  `FC7DFC5528E80D1759448E77A1C476E6C46A804636C7A3689FD4C6417DEE177D`.
+- OfficeCLI 1.0.142 is rejected before watch startup; 1.0.143 and suffixed
+  1.0.143 candidate versions are accepted.
+
+### Real Codex and Office acceptance
+
+All three edit flows used Codex `gpt-5.6-sol` at low effort against disposable
+copies. Each run waited for the real SSE terminal event. Manual movement was
+performed after Send while Codex was still active.
+
+| Format | Manual position during run | Position after completion | Historical focus | Integrity |
+|---|---|---|---|---|
+| Word | `/body/p[41]`: top `376.416687`, center `404.666687/810`, `scrollY=5927.333496` | Exact same values; zero iframe loads and unchanged stable URL | Two submitted tags centered at `49.9897%` and `50.0823%`; gold; reduced motion used `behavior=auto` | Both selected prefixes changed, old prefixes absent, table/below sentinels intact, validation zero errors |
+| Excel | `Sheet1!J225`: top `397`, left `515.25`, center `(634.276,407)`, wrapper scroll `(659.333313,4143.333496)` | Exact same values; worksheet and live changed value retained; zero iframe loads | `Sheet1!F220` centered at `49.5134%` vertically and `49.1936%` horizontally; gold | Only F220 changed, formatting and J30/J250/Archive sentinels intact, validation zero errors |
+| PowerPoint | slide 12 body: top `383.345459`, center `403.421774/822`, main `scrollTop=5371.333496` | Exact same values and slide; live slide-9 edit visible; zero iframe loads | Slide-9 shape centered at `49.0632%`; gold; current slide-10 selection preserved | Only shape 100034 changed, slide-3/slide-14 sentinels intact, validation zero errors |
+
+The Word historical clicks preserved a different current selection, the unsent
+draft `WORD-UNSENT-COMPOSER-SENTINEL`, three transcript turns, three retained
+turns, and idle run state. Excel and PowerPoint repeated the same invariants
+with format-specific unsent drafts and current selections. Clicking the same
+tag replayed centering without reloading.
+
+The recovery evidence is:
+
+| Format | Verified pre-edit backup SHA-256 | Edited candidate SHA-256 |
+|---|---|---|
+| Word | `986DEE332FFB2D84911F8F9AF7D507196B586A0401EA95C7D7697C6AF02546ED` | `D0E82487CE12050526BAF9C664D164107DE0687361FBE74E74AA387E29A7DA78` |
+| Excel | `5B0C3B56B26E35D96E9CED5A09C1D39435B977A8C0A61609D0EF83D43154EF74` | `1D5427AFC5E1F44C934B13431EB51B95F2C77AF294362CC33ADEA449A748E5DA` |
+| PowerPoint | `923E1859C652FE00627B579923D49EEC8AEC3DFA449E10766BD378E1C0BDD8F2` | `3056161779A62D271ECA16025055657AE6DAD41615BB79B03386275CCDDB6E85` |
+
+Historical focus, Stop, the controlled error, and repeated navigation left each
+edited candidate hash unchanged after its edit boundary.
+
+### Terminal states and browser visual gate
+
+- User Stop retained the exact slide-13 top, center, and
+  `scrollTop=5879.333496`; status and outcome both became `stopped`.
+- A controlled error terminated only the exact isolated candidate Codex child.
+  Slide 14 retained top `382.970459`, center `403.046774`, and
+  `scrollTop=6387.333496`; status and outcome both became `error`.
+- Both terminal paths kept the same preview URL and zero iframe loads. The
+  existing stopped/error icons and accessible status text rendered correctly.
+- The requested in-app Browser plugin was tried first and returned exactly
+  `No browser is available`. The authorized fallback used headed Microsoft
+  Edge through Playwright.
+- Desktop `1440x900` and mobile `390x844` had no horizontal application
+  overflow. Transcript, Activity, and composer did not overlap. Historical
+  buttons showed a distinct hover state and a 2 px keyboard focus-visible
+  outline. The held focus request exposed `aria-busy=true` and `disabled=true`
+  until completion. The mobile empty state was truthful and coherent.
+- A fresh final page reported zero console messages. All ordinary final-page
+  requests were successful; the security flow separately recorded only the
+  intentional cross-document HTTP 409.
+- Reduced-motion focus used immediate `behavior=auto`; ordinary focus used
+  smooth center alignment.
+
+Inspected screenshots are outside committed source:
+
+- `output/ogent-v0.10.1-preview-position-links/playwright/candidate/candidate-desktop-error.png`
+- `output/ogent-v0.10.1-preview-position-links/playwright/candidate/candidate-mobile-error.png`
+- `output/ogent-v0.10.1-preview-position-links/playwright/candidate/candidate-mobile-empty.png`
+
+### Publication gate and current verdict
+
+The user authorized the maintained fork, public prerelease, and upstream pull
+request. OfficeCLI PR #268 is open, the fork tag and all eight release assets
+were produced by a green public workflow, all published checksums match, and
+the installed Windows x64 asset is byte-identical to the verified download.
+The public-asset Word, Excel, and PowerPoint matrix then passed viewport
+retention, off-screen historical centering, gold highlighting, package-hash
+integrity, validation, zero-console, and successful loopback-request checks.
+
+Verdict: **SATISFIED for publication**. The deterministic suite passed again
+against the installed public dependency, the real-provider and responsive
+acceptance evidence remains valid, and no release blocker remains. The only
+documented viewer limitation is deliberate watch-wide navigation: two browser
+clients attached to the same session/watch move together. The temporary fork
+dependency is explicitly labeled unofficial, checksum pinned, and replaceable
+with a compatible official OfficeCLI 1.0.143-or-later release when upstream
+publishes one.
