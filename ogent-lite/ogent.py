@@ -1788,6 +1788,22 @@ class OgentState:
         with self.registry_lock:
             if self.sessions.get(session.session_id) is not session:
                 return False
+            if (
+                require_reapable_at is not None
+                and any(
+                    not candidate.closed and candidate.sse_clients > 0
+                    for candidate in self.sessions.values()
+                )
+            ):
+                # One browser window navigates between document sessions, so
+                # inactive workspaces have no SSE of their own. Retain the
+                # whole launch-scoped workspace set while any Ogent tab is
+                # attached, and begin a fresh grace period only after the last
+                # attached workspace disconnects.
+                with session.lock:
+                    if not session.closed and session.sse_clients == 0:
+                        session.orphan_since = require_reapable_at
+                return False
             with session.reference_lock:
                 with session.lock:
                     if session.closed:

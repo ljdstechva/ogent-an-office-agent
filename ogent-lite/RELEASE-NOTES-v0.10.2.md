@@ -13,6 +13,9 @@ exact revision/render acknowledgement.
   provider continuation IDs, run state, and OfficeCLI watch.
 - Opening document B from A creates or focuses B's workspace. B starts clean;
   reopening A during the same backend lifetime restores only A.
+- Long-running work in B no longer lets inactive A age past the reaper grace
+  window. While any Ogent tab is connected, all launch-scoped workspaces remain
+  available; the two-minute grace restarts after the last tab disconnects.
 - Canonical Windows path handling deduplicates case, slash, dot, relative, and
   absolute aliases while keeping different same-named files separate.
 - A visible **+ New chat** button opens an accessible application modal with
@@ -110,8 +113,8 @@ opens, browser-import/PDF isolation, provider switching, transactional reset,
 attachment cleanup boundaries, late-event rejection, exact-client
 authorization, formatting/structural preview events, consecutive edits,
 in-place recovery, canonical-DOM mismatch rejection, stale-generation channel
-rejection, and one-restart semantic restoration. The final local run passed 166
-tests and 58 subtests under Pytest and the same 166 tests under Unittest.
+rejection, and one-restart semantic restoration. The final local run passed 167
+tests and 58 subtests under Pytest and the same 167 tests under Unittest.
 
 Real synthetic-document acceptance demonstrated:
 

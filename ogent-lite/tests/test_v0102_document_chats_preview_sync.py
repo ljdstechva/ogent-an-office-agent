@@ -232,6 +232,48 @@ class V0102WorkspaceTests(unittest.TestCase):
             ["DOCUMENT-B-ONLY"],
         )
 
+    def test_connected_workspace_retains_inactive_document_past_grace(
+        self,
+    ) -> None:
+        document_a = self.root / "retained-a.docx"
+        document_b = self.root / "connected-b.docx"
+        document_a.write_bytes(b"document-a")
+        document_b.write_bytes(b"document-b")
+        session_a = self.state.create_session()
+        session_b = self.state.create_session()
+        self._open(session_a, document_a)
+        self._open(session_b, document_b)
+        self.state.session_grace_seconds = 5
+        with session_a.lock:
+            session_a.orphan_since = 1.0
+        session_b.connect_sse("connected-client-1234")
+
+        self.assertFalse(
+            ogent.close_session(
+                session_a,
+                require_reapable_at=100.0,
+            )
+        )
+        with session_a.lock:
+            self.assertFalse(session_a.closed)
+            self.assertEqual(session_a.orphan_since, 100.0)
+        self.assertIn(session_a.session_id, self.state.sessions)
+
+        session_b.disconnect_sse("connected-client-1234")
+        self.assertFalse(
+            ogent.close_session(
+                session_a,
+                require_reapable_at=104.9,
+            )
+        )
+        self.assertTrue(
+            ogent.close_session(
+                session_a,
+                require_reapable_at=105.0,
+            )
+        )
+        self.assertNotIn(session_a.session_id, self.state.sessions)
+
     def test_aliases_dedupe_and_distinct_same_names_do_not_merge(self) -> None:
         directory = self.root / "alias"
         directory.mkdir()

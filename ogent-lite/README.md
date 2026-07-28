@@ -247,6 +247,9 @@ Reopening a document during the same backend lifetime restores only its own
 launch-scoped state. Windows case, separator, dot, relative/absolute, and
 supported path aliases deduplicate; distinct files with the same basename do
 not. Browser imports and PDF working documents follow the same isolation.
+Inactive workspaces remain retained while any Ogent browser tab is connected.
+After the last tab disconnects, every inactive workspace begins a fresh
+two-minute reconnect grace period.
 
 Different document workspaces may edit concurrently; one workspace allows one
 agent run at a time. Each turn starts a fresh provider process, while Ogent

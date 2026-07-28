@@ -1338,11 +1338,11 @@ consecutive revisions, canonical-DOM mismatch rejection, stale-generation
 channel/control/ack rejection, in-place full refresh, one-restart semantic
 restoration, and modal/relay source contracts.
 
-The focused module passed 18/18 methods and 2 subtests, including forced
+The focused module passed 19/19 methods and 2 subtests, including forced
 memory-persistence rollback and refusal to issue a preview relay channel to a
 client that is not connected to the exact document workspace. The full local
-suite passed 166
-tests and 58 subtests under Pytest, then the same 166 tests under Unittest.
+suite passed 167
+tests and 58 subtests under Pytest, then the same 167 tests under Unittest.
 `compileall`, Ruff, `git diff --check`, three PowerShell parser checks, and all
 13 packaged OfficeCLI fixture validations passed. The rotated current-source
 candidate again passed desktop and mobile layout checks, live iframe loading,
@@ -1361,6 +1361,14 @@ fully rendered viewer and strips only renderer-owned CJK punctuation wrappers.
 The strict backend equality check remains unchanged. Focused regressions, the
 full suites, and the real HTTP 204 evidence passed; no critical or
 high-severity finding remains.
+
+The first permanent-install smoke then found a lifecycle defect outside the
+supervisor's preview scope: A could be reaped after its two-minute orphan timer
+while a long edit continued in B. Reaper eligibility now treats connected
+browser work as a launch-wide retention lease. Every inactive workspace has its
+orphan timestamp refreshed while any Ogent tab is attached, then receives a
+fresh two-minute grace after the last tab disconnects. A deterministic
+past-grace regression covers connected retention and eventual cleanup.
 
 Remote CI, permanent installation, annotated tag publication, and the final
 dirty-checkout fingerprint comparison are operational release checks performed

@@ -337,7 +337,9 @@ chat cannot repopulate the new one. The active Office document, all edits,
 recovery backup, direct-edit mode, preview watch and position, recent-file
 entry, application settings, and every other document workspace are preserved.
 Chat and memory remain launch-scoped: they last only while the current Ogent
-backend is running.
+backend is running. Inactive document workspaces do not age out while any Ogent
+browser tab remains connected; after the last tab disconnects, all inactive
+workspaces begin a fresh two-minute reconnect grace period.
 
 ### Keep the finished file
 
@@ -490,8 +492,8 @@ Automated coverage includes document path deduplication and concurrency,
 provider-neutral A/B memory isolation, transactional reset and late-event
 rejection, exact-client reset authorization, formatting/structural preview
 events, consecutive revisions, in-place recovery, and one-restart semantic
-position restoration. The final local gate passed 166 tests and 58 subtests
-under Pytest, then the same 166 tests under Unittest.
+position restoration. The final local gate passed 167 tests and 58 subtests
+under Pytest, then the same 167 tests under Unittest.
 
 In real Chromium acceptance, document B first opened with no A transcript,
 memory, attachment, or selection. Reopening A restored its unique message,
