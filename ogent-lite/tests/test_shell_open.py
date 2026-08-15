@@ -4,6 +4,7 @@ import importlib.util
 import json
 import tempfile
 import threading
+import shutil
 import unittest
 import urllib.error
 import urllib.parse
@@ -21,6 +22,7 @@ ogent = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ogent)
 
 
+@unittest.skipUnless(shutil.which("officecli"), "OfficeCLI is not installed")
 class ShellOpenTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_state = ogent.STATE

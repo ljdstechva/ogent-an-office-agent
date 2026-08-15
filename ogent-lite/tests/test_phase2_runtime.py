@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import shutil
 import json
 import tempfile
 import threading
@@ -120,7 +121,10 @@ class LegacyImportTests(unittest.TestCase):
                 page.items[0].metadata["preview_selections"][0]["path"],
                 "/body/p[1]",
             )
-            self.assertEqual(metadata.recent_documents(), (str(root / "report.docx"),))
+            self.assertEqual(
+                tuple(Path(item).resolve() for item in metadata.recent_documents()),
+                ((root / "report.docx").resolve(),),
+            )
             self.assertEqual(metadata.recovery_count(), 1)
 
 
@@ -208,6 +212,7 @@ class ResumeRuntimeTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(shutil.which("officecli"), "OfficeCLI is not installed")
 class DurableRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

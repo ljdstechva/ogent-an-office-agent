@@ -17,6 +17,7 @@ if str(OGENT_DIR) not in sys.path:
 import ogent  # noqa: E402
 
 
+@unittest.skipUnless(shutil.which("officecli"), "OfficeCLI is not installed")
 class V010IntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

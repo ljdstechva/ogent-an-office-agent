@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import shutil
 import unittest
 import urllib.error
 import urllib.parse
@@ -95,6 +96,7 @@ def make_pdf_bytes(page_count: int = 1) -> bytes:
     return output.getvalue()
 
 
+@unittest.skipUnless(shutil.which("officecli"), "OfficeCLI is not installed")
 class ReferenceFeatureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.originals = {

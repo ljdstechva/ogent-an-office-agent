@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import shutil
 import unittest
 import urllib.error
 import urllib.parse
@@ -22,6 +23,7 @@ if str(OGENT_DIR) not in sys.path:
 import ogent  # noqa: E402
 
 
+@unittest.skipUnless(shutil.which("officecli"), "OfficeCLI is not installed")
 class V0102WorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
