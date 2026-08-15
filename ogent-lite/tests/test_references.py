@@ -13,6 +13,8 @@ import tempfile
 import threading
 import shutil
 import unittest
+
+from tests.runtime_shutdown import stop_owned_runtime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -160,6 +162,7 @@ class ReferenceFeatureTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
         self.assertFalse(self.thread.is_alive(), "test server did not stop")
+        stop_owned_runtime(ogent)
         ogent.STATE = self.originals["STATE"]
         ogent.REFERENCE_ROOT = self.originals["REFERENCE_ROOT"]
         ogent.SESSION_MEMORY_ROOT = self.originals["SESSION_MEMORY_ROOT"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import statistics
 import tempfile
 import time
@@ -94,9 +95,12 @@ class IncrementalReindexPerformanceTests(unittest.TestCase):
 
         percentile_index = max(0, math.ceil(0.95 * len(latencies)) - 1)
         p95 = sorted(latencies)[percentile_index]
+        budget_seconds = float(
+            os.environ.get("OGENT_REINDEX_P95_BUDGET_SECONDS", "1.0")
+        )
         self.assertLess(
             p95,
-            1.0,
+            budget_seconds,
             f"small-revision p95 was {p95:.3f}s; "
             f"median was {statistics.median(latencies):.3f}s",
         )

@@ -6,6 +6,8 @@ import sys
 import tempfile
 import threading
 import unittest
+
+from tests.runtime_shutdown import stop_owned_runtime
 from pathlib import Path
 from unittest import mock
 
@@ -62,6 +64,7 @@ class V010IntegrationTests(unittest.TestCase):
         with mock.patch.object(ogent, "stop_watch", return_value=None):
             for session in list(self.state.sessions.values()):
                 ogent.close_session(session)
+        stop_owned_runtime(ogent)
         for name, value in self.originals.items():
             setattr(ogent, name, value)
         self.temporary.cleanup()

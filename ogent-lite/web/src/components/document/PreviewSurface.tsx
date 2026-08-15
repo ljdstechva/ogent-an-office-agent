@@ -8,6 +8,23 @@ import { OgentMark } from "../icons";
 type PreviewMode = "live" | "word";
 type PreviewState = "empty" | "loading" | "ready" | "degraded" | "error";
 
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 2;
+const ZOOM_STEP = 0.1;
+const ZOOM_STORAGE_KEY = "ogent-preview-zoom";
+
+function loadStoredZoom(): number {
+  try {
+    const parsed = Number.parseFloat(
+      localStorage.getItem(ZOOM_STORAGE_KEY) ?? "1",
+    );
+    if (!Number.isFinite(parsed)) return 1;
+    return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, parsed));
+  } catch {
+    return 1;
+  }
+}
+
 interface PreviewSurfaceProps {
   workspace: WorkspaceSnapshot;
   update: (value: Partial<WorkspaceSnapshot>) => void;
@@ -51,6 +68,22 @@ export function PreviewSurface({
   );
   const [message, setMessage] = useState("");
   const [frameUrl, setFrameUrl] = useState("");
+  const [zoom, setZoom] = useState<number>(loadStoredZoom);
+
+  const applyZoom = (value: number) => {
+    const clamped = Math.min(
+      MAX_ZOOM,
+      Math.max(MIN_ZOOM, Math.round(value * 10) / 10),
+    );
+    setZoom(clamped);
+    try {
+      localStorage.setItem(ZOOM_STORAGE_KEY, String(clamped));
+    } catch {
+      // Zoom persistence is optional; the control keeps working.
+    }
+  };
+
+  const adjustZoom = (delta: number) => applyZoom(zoom + delta);
   const currentIdentityKey = identityKey(
     workspace.preview_identity,
     workspace.document_revision,
@@ -409,6 +442,7 @@ export function PreviewSurface({
         <iframe
           key={`${mode}|${currentIdentityKey}|${frameAttempt}`}
           ref={frameRef}
+          style={{ "--preview-zoom": zoom } as React.CSSProperties}
           className="document-preview"
           title={label || "OfficeCLI document preview"}
           src={frameUrl || undefined}
@@ -429,7 +463,38 @@ export function PreviewSurface({
           }}
         />
       </div>
-      <div className="preview-view-switch" aria-label="Preview mode">
+      <div className="preview-controls">
+        <div className="preview-zoom" aria-label="Document zoom">
+          <button
+            type="button"
+            aria-label="Zoom out"
+            title="Zoom out"
+            disabled={!workspace.active_document || zoom <= MIN_ZOOM}
+            onClick={() => adjustZoom(-ZOOM_STEP)}
+          >
+            −
+          </button>
+          <button
+            type="button"
+            className="preview-zoom-level"
+            aria-label="Reset zoom to 100%"
+            title="Reset zoom to 100%"
+            disabled={!workspace.active_document}
+            onClick={() => applyZoom(1)}
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            aria-label="Zoom in"
+            title="Zoom in"
+            disabled={!workspace.active_document || zoom >= MAX_ZOOM}
+            onClick={() => adjustZoom(ZOOM_STEP)}
+          >
+            +
+          </button>
+        </div>
+        <div className="preview-view-switch" aria-label="Preview mode">
         <button
           type="button"
           aria-pressed={mode === "live"}
@@ -453,6 +518,7 @@ export function PreviewSurface({
           Exact Word View
           <small>{isDocx ? "Word-rendered" : "DOCX only"}</small>
         </button>
+        </div>
       </div>
     </div>
   );

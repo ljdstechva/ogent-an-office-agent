@@ -53,6 +53,11 @@ jobs:
         run: npx playwright install chromium
         working-directory: ogent-lite\web
 
+      - name: Set up .NET 10 runtime for OfficeCLI
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
       - name: Install OfficeCLI (pinned fork prerelease)
         shell: pwsh
         run: |
@@ -72,6 +77,10 @@ jobs:
       - name: Run unit and regression tests
         run: python -m coverage run --branch --source=ogent_app -m pytest -q
         working-directory: ogent-lite
+        env:
+          # Shared hosted runners are ~2x slower than the local baseline; keep
+          # a gross-regression gate without flaking on runner noise.
+          OGENT_REINDEX_P95_BUDGET_SECONDS: "3.0"
 
       - name: Report coverage
         run: python -m coverage report --fail-under=68

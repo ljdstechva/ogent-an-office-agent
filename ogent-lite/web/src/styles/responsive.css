@@ -170,9 +170,11 @@
     padding: 9px;
   }
 
-  .preview-view-switch {
+  .preview-controls {
     right: 17px;
     bottom: 17px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   .empty-document,

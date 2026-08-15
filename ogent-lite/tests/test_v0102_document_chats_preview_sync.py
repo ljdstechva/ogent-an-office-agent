@@ -9,6 +9,8 @@ import tempfile
 import threading
 import shutil
 import unittest
+
+from tests.runtime_shutdown import stop_owned_runtime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,6 +71,7 @@ class V0102WorkspaceTests(unittest.TestCase):
         with mock.patch.object(ogent, "stop_watch", return_value=None):
             for session in list(self.state.sessions.values()):
                 ogent.close_session(session)
+        stop_owned_runtime(ogent)
         for name, value in self.originals.items():
             setattr(ogent, name, value)
         self.temporary.cleanup()
