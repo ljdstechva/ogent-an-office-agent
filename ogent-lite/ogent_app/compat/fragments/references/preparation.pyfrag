@@ -1,0 +1,557 @@
+from __future__ import annotations
+
+def visual_analysis_requested(message: str) -> bool:
+    return bool(VISUAL_REQUEST_PATTERN.search(message or ""))
+
+
+def _guard_reference_root(root: Path) -> Path:
+    root = Path(root)
+    if root.name != REFERENCE_ROOT_NAME:
+        raise ReferenceError(
+            f"Refusing cleanup: reference root must be named {REFERENCE_ROOT_NAME}.",
+            500,
+        )
+    parent = root.parent.resolve()
+    unresolved = parent / root.name
+    if root.exists() and root.is_symlink():
+        raise ReferenceError("Refusing cleanup: reference root is a symbolic link.", 500)
+    resolved = root.resolve(strict=False)
+    if resolved != unresolved:
+        raise ReferenceError(
+            "Refusing cleanup: reference root does not resolve to its expected location.",
+            500,
+        )
+    if resolved == Path(resolved.anchor) or resolved.parent == resolved:
+        raise ReferenceError("Refusing cleanup of a filesystem root.", 500)
+    return resolved
+
+
+def reference_path_is_within(path: Path, root: Path) -> bool:
+    try:
+        guarded_root = _guard_reference_root(root)
+        Path(path).resolve(strict=False).relative_to(guarded_root)
+        return True
+    except (ReferenceError, ValueError, OSError):
+        return False
+
+
+def _make_tree_writable(path: Path) -> None:
+    if not path.exists():
+        return
+    for current_root, directories, filenames in os.walk(path, topdown=False):
+        for name in filenames:
+            with contextlib.suppress(OSError):
+                os.chmod(Path(current_root) / name, 0o600)
+        for name in directories:
+            with contextlib.suppress(OSError):
+                os.chmod(Path(current_root) / name, 0o700)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700)
+
+
+def _prune_empty_parents(start: Path, root: Path) -> None:
+    guarded_root = _guard_reference_root(root)
+    current = start.resolve(strict=False)
+    while current != guarded_root and reference_path_is_within(current, guarded_root):
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def cleanup_reference_path(path: Path, root: Path) -> bool:
+    """Idempotently delete one contained reference file/tree and empty parents."""
+    guarded_root = _guard_reference_root(root)
+    target = Path(path).resolve(strict=False)
+    if target == guarded_root:
+        raise ReferenceError(
+            "Use reset_reference_root() for whole-root cleanup.",
+            500,
+        )
+    try:
+        target.relative_to(guarded_root)
+    except ValueError as exc:
+        raise ReferenceError(
+            "Refusing to delete a path outside the temporary reference root.",
+            500,
+        ) from exc
+    if not target.exists() and not target.is_symlink():
+        _prune_empty_parents(target.parent, guarded_root)
+        return False
+    _make_tree_writable(target)
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    _prune_empty_parents(target.parent, guarded_root)
+    return True
+
+
+def reset_reference_root(root: Path) -> Path:
+    """Safely remove abandoned data and recreate an empty reference root."""
+    guarded_root = _guard_reference_root(root)
+    if guarded_root.exists():
+        _make_tree_writable(guarded_root)
+        shutil.rmtree(guarded_root)
+    guarded_root.mkdir(parents=True, exist_ok=False)
+    return guarded_root
+
+
+def _require_contained(path: Path, run_root: Path, label: str) -> Path:
+    resolved_root = run_root.resolve(strict=True)
+    resolved_path = path.resolve(strict=True)
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ReferenceError(f"{label} escapes the temporary run directory.", 500) from exc
+    return resolved_path
+
+
+def _write_extraction(path: Path, text: str) -> None:
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_EXTRACTED_TEXT_BYTES:
+        raise ReferenceError(
+            "The extracted reference text exceeds Ogent's 100 MB preparation limit. "
+            "Attach a smaller source or only the relevant portion.",
+            413,
+        )
+    path.write_bytes(encoded)
+
+
+def _prepare_text(item: dict[str, Any], source: Path, derived: Path) -> dict[str, Any]:
+    text = decode_text_file(source)
+    extracted = derived / "extracted.txt"
+    _write_extraction(
+        extracted,
+        f"Reference: {item['filename']}\nLocation: whole file\n\n{text}",
+    )
+    return {
+        "extracted_text_path": str(extracted),
+        "image_paths": [],
+        "ocr_expected": False,
+        "status": "Ready",
+    }
+
+
+def _prepare_office_text(
+    item: dict[str, Any],
+    source: Path,
+    derived: Path,
+) -> Path:
+    raw_output = derived / "officecli-view.txt"
+    environment = os.environ.copy()
+    environment["OFFICECLI_NO_AUTO_RESIDENT"] = "1"
+    environment["OFFICECLI_RESIDENT_FLUSH"] = "each"
+    environment["PYTHONIOENCODING"] = "utf-8"
+    try:
+        with raw_output.open("wb") as output:
+            process = subprocess.run(
+                ["officecli", "view", str(source), "text"],
+                cwd=str(source.parent),
+                env=environment,
+                stdout=output,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if os.name == "nt"
+                    else 0
+                ),
+                check=False,
+            )
+    except FileNotFoundError as exc:
+        raise ReferenceError(
+            "OfficeCLI is required to inspect Office references.",
+            500,
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ReferenceError("OfficeCLI reference inspection timed out.") from exc
+    if process.returncode != 0:
+        detail = process.stderr.decode("utf-8", errors="replace").strip()
+        raise ReferenceError(
+            f"OfficeCLI could not read this Office reference. {detail[-800:]}".strip()
+        )
+    if raw_output.stat().st_size > MAX_EXTRACTED_TEXT_BYTES:
+        raise ReferenceError(
+            "The Office reference extraction exceeds Ogent's 100 MB limit."
+        )
+    raw_text = raw_output.read_text(encoding="utf-8", errors="replace")
+    extracted = derived / "extracted.txt"
+    _write_extraction(
+        extracted,
+        f"Reference: {item['filename']}\n"
+        f"Office type: {source.suffix.upper()[1:]}\n"
+        "Locations below retain OfficeCLI's paragraph, cell, sheet, and slide labels "
+        "when available.\n\n"
+        f"{raw_text}",
+    )
+    raw_output.unlink()
+    return extracted
+
+
+def _render_pdf_pages(
+    pdf_path: Path,
+    output_directory: Path,
+    page_indexes: list[int],
+    *,
+    name_prefix: str,
+) -> list[Path]:
+    if not page_indexes:
+        return []
+    pdfium = _load_pdfium()
+    Image, _ = _load_pillow()
+    image_paths: list[Path] = []
+    rendered_pixels = 0
+    with pdfium.PdfDocument(pdf_path) as pdf:
+        page_count = len(pdf)
+        for page_index in page_indexes:
+            if page_index < 0 or page_index >= page_count:
+                raise ReferenceError("A requested render page is outside the PDF.")
+            page = pdf[page_index]
+            try:
+                width = max(float(page.get_width()), 1.0)
+                height = max(float(page.get_height()), 1.0)
+                maximum_scale = min(
+                    4096.0 / max(width, height),
+                    (MAX_RENDERED_PAGE_PIXELS / (width * height)) ** 0.5,
+                )
+                requested_scale = max(
+                    2.5,
+                    256.0 / min(width, height),
+                )
+                scale = min(requested_scale, maximum_scale)
+                if scale <= 0 or width * scale < 256 or height * scale < 256:
+                    raise ReferenceError(
+                        f"PDF page {page_index + 1} is too large to render "
+                        "legibly within Ogent's pixel limit."
+                    )
+                page_pixels = int(width * scale) * int(height * scale)
+                rendered_pixels += page_pixels
+                if rendered_pixels > MAX_RENDERED_RUN_PIXELS:
+                    raise ReferenceError(
+                        "Rendered reference pages exceed Ogent's 100-megapixel "
+                        "per-run limit. Attach fewer visual pages."
+                    )
+                bitmap = page.render(scale=scale)
+                try:
+                    rendered = bitmap.to_pil().copy()
+                finally:
+                    bitmap.close()
+                if rendered.mode not in {"RGB", "RGBA"}:
+                    rendered = rendered.convert("RGB")
+                target = output_directory / f"{name_prefix}-{page_index + 1:03d}.png"
+                rendered.save(target, format="PNG", optimize=True)
+                rendered.close()
+                with Image.open(target) as check:
+                    check.verify()
+                image_paths.append(target)
+            finally:
+                page.close()
+    return image_paths
+
+
+def _prepare_pdf(
+    item: dict[str, Any],
+    source: Path,
+    derived: Path,
+    *,
+    visual_requested: bool,
+) -> dict[str, Any]:
+    pdfium = _load_pdfium()
+    page_sections: list[str] = []
+    render_indexes: list[int] = []
+    with pdfium.PdfDocument(source) as pdf:
+        page_count = len(pdf)
+        if page_count > MAX_PDF_PAGES:
+            raise ReferenceError(
+                f"The PDF now has {page_count} pages; the limit is {MAX_PDF_PAGES}."
+            )
+        for page_index in range(page_count):
+            page = pdf[page_index]
+            try:
+                textpage = page.get_textpage()
+                try:
+                    text = textpage.get_text_bounded()
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+            normalized = text.replace("\x00", "").strip()
+            page_sections.append(
+                f"=== Page {page_index + 1} ===\n"
+                f"{normalized if normalized else '[No searchable text detected]'}"
+            )
+            searchable_characters = len(re.sub(r"\s+", "", normalized))
+            if visual_requested or searchable_characters < MIN_SEARCHABLE_PAGE_CHARACTERS:
+                render_indexes.append(page_index)
+    extracted = derived / "extracted.txt"
+    _write_extraction(
+        extracted,
+        f"Reference: {item['filename']}\n"
+        f"PDF pages: {len(page_sections)}\n\n"
+        + "\n\n".join(page_sections),
+    )
+    images = _render_pdf_pages(
+        source,
+        derived,
+        render_indexes,
+        name_prefix="pdf-page",
+    )
+    return {
+        "extracted_text_path": str(extracted),
+        "image_paths": [str(path) for path in images],
+        "ocr_expected": bool(images),
+        "status": "OCR/vision" if images else "Ready",
+    }
+
+
+def _export_office_pdf(
+    source: Path,
+    derived: Path,
+    helper_path: Path,
+) -> Path:
+    output = derived / "office-visual.pdf"
+    pid_file = derived / ".office-process.json"
+    process = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(helper_path),
+            "-InputFile",
+            str(source),
+            "-OutPdf",
+            str(output),
+            "-PidFile",
+            str(pid_file),
+        ],
+        cwd=str(derived),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+        creationflags=(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if os.name == "nt"
+            else 0
+        ),
+        check=False,
+    )
+    if process.returncode != 0 or not output.is_file():
+        detail = (
+            process.stderr.decode("utf-8", errors="replace")
+            or process.stdout.decode("utf-8", errors="replace")
+        ).strip()
+        raise ReferenceError(
+            f"Office visual export failed. {detail[-1000:]}".strip()
+        )
+    inspection = _validate_pdf(output)
+    if inspection.page_count and inspection.page_count > MAX_PDF_PAGES:
+        raise ReferenceError(
+            f"Office visual export produced {inspection.page_count} pages; "
+            f"the visual-analysis limit is {MAX_PDF_PAGES}. "
+            "Attach a smaller document or request text-only analysis."
+        )
+    return output
+
+
+def _prepare_office(
+    item: dict[str, Any],
+    source: Path,
+    derived: Path,
+    *,
+    visual_requested: bool,
+    office_visual_helper: Path,
+) -> dict[str, Any]:
+    extracted = _prepare_office_text(item, source, derived)
+    needs_visual = visual_requested or source.suffix.casefold() == ".pptx"
+    images: list[Path] = []
+    if needs_visual:
+        exported_pdf = _export_office_pdf(source, derived, office_visual_helper)
+        pdfium = _load_pdfium()
+        with pdfium.PdfDocument(exported_pdf) as pdf:
+            page_indexes = list(range(len(pdf)))
+        images = _render_pdf_pages(
+            exported_pdf,
+            derived,
+            page_indexes,
+            name_prefix=(
+                "slide" if source.suffix.casefold() == ".pptx" else "office-page"
+            ),
+        )
+    return {
+        "extracted_text_path": str(extracted),
+        "image_paths": [str(path) for path in images],
+        "ocr_expected": bool(images),
+        "status": "OCR/vision" if images else "Ready",
+    }
+
+
+def _prepare_image(
+    item: dict[str, Any],
+    source: Path,
+    derived: Path,
+) -> dict[str, Any]:
+    Image, ImageOps = _load_pillow()
+    image_paths: list[str] = []
+    with Image.open(source) as image:
+        frame_count = int(getattr(image, "n_frames", 1))
+        for frame_index in range(frame_count):
+            image.seek(frame_index)
+            normalized = ImageOps.exif_transpose(image.copy())
+            if normalized.mode not in {"RGB", "RGBA"}:
+                normalized = normalized.convert("RGBA" if "A" in normalized.getbands() else "RGB")
+            normalized.thumbnail(
+                (NORMALIZED_IMAGE_MAX_DIMENSION, NORMALIZED_IMAGE_MAX_DIMENSION),
+                Image.Resampling.LANCZOS,
+            )
+            target = derived / f"image-{frame_index + 1:03d}.png"
+            normalized.save(target, format="PNG", optimize=True)
+            normalized.close()
+            image_paths.append(str(target))
+    return {
+        "extracted_text_path": None,
+        "image_paths": image_paths,
+        "ocr_expected": True,
+        "status": "OCR/vision",
+    }
+
+
+def prepare_manifest(manifest_path: Path, result_path: Path) -> None:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ReferenceError("Invalid reference preparation manifest.", 500)
+    run_root = Path(str(manifest.get("run_root", ""))).resolve(strict=True)
+    _require_contained(manifest_path, run_root, "Preparation manifest")
+    _require_contained(result_path.parent, run_root, "Preparation result directory")
+    office_visual_helper = Path(
+        str(manifest.get("office_visual_helper", ""))
+    ).resolve(strict=True)
+    visual_requested = bool(manifest.get("visual_requested"))
+    raw_items = manifest.get("references")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ReferenceError("The preparation manifest contains no references.", 500)
+
+    results: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise ReferenceError("Invalid reference manifest item.", 500)
+        source = _require_contained(
+            Path(str(item.get("source_path", ""))),
+            run_root,
+            "Reference source",
+        )
+        expected_name = sanitize_reference_filename(str(item.get("filename", "")))
+        inspection = validate_reference_file(source, expected_name)
+        if inspection.kind != item.get("kind"):
+            raise ReferenceError(
+                f"{expected_name} changed type after upload; preparation was refused."
+            )
+        derived = source.parent / "derived"
+        derived.mkdir(parents=False, exist_ok=False)
+        if inspection.kind == "Text":
+            prepared = _prepare_text(item, source, derived)
+        elif inspection.kind == "PDF":
+            prepared = _prepare_pdf(
+                item,
+                source,
+                derived,
+                visual_requested=visual_requested,
+            )
+        elif inspection.kind == "Office":
+            prepared = _prepare_office(
+                item,
+                source,
+                derived,
+                visual_requested=visual_requested,
+                office_visual_helper=office_visual_helper,
+            )
+        elif inspection.kind == "Image":
+            prepared = _prepare_image(item, source, derived)
+        else:
+            raise ReferenceError("Unsupported detected reference type.")
+        results.append(
+            {
+                "id": str(item.get("id", "")),
+                "filename": expected_name,
+                **prepared,
+            }
+        )
+    temporary = result_path.with_suffix(result_path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps({"references": results}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, result_path)
+
+
+def inspect_reference(
+    source_path: Path,
+    original_name: str,
+    result_path: Path,
+) -> None:
+    source = source_path.resolve(strict=True)
+    result_parent = result_path.parent.resolve(strict=True)
+    if source.parent != result_parent:
+        raise ReferenceError(
+            "Inspection output must stay beside the temporary upload.",
+            500,
+        )
+    inspection = validate_reference_file(source, original_name)
+    payload = {
+        "kind": inspection.kind,
+        "detected_type": inspection.detected_type,
+        "page_count": inspection.page_count,
+        "frame_count": inspection.frame_count,
+    }
+    temporary = result_path.with_suffix(result_path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary, result_path)
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser(description="Prepare Ogent temporary references")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    prepare = subcommands.add_parser("prepare")
+    prepare.add_argument("--manifest", required=True)
+    prepare.add_argument("--result", required=True)
+    inspect = subcommands.add_parser("inspect")
+    inspect.add_argument("--source", required=True)
+    inspect.add_argument("--filename", required=True)
+    inspect.add_argument("--result", required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == "prepare":
+            prepare_manifest(Path(args.manifest), Path(args.result))
+        elif args.command == "inspect":
+            inspect_reference(
+                Path(args.source),
+                str(args.filename),
+                Path(args.result),
+            )
+        return 0
+    except ReferenceError as exc:
+        if args.command == "inspect":
+            with contextlib.suppress(OSError):
+                Path(args.result).write_text(
+                    json.dumps(
+                        {"error": str(exc), "status": exc.status},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+        print(str(exc), file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"Reference preparation failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

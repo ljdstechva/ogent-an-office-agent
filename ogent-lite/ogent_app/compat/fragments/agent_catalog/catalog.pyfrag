@@ -1,0 +1,529 @@
+"""Dynamic agent capability catalogs and cache management for Ogent.
+
+The installed command-line tools are the only source of model and effort
+choices.  This module normalizes provider results, persists secret-free cached
+catalogs, coordinates bounded background refreshes, and validates browser
+selections against a successful live refresh from the current process.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+from ogent_app.ports.agent_provider import AgentProviderPort
+
+
+SCHEMA_VERSION = 2
+CACHE_FRESHNESS_SECONDS = 6 * 60 * 60
+AUTOMATIC_EFFORT = "automatic"
+
+# Fast mode: documented provider low-latency tiers, matched against the live
+# discovered catalog (Codex CLI: "mini" models + minimal/low effort;
+# Claude Code: Haiku models + low effort).
+FAST_MODEL_MARKERS = {
+    "codex": ("mini",),
+    "claude": ("haiku",),
+}
+FAST_EFFORT_PREFERENCE = {
+    "codex": ("minimal", "low"),
+    "claude": ("low",),
+}
+LOGGER = logging.getLogger(__name__)
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def normalize_executable_path(path: str) -> str:
+    return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+
+def _clean_string(value: Any, *, maximum: int = 512) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > maximum or "\x00" in text:
+        raise ValueError("Catalog text is empty or invalid.")
+    return text
+
+
+def _clean_optional_string(value: Any, *, maximum: int = 512) -> str | None:
+    if value is None:
+        return None
+    return _clean_string(value, maximum=maximum)
+
+
+def _clean_string_tuple(
+    value: Any,
+    *,
+    maximum_items: int = 128,
+    maximum_length: int = 256,
+) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Catalog list is invalid.")
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        item = _clean_string(raw, maximum=maximum_length)
+        if item in seen:
+            continue
+        result.append(item)
+        seen.add(item)
+        if len(result) > maximum_items:
+            raise ValueError("Catalog list is too large.")
+    return tuple(result)
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelCapability:
+    id: str
+    display_name: str
+    efforts: tuple[str, ...]
+    default_effort: str | None
+    input_modalities: tuple[str, ...]
+    is_default: bool
+    capability_source: str
+    efforts_verified: bool = False
+    input_context_limit: int | None = None
+    output_reserve: int = 4_096
+    tool_result_limit: int = 4_096
+    sessions_resumable: bool = False
+    partial_text_deltas: bool = False
+    context_limit_source: str = "conservative_config"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _clean_string(self.id, maximum=256))
+        object.__setattr__(
+            self,
+            "display_name",
+            _clean_string(self.display_name, maximum=256),
+        )
+        object.__setattr__(
+            self,
+            "efforts",
+            _clean_string_tuple(self.efforts, maximum_items=64),
+        )
+        object.__setattr__(
+            self,
+            "default_effort",
+            _clean_optional_string(self.default_effort, maximum=128),
+        )
+        object.__setattr__(
+            self,
+            "input_modalities",
+            _clean_string_tuple(self.input_modalities, maximum_items=32),
+        )
+        object.__setattr__(
+            self,
+            "capability_source",
+            _clean_string(self.capability_source, maximum=128),
+        )
+        if (
+            self.default_effort is not None
+            and self.default_effort not in self.efforts
+        ):
+            object.__setattr__(self, "default_effort", None)
+        if (
+            self.input_context_limit is not None
+            and int(self.input_context_limit) < 8_192
+        ):
+            raise ValueError("Model input context limit is invalid.")
+        if int(self.output_reserve) < 1_024:
+            raise ValueError("Model output reserve is invalid.")
+        if int(self.tool_result_limit) < 0:
+            raise ValueError("Model tool-result limit is invalid.")
+        object.__setattr__(
+            self,
+            "input_context_limit",
+            (
+                int(self.input_context_limit)
+                if self.input_context_limit is not None
+                else None
+            ),
+        )
+        object.__setattr__(
+            self,
+            "output_reserve",
+            int(self.output_reserve),
+        )
+        object.__setattr__(
+            self,
+            "tool_result_limit",
+            int(self.tool_result_limit),
+        )
+        object.__setattr__(
+            self,
+            "context_limit_source",
+            _clean_string(self.context_limit_source, maximum=128),
+        )
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "displayName": self.display_name,
+            "efforts": list(self.efforts),
+            "defaultEffort": self.default_effort,
+            "inputModalities": list(self.input_modalities),
+            "isDefault": self.is_default,
+            "capabilitySource": self.capability_source,
+            "effortsVerified": self.efforts_verified,
+            "inputContextLimit": self.input_context_limit,
+            "outputReserve": self.output_reserve,
+            "toolResultLimit": self.tool_result_limit,
+            "sessionsResumable": self.sessions_resumable,
+            "partialTextDeltas": self.partial_text_deltas,
+            "contextLimitSource": self.context_limit_source,
+        }
+
+    def cache_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "displayName": self.display_name,
+            "efforts": list(self.efforts),
+            "defaultEffort": self.default_effort,
+            "inputModalities": list(self.input_modalities),
+            "isDefault": self.is_default,
+            "capabilitySource": self.capability_source,
+            "effortsVerified": self.efforts_verified,
+            "inputContextLimit": self.input_context_limit,
+            "outputReserve": self.output_reserve,
+            "toolResultLimit": self.tool_result_limit,
+            "sessionsResumable": self.sessions_resumable,
+            "partialTextDeltas": self.partial_text_deltas,
+            "contextLimitSource": self.context_limit_source,
+        }
+
+    @classmethod
+    def from_cache_dict(cls, value: Any) -> "ModelCapability":
+        if not isinstance(value, dict):
+            raise ValueError("Cached model entry is invalid.")
+        return cls(
+            id=value.get("id"),
+            display_name=value.get("displayName"),
+            efforts=_clean_string_tuple(value.get("efforts", [])),
+            default_effort=value.get("defaultEffort"),
+            input_modalities=_clean_string_tuple(
+                value.get("inputModalities", [])
+            ),
+            is_default=bool(value.get("isDefault")),
+            capability_source=value.get("capabilitySource") or "cli",
+            efforts_verified=bool(value.get("effortsVerified")),
+            input_context_limit=(
+                int(value["inputContextLimit"])
+                if value.get("inputContextLimit") is not None
+                else None
+            ),
+            output_reserve=int(value.get("outputReserve") or 4_096),
+            tool_result_limit=int(
+                value.get("toolResultLimit")
+                if value.get("toolResultLimit") is not None
+                else 4_096
+            ),
+            sessions_resumable=bool(value.get("sessionsResumable")),
+            partial_text_deltas=bool(value.get("partialTextDeltas")),
+            context_limit_source=(
+                value.get("contextLimitSource")
+                or "conservative_config"
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderCatalog:
+    provider_id: str
+    label: str
+    installed: bool
+    authenticated: bool
+    cli_path: str | None
+    cli_version: str | None
+    status: str
+    models: tuple[ModelCapability, ...]
+    refreshed_at: str | None
+    stale: bool
+    warning: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "provider_id",
+            _clean_string(self.provider_id, maximum=64),
+        )
+        object.__setattr__(self, "label", _clean_string(self.label, maximum=128))
+        object.__setattr__(self, "status", _clean_string(self.status, maximum=64))
+        object.__setattr__(
+            self,
+            "cli_path",
+            _clean_optional_string(self.cli_path, maximum=2048),
+        )
+        object.__setattr__(
+            self,
+            "cli_version",
+            _clean_optional_string(self.cli_version, maximum=256),
+        )
+        object.__setattr__(
+            self,
+            "refreshed_at",
+            _clean_optional_string(self.refreshed_at, maximum=128),
+        )
+        object.__setattr__(
+            self,
+            "warning",
+            _clean_optional_string(self.warning, maximum=1000),
+        )
+        if not isinstance(self.models, tuple):
+            object.__setattr__(self, "models", tuple(self.models))
+        model_ids: set[str] = set()
+        for model in self.models:
+            if not isinstance(model, ModelCapability):
+                raise ValueError("Provider catalog contains an invalid model.")
+            if model.id in model_ids:
+                raise ValueError("Provider catalog contains a duplicate model.")
+            model_ids.add(model.id)
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.provider_id,
+            "label": self.label,
+            "installed": self.installed,
+            "authenticated": self.authenticated,
+            "status": self.status,
+            "cliVersion": self.cli_version,
+            "live": self.status == "ready" and not self.stale,
+            "stale": self.stale,
+            "models": [model.public_dict() for model in self.models],
+            "refreshedAt": self.refreshed_at,
+            "warning": self.warning,
+        }
+
+    def cache_dict(self) -> dict[str, Any]:
+        return {
+            "providerId": self.provider_id,
+            "label": self.label,
+            "refreshedAt": self.refreshed_at,
+            "models": [model.cache_dict() for model in self.models],
+        }
+
+    @classmethod
+    def from_cache_dict(
+        cls,
+        value: Any,
+        *,
+        cli_path: str,
+        cli_version: str,
+    ) -> "ProviderCatalog":
+        if not isinstance(value, dict):
+            raise ValueError("Cached provider catalog is invalid.")
+        raw_models = value.get("models")
+        if not isinstance(raw_models, list):
+            raise ValueError("Cached provider models are invalid.")
+        return cls(
+            provider_id=value.get("providerId"),
+            label=value.get("label"),
+            installed=True,
+            authenticated=False,
+            cli_path=cli_path,
+            cli_version=cli_version,
+            status="cached",
+            models=tuple(
+                ModelCapability.from_cache_dict(model) for model in raw_models
+            ),
+            refreshed_at=value.get("refreshedAt"),
+            stale=True,
+            warning="Using cached information while refreshing.",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderEnvironment:
+    provider_id: str
+    label: str
+    installed: bool
+    authenticated: bool
+    cli_path: str | None
+    cli_version: str | None
+    command: tuple[str, ...]
+    status: str
+    warning: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class EffortVerificationResult:
+    efforts: tuple[str, ...]
+    default_effort: str | None = None
+    warning: str | None = None
+    use_global_unverified: bool = False
+    inference_detected: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentSelection:
+    provider_id: str
+    model: str
+    effort: str
+
+    @property
+    def model_id(self) -> str:
+        return self.model
+
+
+class CatalogDiscoveryError(RuntimeError):
+    def __init__(self, message: str, *, status: str = "catalog_error") -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class SelectionValidationError(ValueError):
+    pass
+
+
+class AgentCatalogError(RuntimeError):
+    """Compatibility error carrying a stable browser-facing category."""
+
+    def __init__(self, message: str, *, code: str = "catalog_error") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class CapabilityCache:
+    """Versioned, atomic, secret-free provider capability cache."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        freshness_seconds: float = CACHE_FRESHNESS_SECONDS,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.path = Path(path)
+        self.freshness_seconds = freshness_seconds
+        self.clock = clock
+        self.lock = threading.RLock()
+
+    @staticmethod
+    def _entry_key(
+        provider_id: str,
+        cli_path: str,
+        cli_version: str,
+    ) -> str:
+        normalized = normalize_executable_path(cli_path)
+        payload = json.dumps(
+            [provider_id, normalized, cli_version],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _read_unlocked(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"schemaVersion": SCHEMA_VERSION, "entries": {}}
+        if (
+            not isinstance(value, dict)
+            or value.get("schemaVersion") != SCHEMA_VERSION
+            or not isinstance(value.get("entries"), dict)
+        ):
+            return {"schemaVersion": SCHEMA_VERSION, "entries": {}}
+        return value
+
+    def load(
+        self,
+        provider_id: str,
+        cli_path: str,
+        cli_version: str,
+    ) -> ProviderCatalog | None:
+        normalized = normalize_executable_path(cli_path)
+        key = self._entry_key(provider_id, normalized, cli_version)
+        with self.lock:
+            payload = self._read_unlocked()
+        entry = payload["entries"].get(key)
+        if not isinstance(entry, dict):
+            return None
+        if (
+            entry.get("providerId") != provider_id
+            or entry.get("cliPath") != normalized
+            or entry.get("cliVersion") != cli_version
+        ):
+            return None
+        try:
+            saved_at = float(entry.get("savedAt"))
+        except (TypeError, ValueError):
+            return None
+        if saved_at > self.clock() + 300:
+            return None
+        if self.clock() - saved_at > self.freshness_seconds:
+            return None
+        try:
+            return ProviderCatalog.from_cache_dict(
+                entry.get("catalog"),
+                cli_path=normalized,
+                cli_version=cli_version,
+            )
+        except ValueError:
+            return None
+
+    def store(self, catalog: ProviderCatalog) -> None:
+        if (
+            catalog.status != "ready"
+            or catalog.stale
+            or not catalog.installed
+            or not catalog.authenticated
+            or not catalog.cli_path
+            or not catalog.cli_version
+        ):
+            return
+        normalized = normalize_executable_path(catalog.cli_path)
+        key = self._entry_key(
+            catalog.provider_id,
+            normalized,
+            catalog.cli_version,
+        )
+        with self.lock:
+            payload = self._read_unlocked()
+            entries = payload["entries"]
+            for existing_key, entry in list(entries.items()):
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("providerId") == catalog.provider_id
+                    and existing_key != key
+                ):
+                    entries.pop(existing_key, None)
+            entries[key] = {
+                "providerId": catalog.provider_id,
+                "cliPath": normalized,
+                "cliVersion": catalog.cli_version,
+                "savedAt": self.clock(),
+                "catalog": catalog.cache_dict(),
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(
+                f".{self.path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+                    json.dump(
+                        payload,
+                        stream,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    # Intentional: os.replace already consumed the temp file.
+                    pass

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import shutil
 import sys
 import tempfile
@@ -183,11 +182,74 @@ class V010IntegrationTests(unittest.TestCase):
                 self.assertEqual(session.active_source, source.resolve())
                 self.assertIsNotNone(session.recovery_backup)
                 self.assertEqual(
-                    hashlib.sha256(observed_backup[0].backup_path.read_bytes()).digest(),
+                    hashlib.sha256(
+                        observed_backup[0].backup_path.read_bytes()
+                    ).digest(),
                     hashlib.sha256(original).digest(),
                 )
                 source.write_bytes(original + b"-edited")
                 self.assertEqual(observed_backup[0].backup_path.read_bytes(), original)
+
+    def test_zero_byte_local_document_is_initialized_after_verified_backup(
+        self,
+    ) -> None:
+        session = self.state.create_session()
+        source = self.root / "blank.docx"
+        source.write_bytes(b"")
+
+        def initialize(document: Path) -> None:
+            records = ogent.BACKUP_STORE.list_records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].backup_path.read_bytes(), b"")
+            document.write_bytes(b"valid-blank-docx-package")
+
+        patches = self._open_patches()
+        with (
+            mock.patch.object(
+                ogent,
+                "initialize_blank_office_document",
+                side_effect=initialize,
+            ) as initialize_blank,
+            patches[0],
+            patches[1],
+            patches[2],
+        ):
+            result = ogent.dispatch_open_path(session, str(source))
+
+        initialize_blank.assert_called_once_with(source.resolve())
+        self.assertTrue(result["blank_initialized"])
+        self.assertIn("Blank DOCX initialized", result["message"])
+        self.assertEqual(source.read_bytes(), b"valid-blank-docx-package")
+        assert session.recovery_backup is not None
+        self.assertEqual(session.recovery_backup.byte_size, 0)
+        self.assertEqual(session.recovery_backup.backup_path.read_bytes(), b"")
+
+    def test_failed_zero_byte_open_restores_original_placeholder(self) -> None:
+        session = self.state.create_session()
+        source = self.root / "blank-failure.xlsx"
+        source.write_bytes(b"")
+
+        def initialize(document: Path) -> None:
+            document.write_bytes(b"valid-blank-xlsx-package")
+
+        with (
+            mock.patch.object(
+                ogent,
+                "initialize_blank_office_document",
+                side_effect=initialize,
+            ),
+            mock.patch.object(
+                ogent,
+                "start_watch",
+                side_effect=ogent.UserFacingError("watch failed", 500),
+            ),
+            mock.patch.object(ogent, "stop_watch", return_value=None),
+        ):
+            with self.assertRaisesRegex(ogent.UserFacingError, "watch failed"):
+                ogent.open_document(session, str(source))
+
+        self.assertEqual(source.read_bytes(), b"")
+        self.assertIsNone(session.active_doc)
 
     def test_backup_failure_aborts_before_watch_or_document_commit(self) -> None:
         session = self.state.create_session()
@@ -284,18 +346,14 @@ class V010IntegrationTests(unittest.TestCase):
         with session.lock:
             session.orphan_since = 1_000.0
         self.state.session_grace_seconds = 10.0
-        self.assertFalse(
-            ogent.close_session(session, require_reapable_at=1_005.0)
-        )
+        self.assertFalse(ogent.close_session(session, require_reapable_at=1_005.0))
         self.assertTrue(memory_root.is_dir())
         session.connect_sse("reconnected-client")
         self.assertIsNone(session.orphan_since)
         session.mark_page_closed("reconnected-client")
         with session.lock:
             session.orphan_since = 2_000.0
-        self.assertTrue(
-            ogent.close_session(session, require_reapable_at=2_011.0)
-        )
+        self.assertTrue(ogent.close_session(session, require_reapable_at=2_011.0))
         self.assertFalse(memory_root.exists())
         with self.assertRaises(ogent.UserFacingError):
             self.state.get_session(session.session_id)
@@ -468,9 +526,7 @@ class V010IntegrationTests(unittest.TestCase):
                 session.run_id = run_id
                 session.run_status = "working"
                 session.run_complete.clear()
-                self.assertTrue(
-                    ogent._finish_session_run(session, run_id, terminal)
-                )
+                self.assertTrue(ogent._finish_session_run(session, run_id, terminal))
                 self.assertEqual(
                     (session.run_status, session.last_run_outcome),
                     expected,
@@ -546,31 +602,50 @@ class V010IntegrationTests(unittest.TestCase):
     def test_ui_template_has_accessible_status_settings_and_selection_contract(
         self,
     ) -> None:
-        html = ogent.HTML_TEMPLATE
-        self.assertIn('aria-label="Settings and recovery"', html)
-        self.assertIn('role="dialog"', html)
-        self.assertIn('role="status"', html)
-        self.assertIn("@media (prefers-reduced-motion: reduce)", html)
-        for state in ("working", "completed", "error", "stopped", "neutral"):
-            self.assertIn(f".run-status.{state}", html)
-        self.assertIn('id="selectionTray"', html)
-        self.assertIn("selection-chip.primary", html)
-        self.assertIn("Clear selection", html)
-        self.assertIn("Touch multi-select", html)
-        self.assertIn("@media (max-width: 820px)", html)
-        self.assertIn("grid-template-rows: auto auto auto auto auto;", html)
-        self.assertIn("max-height: min(320px, 38vh);", html)
-        self.assertIn("LITE __VERSION__", html)
-        self.assertIn("Editing original · recovery backup created", html)
-        self.assertIn("Browser upload · editing an imported copy", html)
-        self.assertNotIn("Delete all backups", html)
-        self.assertNotIn("legacySetRunStatus", html)
-
-        declared_ids = set(re.findall(r'\bid="([^"]+)"', html))
-        referenced_ids = set(
-            re.findall(r'document\.getElementById\("([^"]+)"\)', html)
+        source_root = OGENT_DIR / "web" / "src"
+        frontend = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(source_root.rglob("*"))
+            if path.suffix in {".ts", ".tsx", ".css"} and ".test." not in path.name
         )
-        self.assertEqual(referenced_ids - declared_ids, set())
+        self.assertIn('aria-label="Settings and recovery"', frontend)
+        self.assertIn('role="dialog"', frontend)
+        self.assertIn('role="status"', frontend)
+        self.assertIn(
+            "@media (prefers-reduced-motion: reduce)",
+            frontend,
+        )
+        for state in (
+            "working",
+            "edit_completed",
+            "analysis_completed",
+            "error",
+            "stopped",
+            "no_change",
+        ):
+            self.assertIn(f".run-status.{state}", frontend)
+        self.assertIn('className="selection-tray"', frontend)
+        self.assertIn(".selection-chip.primary", frontend)
+        self.assertIn("Clear selection", frontend)
+        self.assertIn("Multi-select", frontend)
+        self.assertIn("@media (max-width: 820px)", frontend)
+        self.assertIn(
+            "grid-template-columns: repeat(2, minmax(0, 1fr));",
+            frontend,
+        )
+        self.assertIn("LITE {config.version}", frontend)
+        self.assertIn(
+            "Editing original · recovery backup created",
+            frontend,
+        )
+        self.assertIn(
+            "Browser upload · editing an imported copy",
+            frontend,
+        )
+        self.assertNotIn("Delete all backups", frontend)
+        self.assertNotIn("legacySetRunStatus", frontend)
+        self.assertEqual(frontend.count("document.getElementById"), 1)
+        self.assertIn('document.getElementById("root")', frontend)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,11 @@
   only if the user asks.
 - officecli syntax unsure? Run `officecli help <format> <element>` — never guess.
 - Prefer one atomic `officecli batch` over many single edits.
+- LIVE PREVIEW: `OFFICECLI_RESIDENT_FLUSH=each` is set machine-wide (user env var), so
+  every mutation is flushed to disk immediately and AionUi's preview panel updates live.
+  Do not rely on idle auto-flush. `OFFICECLI_NO_AUTO_RESIDENT=1` remains a valid per-shell
+  alternative (direct mode); either is fine, never assume unflushed resident state is visible
+  to other programs.
 - Never commit or push personal documents; pushes to public repos require the
   user's explicit yes.
 

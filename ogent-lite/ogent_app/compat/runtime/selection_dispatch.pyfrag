@@ -1,0 +1,641 @@
+def handle_chat_message(
+    session: SessionState,
+    message: str,
+    provider: Any = DEFAULT_PROVIDER,
+    model: Any = None,
+    effort: Any = AUTOMATIC_EFFORT,
+    client_id: str | None = None,
+    fast: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    raw_text = message if isinstance(message, str) else str(message)
+    text = raw_text if raw_text.strip() else ""
+    if len(raw_text) > MAX_CHAT_MESSAGE_CHARS:
+        raise UserFacingError(
+            f"A single chat message may contain up to "
+            f"{MAX_CHAT_MESSAGE_CHARS:,} characters.",
+            413,
+        )
+    with session.reference_lock:
+        has_references = bool(session.pending_references)
+        has_retained = bool(session.retained_references)
+    with session.lock:
+        has_document = session.active_doc is not None
+    has_selection = bool(session.preview_selection.targets)
+    if not text and has_references:
+        text = (
+            "Read and analyze the attached reference files. "
+            "Summarize the important findings."
+        )
+    if not text and has_selection:
+        text = (
+            "Review the selected document elements and suggest improvements "
+            "without editing them."
+        )
+    if not text:
+        raise UserFacingError("Type a request or attach a temporary reference first.")
+    if has_document or has_references or has_retained:
+        if fast:
+            try:
+                selection = AGENT_CATALOG.resolve_fast_selection(
+                    provider,
+                    model,
+                    effort,
+                )
+            except SelectionValidationError as exc:
+                raise UserFacingError(str(exc), 409) from exc
+        else:
+            selection = validate_agent_selection(provider, model, effort)
+        run_id = start_agent_run(
+            session,
+            text,
+            selection.model,
+            selection.effort,
+            selection.provider_id,
+            selection=selection,
+            client_id=client_id,
+            fast=fast,
+        )
+        with session.lock:
+            contract = (
+                session.run_contract
+                if session.run_id == run_id
+                else None
+            )
+        if contract is None:
+            raise UserFacingError(
+                "The run execution contract is unavailable.",
+                500,
+            )
+        return 202, {
+            "message": "Run started.",
+            "run_id": run_id,
+            "provider": selection.provider_id,
+            "model": selection.model,
+            "effort": selection.effort,
+            "fast": fast,
+            "references": has_references,
+            "analysis_only": contract.analysis_only,
+            "mode": contract.mode.value,
+            "scope": contract.scope.value,
+            "requires_mutation": contract.requires_mutation,
+        }
+
+    session.add_message("user", text)
+    pdf_path = extract_pdf_path(text)
+    if pdf_path:
+        deduped = STATE.claim_source(session, pdf_path)
+        if deduped is not None:
+            return 200, {
+                "action": "focus_session",
+                "session_id": deduped.session_id,
+                "url": f"/?s={deduped.session_id}",
+                "message": "That PDF is already open in another Ogent session.",
+            }
+        try:
+            run_id = start_pdf_import(session, pdf_path, text)
+        except Exception:
+            STATE.release_claim(session, pdf_path)
+            raise
+        return 202, {
+            "message": "Preparing a protected PDF working copy.",
+            "run_id": run_id,
+        }
+    if "pdf" in text.casefold():
+        with session.lock:
+            session.pending_pdf = True
+        response = (
+            "Paste the absolute PDF path here. I will copy it, convert the copy through the "
+            "Word-first PDF pipeline, and open the working DOCX on the left. The original will remain untouched."
+        )
+    else:
+        response = (
+            "Open a .docx, .xlsx, or .pptx using the path field above. "
+            "For a PDF, ask me to edit it and then paste its absolute path."
+        )
+    session.add_message("assistant", response)
+    return 200, {"message": response}
+
+
+def stop_active_run(session: SessionState) -> bool:
+    with session.lock:
+        process = session.run_process
+        active = session.run_status in ACTIVE_RUN_STATUSES
+        if not active:
+            return False
+        session.stop_requested = True
+        session.run_status = "stopping"
+        run_id = session.run_id
+        cancel_event = (
+            session.owned_cancel_events.get(run_id)
+            if run_id is not None
+            else None
+        )
+    if cancel_event is not None:
+        cancel_event.set()
+    if run_id and session.workspace_actor is not None:
+        try:
+            run, durable_event = session.workspace_actor.dispatch(
+                RequestRunCancellation(run_id)
+            )
+            del run
+            session.emit(
+                "run.cancellation_requested",
+                {"run_id": run_id},
+                durable_sequence=durable_event.sequence,
+            )
+        except Exception as projection_error:
+            backend_log(
+                "run_cancellation_projection_failed",
+                session_id=session.session_id,
+                run_id=run_id,
+                error_type=type(projection_error).__name__,
+            )
+    session.emit("run", {"status": "stopping", "run_id": run_id})
+    STATE.broadcast_sessions()
+    terminate_process_tree(process)
+    if run_id:
+        with session.reference_lock:
+            run_root = session.reference_run_roots.get(run_id)
+        if run_root is not None:
+            _terminate_tracked_reference_office_processes(run_root)
+        cancel_incomplete_run_steps(session, run_id)
+    return True
+
+
+def remove_preview_selection(
+    session: SessionState,
+    selection_id: str,
+) -> None:
+    with session.lock:
+        port = session.watch_port
+    with session.preview_selection.lock:
+        current = list(session.preview_selection.targets)
+    if not any(item.selection_id == selection_id for item in current):
+        raise UserFacingError("Preview selection target not found.", 404)
+    remaining_paths = [
+        item.path for item in current if item.selection_id != selection_id
+    ]
+    if port is None:
+        raise UserFacingError("The OfficeCLI preview is not available.", 409)
+    try:
+        post_session_watch_selection(session, port, remaining_paths)
+        session.preview_selection.remove(selection_id)
+    except PreviewSelectionError as exc:
+        raise UserFacingError(str(exc), 409) from exc
+    emit_preview_selection(session)
+
+
+def clear_preview_selection(session: SessionState) -> None:
+    with session.lock:
+        port = session.watch_port
+    if port is not None:
+        try:
+            post_session_watch_selection(session, port, [])
+        except PreviewSelectionError as exc:
+            raise UserFacingError(str(exc), 409) from exc
+    session.preview_selection.clear()
+    emit_preview_selection(session)
+
+
+def select_indexed_document_nodes(
+    session: SessionState,
+    node_ids: list[str],
+) -> dict[str, Any]:
+    """Resolve indexed nodes, focus Live View, and scope the next request."""
+    identifiers = tuple(dict.fromkeys(str(value) for value in node_ids))
+    if not identifiers or len(identifiers) > 20:
+        raise UserFacingError(
+            "Select between one and twenty indexed document nodes."
+        )
+    if DOCUMENT_REPOSITORY is None:
+        raise UserFacingError("Document intelligence is unavailable.", 503)
+    with session.watch_lock:
+        with session.lock:
+            document = session.active_doc
+            document_id = session.document_id
+            document_revision = session.document_revision
+            port = session.watch_port
+            multi_mode = session.selection_multi_mode
+            if session.run_status in ACTIVE_RUN_STATUSES:
+                raise UserFacingError(
+                    "Wait for the active run to finish before changing scope.",
+                    409,
+                )
+        if document is None or not document_id or port is None:
+            raise UserFacingError(
+                "The current document does not have a selectable Live View.",
+                409,
+            )
+        current = DOCUMENT_REPOSITORY.current_revision(document_id)
+        if current is None:
+            raise UserFacingError(
+                "The current document index is unavailable.",
+                409,
+            )
+        records = DOCUMENT_REPOSITORY.nodes_for_ids(
+            current.revision_id,
+            identifiers,
+            include_text=False,
+        )
+        by_id = {record.node_id: record for record in records}
+        if any(identifier not in by_id for identifier in identifiers):
+            raise UserFacingError(
+                "One or more map nodes no longer belong to the current revision.",
+                409,
+            )
+        unresolved = [
+            by_id[identifier].node.title
+            or by_id[identifier].node.stable_path
+            for identifier in identifiers
+            if not by_id[identifier].node.locator.resolvable
+        ]
+        if unresolved:
+            raise UserFacingError(
+                "That map item is informational and cannot be focused "
+                "in Live View.",
+                409,
+            )
+        requested_paths = [
+            by_id[identifier].node.stable_path
+            for identifier in identifiers
+        ]
+        if multi_mode:
+            with session.preview_selection.lock:
+                requested_paths = list(
+                    dict.fromkeys(
+                        (
+                            *(
+                                item.path
+                                for item in session.preview_selection.targets
+                            ),
+                            *requested_paths,
+                        )
+                    )
+                )
+        try:
+            targets = session.preview_selection.apply_paths(
+                requested_paths,
+                lambda selected: _resolve_preview_nodes(
+                    session,
+                    selected,
+                    expected_document=document,
+                    expected_revision=document_revision,
+                ),
+                primary_path=requested_paths[-1],
+                expected_watch_id=session.preview_selection.watch_id,
+                expected_document_id=document_id,
+                expected_revision=document_revision,
+            )
+            accepted_paths = [item.path for item in targets]
+            post_session_watch_selection(session, port, accepted_paths)
+        except PreviewSelectionError as exc:
+            raise UserFacingError(str(exc), 409) from exc
+    emit_preview_selection(session)
+    return {
+        "preview_selection": preview_selection_public(session),
+        "message": (
+            f"Focused {targets[-1].label} and scoped the next request."
+        ),
+    }
+
+
+def accept_postmessage_selection(
+    session: SessionState,
+    payload: dict[str, Any],
+    *,
+    event_origin: str,
+    source_matches: bool,
+) -> None:
+    with session.lock:
+        port = session.watch_port
+        document = session.active_doc
+        revision = session.document_revision
+        document_id = session.document_id
+        multi_mode = session.selection_multi_mode
+    if port is None or document is None:
+        raise UserFacingError("The OfficeCLI preview is not available.", 409)
+    allowed_origins = {
+        f"http://localhost:{STATE.server_port}",
+        f"http://{HOST}:{port}",
+    }
+    if event_origin not in allowed_origins:
+        raise UserFacingError("Preview selection origin mismatch.", 409)
+    try:
+        paths = session.preview_selection.validate_bridge_envelope(
+            payload,
+            event_origin=event_origin,
+            expected_origin=event_origin,
+            source_matches=source_matches,
+        )
+        if multi_mode and len(paths) == 1:
+            # The OfficeCLI SSE broker owns touch-toggle semantics. A browser click
+            # also emits this postMessage copy, which can arrive after the broker
+            # has already merged the clicked path into the multi-selection. Do not
+            # let that duplicate single-path envelope overwrite the merged set.
+            return
+        targets = session.preview_selection.apply_paths(
+            paths,
+            lambda selected: _resolve_preview_nodes(
+                session,
+                selected,
+                expected_document=document,
+                expected_revision=revision,
+            ),
+            primary_path=str(payload.get("primary_path") or "") or None,
+            expected_watch_id=session.preview_selection.watch_id,
+            expected_document_id=document_id,
+            expected_revision=revision,
+        )
+        accepted_paths = [item.path for item in targets]
+        if accepted_paths != paths:
+            post_session_watch_selection(session, port, accepted_paths)
+    except PreviewSelectionError as exc:
+        raise UserFacingError(str(exc), 409) from exc
+    emit_preview_selection(session)
+
+
+def focus_submitted_selection(
+    session: SessionState,
+    payload: Any,
+) -> dict[str, Any]:
+    """Resolve a submitted selection from canonical memory and focus its watch target."""
+    with session.watch_lock:
+        return _focus_submitted_selection_locked(session, payload)
+
+
+def _focus_submitted_selection_locked(
+    session: SessionState,
+    payload: Any,
+) -> dict[str, Any]:
+    """Focus one historical target while preview lifecycle changes are excluded."""
+    try:
+        message_sequence, selection_id = validate_focus_payload(payload)
+    except HistoricalFocusError as exc:
+        raise UserFacingError(str(exc), exc.status) from exc
+
+    with session.lock:
+        if session.closed:
+            raise UserFacingError("This Ogent session has closed.", 410)
+        if session.opening_source is not None:
+            raise UserFacingError(
+                "Wait for the Office document to finish opening before focusing history.",
+                409,
+            )
+        if session.run_status in ACTIVE_RUN_STATUSES:
+            raise UserFacingError(
+                "Wait for the active agent run to finish before focusing history.",
+                409,
+            )
+        document = session.active_doc
+        document_id = session.document_id
+        document_revision = session.document_revision
+        watch_port = session.watch_port
+        watch_generation = session.watch_generation
+        memory = session.memory
+    if document is None or not document_id:
+        raise UserFacingError("Open the selection's Office document first.", 409)
+    if watch_port is None or not watch_generation or not watch_http_alive(watch_port):
+        raise UserFacingError(
+            "The live preview is unavailable. Reload it, then try the selection again.",
+            409,
+        )
+
+    try:
+        reference = resolve_memory_selection(
+            memory,
+            expected_session_id=session.session_id,
+            message_sequence=message_sequence,
+            selection_id=selection_id,
+        )
+        if reference.document_id != document_id:
+            raise HistoricalFocusError(
+                "That selection belongs to a different Office document.",
+                409,
+            )
+        if reference.document_format != document.suffix.casefold().lstrip("."):
+            raise HistoricalFocusError(
+                "That selection no longer matches the active Office document.",
+                409,
+            )
+        before_sha256 = package_sha256(document)
+        target = resolve_current_target(
+            run_quiet,
+            document,
+            reference,
+            current_revision=document_revision,
+        )
+        result = focus_historical_target(
+            run_quiet,
+            document,
+            target,
+            session.historical_focus,
+        )
+        after_sha256 = package_sha256(document)
+    except HistoricalFocusError as exc:
+        raise UserFacingError(str(exc), exc.status) from exc
+    except PreviewSelectionError as exc:
+        raise UserFacingError(str(exc), 409) from exc
+    except OSError as exc:
+        raise UserFacingError(
+            "The Office document could not be verified after focusing history.",
+            503,
+        ) from exc
+
+    if after_sha256 != before_sha256:
+        raise UserFacingError(
+            "The Office document changed while the historical selection was focused. "
+            "Try again after editing finishes.",
+            409,
+        )
+    with session.lock:
+        if (
+            session.closed
+            or session.active_doc is None
+            or session.active_doc.resolve() != document.resolve()
+            or session.document_id != document_id
+            or session.document_revision != document_revision
+            or session.watch_port != watch_port
+            or session.watch_generation != watch_generation
+            or session.run_status in ACTIVE_RUN_STATUSES
+        ):
+            raise UserFacingError(
+                "The active document changed while the historical selection was focused.",
+                409,
+            )
+    return {
+        **result.public_state(),
+        "message": f"Focused {result.label}.",
+        "document_revision": document_revision,
+        "document_sha256": after_sha256,
+        "preview_identity": preview_identity_public(session),
+    }
+
+
+def reset_document_conversation(
+    session: SessionState,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    if reason not in {"new_chat", "settings_clear"}:
+        raise UserFacingError("Invalid conversation reset reason.", 400)
+    cleanup_pending = False
+    quarantine: Path | None = None
+    with session.reference_lock:
+        with session.lock:
+            if (
+                session.run_status in ACTIVE_RUN_STATUSES
+                or (
+                    session.run_thread is not None
+                    and session.run_thread.is_alive()
+                )
+            ):
+                raise UserFacingError(
+                    "Stop the active run before starting a new chat.",
+                    409,
+                )
+            if session.opening_source is not None:
+                raise UserFacingError(
+                    "Wait for the document to finish opening before starting a new chat.",
+                    409,
+                )
+            if session.snapshot_in_progress:
+                raise UserFacingError(
+                    "Wait for Word view generation to finish before starting a new chat.",
+                    409,
+                )
+            if session.reference_operations:
+                raise UserFacingError(
+                    "Wait for attachment uploads to finish before starting a new chat.",
+                    409,
+                )
+            if session.active_references or session.reference_run_roots:
+                raise UserFacingError(
+                    "Wait for temporary attachment processing to finish before "
+                    "starting a new chat.",
+                    409,
+                )
+            document = session.active_doc
+            port = session.watch_port
+            has_historical_marks = bool(session.historical_focus.marks)
+            if session.attachment_store is None or session.memory is None:
+                raise UserFacingError("Session memory is unavailable.", 500)
+            try:
+                if port is not None:
+                    post_session_watch_selection(session, port, [])
+                if document is not None and has_historical_marks:
+                    clear_historical_focus(
+                        run_quiet,
+                        document,
+                        session.historical_focus,
+                    )
+                quarantine = (
+                    session.attachment_store.stage_conversation_clear()
+                )
+                try:
+                    session.memory.clear_conversation(
+                        preserve_document=True
+                    )
+                    if session.durable_conversation is not None:
+                        generation = session.durable_conversation.clear(
+                            reason=reason
+                        )
+                except Exception:
+                    session.attachment_store.rollback_conversation_clear(
+                        quarantine
+                    )
+                    quarantine = None
+                    raise
+            except (
+                HistoricalFocusError,
+                PreviewSelectionError,
+                RetainedAttachmentError,
+                SessionMemoryError,
+                OSError,
+            ) as exc:
+                raise UserFacingError(
+                    "The new chat could not start because the current "
+                    "conversation state could not be cleared safely.",
+                    409,
+                ) from exc
+            session.pending_references.clear()
+            session.retained_references.clear()
+            session.active_references.clear()
+            session.run_retained_ids.clear()
+            session.reference_run_roots.clear()
+            if session.durable_conversation is None:
+                session.transcript.clear()
+            session.codex_thread_id = None
+            session.codex_model_id = None
+            session.claude_session_id = None
+            session.claude_model_id = None
+            session.pending_pdf = False
+            session.last_error = None
+            session.last_run_outcome = "neutral"
+            session.run_status = "idle"
+            session.run_id = None
+            session.stop_requested = False
+            session.active_timing = None
+            session.last_timing = None
+            session.last_provider_usage.clear()
+            session.run_user_sequence = None
+            session.run_user_turn_id = None
+            session.run_conversation_generation = None
+            session.run_client_id = None
+            session.run_contract = None
+            session.run_plan = None
+            session.run_steps = []
+            session.run_resume_checkpoint = None
+            session.assistant_stream = None
+            session.owned_cancel_events.clear()
+            session.run_capability = None
+            session.selection_multi_mode = False
+            session.preview_selection.clear()
+            session.historical_focus.marks = ()
+            session.historical_focus.selection_id = None
+            session.preview_update_status = "idle"
+            session.preview_update_message = ""
+            session.preview_confirmation = None
+            if session.durable_conversation is None:
+                session.conversation_generation += 1
+                generation = session.conversation_generation
+            else:
+                session.conversation_generation = generation
+            summary = {
+                **session.memory.summary(),
+                "retained_turns": session.transcript_count(),
+                "durable": session.durable_conversation is not None,
+            }
+        if quarantine is not None:
+            try:
+                session.attachment_store.commit_conversation_clear(
+                    quarantine
+                )
+            except (RetainedAttachmentError, OSError):
+                cleanup_pending = True
+    event = {
+        "generation": generation,
+        "reason": reason,
+        "transcript": [],
+        "references": [],
+        "retained_attachments": [],
+        "preview_selection": preview_selection_public(session),
+        "session_memory": summary,
+        "cleanup_pending": cleanup_pending,
+    }
+    session.emit("conversation_reset", event)
+    STATE.broadcast_sessions()
+    if cleanup_pending:
+        session.add_activity(
+            "memory",
+            "New chat started; detached attachment files will be removed "
+            "when this workspace closes.",
+        )
+    return event
+
+
+def clear_session_memory(session: SessionState) -> dict[str, Any]:
+    """Compatibility entry point shared by Settings and the New Chat control."""
+    return reset_document_conversation(
+        session,
+        reason="settings_clear",
+    )["session_memory"]

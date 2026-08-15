@@ -34,9 +34,7 @@ class FakeConverterProcess:
         self.output = output
         self.pid = 987654
         if returncode == 0:
-            destination = Path(
-                self.arguments[self.arguments.index("-OutPdf") + 1]
-            )
+            destination = Path(self.arguments[self.arguments.index("-OutPdf") + 1])
             destination.write_bytes(b"%PDF-1.7\nsynthetic-word-view\n%%EOF")
 
     def communicate(self, timeout: int) -> tuple[str, None]:
@@ -50,133 +48,136 @@ class FakeConverterProcess:
 
 class PreviewFallbackTemplateTests(unittest.TestCase):
     @staticmethod
-    def function_body(name: str, next_name: str) -> str:
-        match = re.search(
-            rf"(?:async\s+)?function {name}\b[\s\S]*?"
-            rf"(?=(?:async\s+)?function {next_name}\b)",
-            ogent.HTML_TEMPLATE,
-        )
-        if match is None:
-            raise AssertionError(f"Could not find JavaScript function {name}")
-        return match.group(0)
+    def preview_source() -> str:
+        return (
+            OGENT_DIR / "web" / "src" / "components" / "document" / "PreviewSurface.tsx"
+        ).read_text(encoding="utf-8")
 
-    def test_template_declares_only_the_six_preview_states(self) -> None:
+    def test_preview_state_and_mode_unions_are_closed(self) -> None:
+        source = self.preview_source()
         match = re.search(
-            r"const PREVIEW_STATES = new Set\(\[(?P<states>[\s\S]*?)\]\);",
-            ogent.HTML_TEMPLATE,
+            r"type PreviewState\s*=\s*(?P<states>[^;]+);",
+            source,
         )
         self.assertIsNotNone(match)
         assert match is not None
         self.assertEqual(
             re.findall(r'"([^"]+)"', match.group("states")),
             [
+                "empty",
                 "loading",
-                "live",
-                "live-complex",
-                "word-view-loading",
-                "word-view",
+                "ready",
+                "degraded",
                 "error",
             ],
         )
+        self.assertIn('type PreviewMode = "live" | "word";', source)
 
     def test_live_view_waits_for_event_stream_and_uses_same_origin(self) -> None:
-        html = ogent.HTML_TEMPLATE
-        self.assertIn('new URL("/preview", window.location.origin)', html)
-        self.assertNotIn("http://localhost:${window.location.port}/preview", html)
-        self.assertIn("if (!eventStreamReady) {", html)
-        self.assertIn("source.onopen = () =>", html)
-        self.assertIn("activatePendingPreview()", html)
-        source = Path(ogent.__file__).read_text(encoding="utf-8")
+        source = self.preview_source()
+        workspace_hook = (
+            OGENT_DIR / "web" / "src" / "hooks" / "useWorkspace.ts"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'new URL("/preview", window.location.origin)',
+            source,
+        )
+        self.assertNotIn("http://localhost", source)
+        self.assertIn(
+            "!workspace.preview_identity || !workspace.stream_connected",
+            source,
+        )
+        self.assertIn(
+            "source.onopen = () => dispatch",
+            workspace_hook,
+        )
+        source = (
+            Path(ogent.__file__).parent / "ogent_app" / "api" / "http_get_routes.py"
+        ).read_text(encoding="utf-8")
         serve_events = source[
-            source.index("    def _serve_events("):
-            source.index("    def _write_event(")
+            source.index("    def _serve_events(") : source.index(
+                "    def _write_event("
+            )
         ]
         self.assertLess(
             serve_events.index("session.connect_sse(client_id)"),
-            serve_events.index(
-                'self.send_header("Content-Type", "text/event-stream'
-            ),
+            serve_events.index('self.send_header("Content-Type", "text/event-stream'),
         )
 
     def test_meaningful_live_content_and_complex_fallback_are_explicit(self) -> None:
-        html = ogent.HTML_TEMPLATE
-        self.assertIn('event.data.protocol === "ogent-preview-status"', html)
-        self.assertIn('event.data.type === "preview.ready"', html)
-        self.assertIn("event.data.meaningful === true", html)
+        source = self.preview_source()
+        self.assertIn('data.protocol === "ogent-preview-status"', source)
+        self.assertIn('data.type === "preview.ready"', source)
+        self.assertIn("data.meaningful === true", source)
         self.assertIn(
-            'state.complex_layout ? "live-complex" : "live"',
-            html,
+            'setStatus(approximate ? "degraded" : "ready")',
+            source,
         )
         self.assertIn(
-            'reportPreviewStatus("meaningless", reason, metrics)',
-            html,
+            'reportPreview("meaningless", detail, metrics)',
+            source,
         )
-        self.assertIn(
-            "openWordView({ automatic: true, reason })",
-            html,
-        )
+        self.assertIn("void openWord();", source)
 
     def test_warning_banner_and_retry_controls_never_cover_the_iframe(self) -> None:
-        html = ogent.HTML_TEMPLATE
+        source = self.preview_source()
+        styles = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((OGENT_DIR / "web" / "src" / "styles").glob("*.css"))
+        )
         warning = (
-            "Complex layout detected. Live View is approximate; "
-            "use Word View for exact rendering."
+            "Live View is approximate for this complex Word layout. "
+            "Use Exact Word View for authoritative rendering."
         )
-        automatic = (
-            "This document uses a complex Word layout. Word View was opened "
-            "automatically for accurate rendering."
-        )
-        self.assertIn(warning, html)
-        self.assertIn(automatic, html)
+        self.assertIn(warning, source)
         self.assertLess(
-            html.index('id="previewBanner"'),
-            html.index('class="preview-stage"'),
+            source.index('className="preview-banner"'),
+            source.index('className="preview-stage"'),
         )
-        self.assertIn('id="previewRetryButton"', html)
-        self.assertIn('id="previewWordButton"', html)
-        self.assertIn("@media (max-width: 760px)", html)
+        self.assertIn("Retry Live View", source)
+        self.assertIn("Open Exact Word View", source)
+        self.assertIn("@media (max-width: 760px)", styles)
 
     def test_manual_word_view_reuses_the_document_iframe(self) -> None:
-        body = self.function_body("openWordView", "handlePreviewFrameLoad")
-        self.assertIn("elements.preview.src = snapshotUrl.href", body)
-        self.assertNotIn("window.open", body)
-        self.assertIn("result.document_id", body)
-        self.assertIn("result.document_revision", body)
-        self.assertIn("sameDocumentIdentity", body)
+        source = self.preview_source()
+        self.assertIn("const openWord = useCallback", source)
+        self.assertIn("setFrameUrl(value.href)", source)
+        self.assertNotIn("window.open", source)
+        self.assertIn("result.document_id !== identity.document_id", source)
+        self.assertIn("result.document_revision", source)
+        self.assertIn("wordIdentityRef.current = requestedKey", source)
 
     def test_live_and_word_failures_have_visible_recovery_paths(self) -> None:
-        html = ogent.HTML_TEMPLATE
-        self.assertIn('transitionPreview("error"', html)
-        self.assertIn('title: "Live View unavailable"', html)
-        self.assertIn('title: "Word View unavailable"', html)
+        source = self.preview_source()
+        self.assertIn('setStatus("error")', source)
+        self.assertIn('"Live View unavailable"', source)
+        self.assertIn('"Exact Word View unavailable"', source)
         self.assertIn(
-            'elements.previewRetry.addEventListener("click", repairWatch)',
-            html,
+            "onClick={() => void openLive(true)}",
+            source,
         )
-        self.assertIn("connectEventStream({ force: true })", html)
-        self.assertIn("eventStreamAttempt !== streamAttempt", html)
         self.assertIn(
-            'elements.preview.addEventListener("error", handlePreviewFrameError)',
-            html,
+            "onError={() =>",
+            source,
         )
 
     def test_stale_preview_messages_and_snapshot_results_are_ignored(self) -> None:
-        html = ogent.HTML_TEMPLATE
+        source = self.preview_source()
         self.assertIn(
-            "event.data.document_id !== identity.document_id",
-            html,
+            "data.document_id !== identity.document_id",
+            source,
         )
         self.assertIn(
-            "event.data.watch_generation !== identity.watch_generation",
-            html,
+            "data.watch_generation !== identity.watch_generation",
+            source,
         )
         self.assertIn(
-            "previewMachine.attempt !== attempt",
-            html,
+            "result.document_id !== identity.document_id",
+            source,
         )
         self.assertIn(
-            "!sameDocumentIdentity(requestedIdentity, activeIdentity)",
-            html,
+            "Number(result.document_revision ?? 0)",
+            source,
         )
 
 
@@ -271,9 +272,7 @@ class WordViewSnapshotTests(unittest.TestCase):
         self.assertIn("converter diagnostic", self.session.snapshot_error or "")
         events = [
             json.loads(line)
-            for line in ogent.RUNTIME_LOG_PATH.read_text(
-                encoding="utf-8"
-            ).splitlines()
+            for line in ogent.RUNTIME_LOG_PATH.read_text(encoding="utf-8").splitlines()
         ]
         self.assertEqual(events[-1]["event"], "word_view_failed")
         self.assertEqual(events[-1]["document_id"], self.session.document_id)
@@ -318,9 +317,7 @@ class WordViewSnapshotTests(unittest.TestCase):
         state = ogent.OgentState()
         state.sessions[self.session.session_id] = self.session
         ogent.STATE = state
-        snapshot_root = (
-            ogent.WORK_ROOT / self.session.session_id / "word-view"
-        )
+        snapshot_root = ogent.WORK_ROOT / self.session.session_id / "word-view"
         snapshot_root.mkdir(parents=True)
         snapshot = snapshot_root / "cached.pdf"
         snapshot.write_bytes(b"%PDF-1.7\nendpoint-proof\n%%EOF")
@@ -328,9 +325,7 @@ class WordViewSnapshotTests(unittest.TestCase):
             self.session.snapshot_path = snapshot
             self.session.snapshot_cache_key = "cache-proof"
             self.session.snapshot_document_id = self.session.document_id
-            self.session.snapshot_document_revision = (
-                self.session.document_revision
-            )
+            self.session.snapshot_document_revision = self.session.document_revision
             self.session.snapshot_package_sha256 = self.source_hash
 
         server = ogent.OgentServer((ogent.HOST, 0), ogent.OgentHandler)

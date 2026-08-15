@@ -1,0 +1,588 @@
+from ogent_app.api.http_handler import RuntimeBoundOgentHandler
+
+
+class OgentHandler(RuntimeBoundOgentHandler):
+    runtime_values = globals()
+
+
+class OgentServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def handle_error(
+        self,
+        request: socket.socket,
+        client_address: tuple[str, int],
+    ) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(
+            error,
+            (BrokenPipeError, ConnectionResetError, ConnectionAbortedError),
+        ):
+            # Client-disconnected sockets are an idempotent transport boundary;
+            # see ARCHITECTURE.md intentional-suppression section.
+            return
+        super().handle_error(request, client_address)
+
+
+def find_existing_server() -> tuple[int, dict[str, Any]] | None:
+    for port in range(BASE_PORT, BASE_PORT + 20):
+        data = http_json(f"http://{HOST}:{port}/health", timeout=0.18)
+        if data and data.get("app") == APP_NAME:
+            return port, data
+    return None
+
+
+def post_open_to_existing_server(port: int, raw_path: str) -> dict[str, Any]:
+    try:
+        info = json.loads(SERVER_INFO_PATH.read_text(encoding="utf-8"))
+        recorded_port = int(info["port"])
+        token = str(info["token"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise UserFacingError(
+            "Ogent is running, but its local connection record is missing or invalid.",
+            500,
+        ) from exc
+    if recorded_port != port:
+        raise UserFacingError(
+            "Ogent's local connection record does not match the running server. "
+            "Run `ogent stop`, then try again.",
+            409,
+        )
+
+    request = urllib.request.Request(
+        f"http://{HOST}:{port}/open",
+        data=json_bytes({"path": raw_path}),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Ogent-Token": token,
+            "X-Ogent-Session": "shell",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+            message = str(payload.get("error", "")).strip()
+            session_id = str(payload.get("session_id", "")).strip() or None
+        except (UnicodeDecodeError, ValueError, AttributeError):
+            message = ""
+            session_id = None
+        raise UserFacingError(
+            message or f"Ogent could not open the file (HTTP {exc.code}).",
+            exc.code,
+            session_id=session_id,
+        ) from None
+    except (OSError, urllib.error.URLError) as exc:
+        raise UserFacingError(f"Could not contact the running Ogent server: {exc}", 503) from exc
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise UserFacingError("The running Ogent server returned an invalid response.", 502) from exc
+    if not isinstance(payload, dict):
+        raise UserFacingError("The running Ogent server returned an invalid response.", 502)
+    return payload
+
+
+def _registry_module() -> Any:
+    if os.name != "nt" or winreg is None:
+        raise UserFacingError("Windows Explorer integration is available only on Windows.", 501)
+    return winreg
+
+
+def shell_registry_path(extension: str) -> str:
+    return (
+        rf"Software\Classes\SystemFileAssociations\{extension}"
+        r"\shell\OgentLite"
+    )
+
+
+def resolve_shell_interpreter() -> tuple[Path, bool]:
+    executable = Path(sys.executable).resolve()
+    pythonw = executable.with_name("pythonw.exe")
+    if pythonw.is_file():
+        return pythonw, False
+    return executable, True
+
+
+def register_shell_integration() -> None:
+    registry = _registry_module()
+    if not ICON_PATH.is_file():
+        raise UserFacingError(f"Ogent icon not found: {ICON_PATH}", 500)
+    interpreter, console_fallback = resolve_shell_interpreter()
+    command = f'"{interpreter}" "{Path(__file__).resolve()}" --open "%1"'
+    for extension in SHELL_EXTENSIONS:
+        key_path = shell_registry_path(extension)
+        with registry.CreateKeyEx(
+            registry.HKEY_CURRENT_USER,
+            key_path,
+            0,
+            registry.KEY_WRITE,
+        ) as key:
+            registry.SetValueEx(key, None, 0, registry.REG_SZ, "Open in Ogent")
+            registry.SetValueEx(key, "Icon", 0, registry.REG_SZ, str(ICON_PATH.resolve()))
+            registry.SetValueEx(key, "Position", 0, registry.REG_SZ, "Top")
+        command_path = key_path + r"\command"
+        with registry.CreateKeyEx(
+            registry.HKEY_CURRENT_USER,
+            command_path,
+            0,
+            registry.KEY_WRITE,
+        ) as command_key:
+            registry.SetValueEx(command_key, None, 0, registry.REG_SZ, command)
+        print(rf"Wrote HKCU\{key_path}")
+        print(rf"Wrote HKCU\{command_path}")
+    if console_fallback:
+        print(
+            "Note: pythonw.exe was not found beside the active interpreter; "
+            "Explorer will use python.exe and may briefly show a console window."
+        )
+
+
+def unregister_shell_integration() -> None:
+    registry = _registry_module()
+    for extension in SHELL_EXTENSIONS:
+        key_path = shell_registry_path(extension)
+        removed = False
+        for candidate in (key_path + r"\command", key_path):
+            try:
+                registry.DeleteKey(registry.HKEY_CURRENT_USER, candidate)
+            except FileNotFoundError:
+                # Intentional idempotency: an absent shell key is already removed.
+                continue
+            except OSError as exc:
+                raise UserFacingError(
+                    rf"Could not remove HKCU\{candidate}: {exc}",
+                    500,
+                ) from exc
+            print(rf"Removed HKCU\{candidate}")
+            removed = True
+        if not removed:
+            print(rf"Already absent: HKCU\{key_path}")
+
+
+def stop_existing_server() -> bool:
+    try:
+        info = json.loads(SERVER_INFO_PATH.read_text(encoding="utf-8"))
+        port = int(info["port"])
+        token = str(info["token"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    body = b"{}"
+    request = urllib.request.Request(
+        f"http://{HOST}:{port}/shutdown",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Ogent-Token": token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=4) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def write_server_info(port: int) -> None:
+    LOCAL_DATA.mkdir(parents=True, exist_ok=True)
+    info = {
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "pid": os.getpid(),
+        "port": port,
+        "token": STATE.token,
+        "started_at": now_iso(),
+    }
+    temp = SERVER_INFO_PATH.with_suffix(".tmp")
+    temp.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, SERVER_INFO_PATH)
+
+
+def choose_port(requested: int) -> int:
+    for port in range(requested, requested + 30):
+        if port_available(port):
+            return port
+    raise RuntimeError(f"No free localhost port found from {requested} through {requested + 29}.")
+
+
+from ogent_app.application.checkpoint_store import CHECKPOINT_DIR_NAME
+
+WORKSPACE_DOCUMENT_SUFFIX = ".docx"
+
+
+def discover_workspace_documents(root: Path) -> list[Path]:
+    """Recursively list workspace DOCX files, ignoring ~$ locks and checkpoints."""
+    if not root.is_dir():
+        raise UserFacingError(f"Not a folder: {root}", 400)
+    documents: list[Path] = []
+    for path in root.rglob(f"*{WORKSPACE_DOCUMENT_SUFFIX}"):
+        if not path.is_file():
+            continue
+        if path.name.startswith("~$"):
+            continue
+        relative = path.relative_to(root)
+        if CHECKPOINT_DIR_NAME in relative.parts[:-1]:
+            continue
+        documents.append(path)
+    documents.sort(key=lambda item: str(item.relative_to(root)).casefold())
+    return documents
+
+
+def verify_agent_startup_requirements() -> None:
+    """Fail agent startup with exact diagnostics when OfficeCLI/MCP is missing."""
+    executable = shutil.which("officecli")
+    if executable is None:
+        raise UserFacingError(
+            "OfficeCLI is not installed or not on PATH. Install it (default: "
+            r"%LOCALAPPDATA%\OfficeCLI\officecli.exe) and confirm "
+            "`officecli --version` works in this console.",
+            503,
+        )
+    gateway = SCRIPT_DIR / "ogent_officecli_mcp.py"
+    if not gateway.is_file():
+        raise UserFacingError(
+            f"The OfficeCLI MCP gateway is missing: {gateway}. "
+            "Restore the ogent-lite folder or re-clone the repository.",
+            503,
+        )
+    probe = subprocess.run(
+        [executable, "load_skill", "word"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=45,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    if probe.returncode != 0 or not (probe.stdout or "").strip():
+        detail = (probe.stderr or probe.stdout or "").strip()[:400]
+        raise UserFacingError(
+            "OfficeCLI could not load the word (DOCX) skill, so agent "
+            "sessions cannot start. Run `officecli load_skill word` to "
+            f"reproduce. Output: {detail or '(empty)'}",
+            503,
+        )
+
+
+def _filter_workspace_choices(
+    entries: list[tuple[str, Path]],
+    query: str,
+) -> list[tuple[str, Path]]:
+    """Case-insensitive substring filter over the displayed file names."""
+    needle = query.strip().casefold()
+    if not needle:
+        return list(entries)
+    return [entry for entry in entries if needle in entry[0].casefold()]
+
+
+def _default_console_key_reader() -> str:
+    import msvcrt
+
+    return msvcrt.getwch()
+
+
+def interactive_workspace_pick(
+    entries: list[tuple[str, Path]],
+    read_key: Callable[[], str] | None = None,
+) -> Path:
+    """Arrow-key picker with type-to-filter. Enter opens, Esc cancels."""
+    if read_key is None:
+        read_key = _default_console_key_reader
+    os.system("")  # enable VT escape processing in legacy consoles
+    visible_rows = 12
+    query = ""
+    index = 0
+    stdout = sys.stdout
+    stdout.write("\x1b[?1049h")  # alternate screen: keep the console history
+    try:
+        while True:
+            matches = _filter_workspace_choices(entries, query)
+            index = min(index, max(0, len(matches) - 1))
+            frame = [
+                "\x1b[H\x1b[J",
+                f"Ogent workspace - {len(matches)}/{len(entries)} documents."
+                "  Type to filter, Up/Down to select, Enter to open, "
+                "Esc to cancel.\r\n",
+                f"Filter: {query or '(all)'}\r\n\r\n",
+            ]
+            start = max(
+                0,
+                min(index - visible_rows // 2, len(matches) - visible_rows),
+            )
+            for row, (label, _) in enumerate(
+                matches[start : start + visible_rows],
+                start=start,
+            ):
+                if row == index:
+                    frame.append(f" \x1b[7m> {label}\x1b[0m\r\n")
+                else:
+                    frame.append(f"   {label}\r\n")
+            if not matches:
+                frame.append("   (no file name contains the filter)\r\n")
+            stdout.write("".join(frame))
+            stdout.flush()
+            key = read_key()
+            if key in ("\x00", "\xe0"):  # arrow/function key prefix
+                code = read_key()
+                if matches and code == "H":  # Up
+                    index = (index - 1) % len(matches)
+                elif matches and code == "P":  # Down
+                    index = (index + 1) % len(matches)
+                continue
+            if key == "\r":
+                if matches:
+                    return matches[index][1]
+                continue
+            if key in ("\x1b", "\x03"):  # Esc / Ctrl+C
+                raise UserFacingError("Document selection was cancelled.", 400)
+            if key == "\x08":  # Backspace
+                query = query[:-1]
+                continue
+            if key.isprintable():
+                query += key
+                index = 0
+    finally:
+        stdout.write("\x1b[?1049l")
+        stdout.flush()
+
+
+def prompt_workspace_document(root: Path) -> Path:
+    """Console picker: list workspace DOCX files and prompt for the active one."""
+    root = root.resolve()
+    documents = discover_workspace_documents(root)
+    if not documents:
+        raise UserFacingError(
+            f"No .docx files found under {root} "
+            f"(~$ lock files and {CHECKPOINT_DIR_NAME} folders are ignored). "
+            "Run this command inside a folder that contains Word documents.",
+            404,
+        )
+    if len(documents) == 1:
+        print(f"Opening the only document found: {documents[0].relative_to(root)}")
+        return documents[0]
+    entries = [(str(path.relative_to(root)), path) for path in documents]
+    if os.name == "nt" and sys.stdin.isatty() and sys.stdout.isatty():
+        selected = interactive_workspace_pick(entries)
+        print(f"Opening {selected.relative_to(root)}")
+        return selected
+    # Numbered fallback for piped stdin and non-console use.
+    print(f"Documents under {root}:")
+    for index, path in enumerate(documents, start=1):
+        print(f"  {index}. {path.relative_to(root)}")
+    while True:
+        try:
+            answer = input(f"Open which document? [1-{len(documents)}] ").strip()
+        except EOFError:
+            raise UserFacingError("Document selection was cancelled.", 400) from None
+        if answer.casefold() in {"q", "quit", "exit"}:
+            raise UserFacingError("Document selection was cancelled.", 400)
+        if answer.isdigit() and 1 <= int(answer) <= len(documents):
+            return documents[int(answer) - 1]
+        print(f"Enter a number from 1 through {len(documents)}, or q to cancel.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Ogent Lite local document workspace")
+    parser.add_argument("--port", type=int, default=BASE_PORT, help="Preferred localhost port")
+    parser.add_argument("--no-browser", action="store_true", help="Start without opening a browser")
+    parser.add_argument(
+        "--idle-exit-minutes",
+        type=float,
+        default=DEFAULT_IDLE_EXIT_MINUTES,
+        metavar="N",
+        help="Exit after N minutes with no sessions (0 keeps the backend resident)",
+    )
+    parser.add_argument(
+        "--session-grace-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "OGENT_SESSION_GRACE_SECONDS",
+                str(DEFAULT_SESSION_GRACE_SECONDS),
+            )
+        ),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--reaper-tick-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "OGENT_REAPER_TICK_SECONDS",
+                str(DEFAULT_REAPER_TICK_SECONDS),
+            )
+        ),
+        help=argparse.SUPPRESS,
+    )
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--open", dest="open_path", metavar="FILE", help="Open a file in Ogent")
+    action.add_argument(
+        "--agent",
+        dest="agent_dir",
+        nargs="?",
+        const=".",
+        metavar="DIR",
+        help=(
+            "Treat DIR (default: current folder) as the document workspace: "
+            "list its .docx files recursively, prompt for one, and open it"
+        ),
+    )
+    action.add_argument("--stop", action="store_true", help="Stop a running Ogent Lite server")
+    action.add_argument(
+        "--register-shell",
+        action="store_true",
+        help="Add per-user Explorer 'Open in Ogent' entries",
+    )
+    action.add_argument(
+        "--unregister-shell",
+        action="store_true",
+        help="Remove per-user Explorer 'Open in Ogent' entries",
+    )
+    args = parser.parse_args()
+    if args.idle_exit_minutes < 0:
+        parser.error("--idle-exit-minutes must be 0 or greater")
+    if args.session_grace_seconds < 0:
+        parser.error("--session-grace-seconds must be 0 or greater")
+    if args.reaper_tick_seconds <= 0:
+        parser.error("--reaper-tick-seconds must be greater than 0")
+
+    LOCAL_DATA.mkdir(parents=True, exist_ok=True)
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    IMPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    if args.register_shell:
+        try:
+            register_shell_integration()
+        except UserFacingError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+    if args.unregister_shell:
+        try:
+            unregister_shell_integration()
+        except UserFacingError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+    if args.stop:
+        if stop_existing_server():
+            print("Ogent Lite stopped.")
+            return 0
+        print("Ogent Lite is not running.")
+        return 1
+    if args.agent_dir is not None:
+        try:
+            verify_agent_startup_requirements()
+            args.open_path = str(prompt_workspace_document(Path(args.agent_dir)))
+        except UserFacingError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        except subprocess.TimeoutExpired:
+            print(
+                "OfficeCLI did not answer the startup skill probe within 45 "
+                "seconds. Check that officecli.exe runs, then try again.",
+                file=sys.stderr,
+            )
+            return 1
+
+    existing = find_existing_server()
+    if existing:
+        port, _ = existing
+        url = f"http://{HOST}:{port}/"
+        if args.open_path:
+            try:
+                result = post_open_to_existing_server(port, args.open_path)
+            except UserFacingError as exc:
+                error_url = (
+                    f"{url}?s={urllib.parse.quote(exc.session_id)}"
+                    if exc.session_id
+                    else url
+                )
+                webbrowser.open(error_url)
+                print(str(exc), file=sys.stderr)
+                return 1
+            session_id = str(result.get("session_id", "")).strip()
+            target_url = (
+                f"{url}?s={urllib.parse.quote(session_id)}"
+                if session_id
+                else url
+            )
+            webbrowser.open(target_url)
+            print(f"{result.get('message', 'File sent to Ogent')} {target_url}")
+            return 0
+        if not args.no_browser:
+            webbrowser.open(url)
+        print(f"Ogent Lite is already running at {url}")
+        return 0
+
+    port = choose_port(args.port)
+    STATE.enforce_capability_contract = True
+    try:
+        initialize_owned_stores()
+    except (BackupError, SessionMemoryError, OSError) as exc:
+        print(f"Could not initialize Ogent recovery and memory stores: {exc}", file=sys.stderr)
+        return 1
+    STATE.server_port = port
+    STATE.idle_exit_minutes = args.idle_exit_minutes
+    STATE.session_grace_seconds = args.session_grace_seconds
+    STATE.reaper_tick_seconds = args.reaper_tick_seconds
+    server = OgentServer((HOST, port), OgentHandler)
+    try:
+        reset_reference_root(REFERENCE_ROOT)
+    except (ReferenceError, OSError) as exc:
+        server.server_close()
+        print(f"Could not initialize temporary references: {exc}", file=sys.stderr)
+        return 1
+    AGENT_CATALOG.refresh_async()
+    write_server_info(port)
+    atexit.register(cleanup)
+    initial_session: SessionState | None = None
+    if args.open_path:
+        initial_session = STATE.create_session()
+        try:
+            dispatch_open_path(initial_session, args.open_path)
+        except UserFacingError as exc:
+            with initial_session.lock:
+                initial_session.last_error = str(exc)
+            initial_session.add_message("assistant", str(exc))
+            print(str(exc), file=sys.stderr)
+
+    def request_shutdown(*_: Any) -> None:
+        with STATE.registry_lock:
+            STATE.shutdown_requested = True
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    with contextlib.suppress(ValueError):
+        signal.signal(signal.SIGINT, request_shutdown)
+        signal.signal(signal.SIGTERM, request_shutdown)
+
+    reaper = threading.Thread(
+        target=reaper_loop,
+        args=(server,),
+        name="ogent-session-reaper",
+        daemon=True,
+    )
+    reaper.start()
+
+    base_url = f"http://{HOST}:{port}/"
+    url = (
+        f"{base_url}?s={initial_session.session_id}"
+        if initial_session
+        else base_url
+    )
+    print(f"Ogent Lite {APP_VERSION} listening on {url}")
+    print(
+        f"Session previews use ports {WATCH_PORT_FIRST} through {WATCH_PORT_LAST}."
+    )
+    print("Press Ctrl+C to stop.")
+    if args.open_path or not args.no_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+        cleanup()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

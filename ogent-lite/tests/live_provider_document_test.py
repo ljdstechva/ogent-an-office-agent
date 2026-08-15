@@ -18,7 +18,9 @@ OGENT_PATH = Path(__file__).resolve().parents[1] / "ogent.py"
 
 
 def load_ogent() -> object:
-    spec = importlib.util.spec_from_file_location("ogent_live_provider_test", OGENT_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "ogent_live_provider_test", OGENT_PATH
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load {OGENT_PATH}")
     module = importlib.util.module_from_spec(spec)
@@ -76,9 +78,7 @@ def main() -> int:
         if not session.run_complete.wait(timeout=args.timeout_seconds):
             ogent.stop_active_run(session)
             session.run_complete.wait(timeout=30)
-            raise TimeoutError(
-                f"{args.provider} did not complete run {run_id} in time"
-            )
+            raise TimeoutError(f"{args.provider} did not complete run {run_id} in time")
         with session.lock:
             status = session.run_status
             working = session.active_doc

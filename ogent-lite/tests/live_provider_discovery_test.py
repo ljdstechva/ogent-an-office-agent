@@ -31,10 +31,14 @@ def token_accounting(value: Any) -> dict[str, float]:
         for key, child in value.items():
             lowered = str(key).casefold()
             if (
-                lowered.endswith("_tokens")
-                or lowered.endswith("tokencount")
-                or lowered in {"inputtokens", "outputtokens"}
-            ) and isinstance(child, (int, float)) and not isinstance(child, bool):
+                (
+                    lowered.endswith("_tokens")
+                    or lowered.endswith("tokencount")
+                    or lowered in {"inputtokens", "outputtokens"}
+                )
+                and isinstance(child, (int, float))
+                and not isinstance(child, bool)
+            ):
                 found[str(key)] = float(child)
             found.update(token_accounting(child))
     elif isinstance(value, list):
@@ -97,8 +101,7 @@ def main() -> int:
                         "capabilitySource": "Codex App Server model/list",
                         "visibleModels": len(codex_catalog.models),
                         "allEffortsFromPerModelRecords": all(
-                            model.capability_source == "cli"
-                            and model.efforts_verified
+                            model.capability_source == "cli" and model.efforts_verified
                             for model in codex_catalog.models
                         ),
                     },
@@ -111,9 +114,7 @@ def main() -> int:
                         "durationApiMs": raw_payload["duration_api_ms"],
                         "totalCostUsd": raw_payload["total_cost_usd"],
                         "tokenFields": tokens,
-                        "selectedModelEffortsVerified": len(
-                            verification.efforts
-                        ),
+                        "selectedModelEffortsVerified": len(verification.efforts),
                         "effortWarning": verification.warning,
                     },
                 },

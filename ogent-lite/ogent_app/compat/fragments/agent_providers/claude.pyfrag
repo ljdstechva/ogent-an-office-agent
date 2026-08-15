@@ -1,0 +1,643 @@
+from __future__ import annotations
+
+class ClaudeStreamState(StreamState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.partial_text: list[str] = []
+        self.assistant_text: str | None = None
+
+
+class ClaudeProvider(BaseAgentProvider):
+    provider_id = "claude"
+    label = "Claude Code"
+    supports_model_effort_verification = True
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.effort_lock = threading.RLock()
+        self.probe_semaphore = threading.BoundedSemaphore(2)
+        self.effort_candidates: dict[tuple[str, str], tuple[str, ...]] = {}
+        self.inference_blocked: set[tuple[str, str]] = set()
+
+    def resolve_cli(self) -> CLIResolution | None:
+        return resolve_claude_cli()
+
+    def inspect_environment(self) -> ProviderEnvironment:
+        resolution = self.resolve_cli()
+        if resolution is None:
+            return ProviderEnvironment(
+                provider_id=self.provider_id,
+                label=self.label,
+                installed=False,
+                authenticated=False,
+                cli_path=None,
+                cli_version=None,
+                command=(),
+                status="not_installed",
+                warning="Claude Code is not installed.",
+            )
+        try:
+            version = self._version(resolution)
+        except CatalogDiscoveryError as exc:
+            return ProviderEnvironment(
+                provider_id=self.provider_id,
+                label=self.label,
+                installed=True,
+                authenticated=False,
+                cli_path=resolution.executable_path,
+                cli_version=None,
+                command=resolution.command,
+                status=exc.status,
+                warning=str(exc),
+            )
+        auth = self._run_discovery_command(
+            [*resolution.command, "auth", "status", "--json"],
+            timeout=min(self.discovery_timeout, 10),
+        )
+        authenticated = False
+        if auth.returncode == 0:
+            try:
+                payload = json.loads(auth.stdout)
+                authenticated = (
+                    isinstance(payload, dict)
+                    and payload.get("loggedIn") is True
+                )
+            except ValueError:
+                authenticated = False
+        return ProviderEnvironment(
+            provider_id=self.provider_id,
+            label=self.label,
+            installed=True,
+            authenticated=authenticated,
+            cli_path=resolution.executable_path,
+            cli_version=version,
+            command=resolution.command,
+            status="ready" if authenticated else "auth_required",
+            warning=(
+                None
+                if authenticated
+                else "Sign in with `claude auth login`, then refresh."
+            ),
+        )
+
+    @staticmethod
+    def _model_discovery_arguments(
+        environment: ProviderEnvironment,
+    ) -> list[str]:
+        return [
+            *environment.command,
+            "-p",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "--tools",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            "--max-turns",
+            "1",
+            "--max-budget-usd",
+            "0.000001",
+            "--safe-mode",
+            "/model",
+        ]
+
+    def _discover_models(
+        self,
+        environment: ProviderEnvironment,
+    ) -> tuple[ModelCapability, ...]:
+        result = self._run_discovery_command(
+            self._model_discovery_arguments(environment),
+            timeout=self.discovery_timeout,
+        )
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError as exc:
+            raise CompatibilityError(
+                f"Claude /model returned malformed JSON: {exc}"
+            ) from exc
+        try:
+            validate_claude_zero_usage(payload, exit_code=result.returncode)
+        except InferenceDetectedError:
+            if environment.cli_path and environment.cli_version:
+                with self.effort_lock:
+                    self.inference_blocked.add(
+                        (environment.cli_path, environment.cli_version)
+                    )
+            raise
+        identifiers = parse_claude_available_models(payload["result"])
+        return tuple(
+            ModelCapability(
+                id=identifier,
+                display_name=identifier,
+                efforts=(),
+                default_effort=None,
+                input_modalities=(),
+                is_default=False,
+                capability_source="cli",
+                efforts_verified=False,
+                partial_text_deltas=True,
+                context_limit_source="conservative_config",
+            )
+            for identifier in identifiers
+        )
+
+    def _discover_global_efforts(
+        self,
+        environment: ProviderEnvironment,
+    ) -> tuple[str, ...]:
+        result = self._run_discovery_command(
+            [*environment.command, "--help"],
+            timeout=min(self.discovery_timeout, 10),
+        )
+        if result.returncode != 0:
+            return ()
+        return parse_claude_effort_choices(result.stdout)
+
+    def discover_catalog(
+        self,
+        environment: ProviderEnvironment,
+    ) -> ProviderCatalog:
+        key = (environment.cli_path or "", environment.cli_version or "")
+        with self.effort_lock:
+            self.inference_blocked.discard(key)
+        try:
+            models = self._discover_models(environment)
+        except InferenceDetectedError as exc:
+            raise CatalogDiscoveryError(
+                str(exc),
+                status="catalog_error",
+            ) from exc
+        except Exception as exc:
+            raise CatalogDiscoveryError(
+                "This CLI version does not expose a compatible catalog. "
+                + _safe_detail(str(exc))
+            ) from exc
+        efforts = self._discover_global_efforts(environment)
+        with self.effort_lock:
+            self.effort_candidates[key] = efforts
+        warning = None
+        if not efforts:
+            warning = (
+                "No model-specific effort control; using CLI default. "
+                "This CLI help output did not expose compatible effort choices."
+            )
+        return ProviderCatalog(
+            provider_id=self.provider_id,
+            label=self.label,
+            installed=True,
+            authenticated=True,
+            cli_path=environment.cli_path,
+            cli_version=environment.cli_version,
+            status="ready",
+            models=models,
+            refreshed_at=utc_now_iso(),
+            stale=False,
+            warning=warning,
+        )
+
+    @staticmethod
+    def _effort_probe_arguments(
+        environment: ProviderEnvironment,
+        model_id: str,
+        effort: str,
+    ) -> list[str]:
+        return [
+            *environment.command,
+            "--model",
+            model_id,
+            "--effort",
+            effort,
+            "-p",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "--tools",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            "--max-turns",
+            "1",
+            "--max-budget-usd",
+            "0.000001",
+            "--safe-mode",
+            "/model",
+        ]
+
+    def _probe_effort(
+        self,
+        environment: ProviderEnvironment,
+        model_id: str,
+        effort: str,
+    ) -> tuple[str, str]:
+        with self.probe_semaphore:
+            result = self._run_discovery_command(
+                self._effort_probe_arguments(environment, model_id, effort),
+                timeout=self.discovery_timeout,
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            return "unsupported", effort
+        try:
+            validate_claude_zero_usage(payload, exit_code=result.returncode)
+        except InferenceDetectedError:
+            return "inference", effort
+        except CompatibilityError:
+            return "rejected", effort
+        effective = parse_claude_current_effort(payload["result"])
+        if effective is None:
+            return "unsupported", effort
+        warnings = payload.get("warnings")
+        warning_text = " ".join(
+            (
+                str(warnings or ""),
+                result.stderr or "",
+                payload["result"],
+            )
+        )
+        has_warning = bool(
+            warnings
+            or result.stderr.strip()
+            or re.search(
+                r"\b(?:warning|downgrad|normaliz)\w*\b",
+                warning_text,
+                re.IGNORECASE,
+            )
+        )
+        if effective == effort and not has_warning:
+            return "accepted", effort
+        return "rejected", effort
+
+    def verify_model_efforts(
+        self,
+        environment: ProviderEnvironment,
+        model_id: str,
+    ) -> EffortVerificationResult:
+        key = (environment.cli_path or "", environment.cli_version or "")
+        with self.effort_lock:
+            candidates = self.effort_candidates.get(key, ())
+            blocked = key in self.inference_blocked
+        if blocked:
+            return EffortVerificationResult(
+                efforts=(),
+                warning=(
+                    "No model-specific effort control; using CLI default. "
+                    "A zero-inference probe reported nonzero usage."
+                ),
+                inference_detected=True,
+            )
+        if not candidates:
+            return EffortVerificationResult(
+                efforts=(),
+                warning=(
+                    "No model-specific effort control; using CLI default."
+                ),
+            )
+        accepted: set[str] = set()
+        rejected = 0
+        unsupported = 0
+        for offset in range(0, len(candidates), 2):
+            batch = candidates[offset : offset + 2]
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="ogent-claude-probe",
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        self._probe_effort,
+                        environment,
+                        model_id,
+                        effort,
+                    )
+                    for effort in batch
+                ]
+                results = [future.result() for future in futures]
+            if any(status == "inference" for status, _ in results):
+                with self.effort_lock:
+                    self.inference_blocked.add(key)
+                return EffortVerificationResult(
+                    efforts=(),
+                    warning=(
+                        "No model-specific effort control; using CLI default. "
+                        "A zero-inference effort probe reported nonzero usage."
+                    ),
+                    inference_detected=True,
+                )
+            for status, effort in results:
+                if status == "accepted":
+                    accepted.add(effort)
+                elif status == "unsupported":
+                    unsupported += 1
+                else:
+                    rejected += 1
+        ordered = tuple(
+            effort for effort in candidates if effort in accepted
+        )
+        if ordered:
+            return EffortVerificationResult(efforts=ordered)
+        if unsupported == len(candidates) and not rejected:
+            return EffortVerificationResult(
+                efforts=candidates,
+                warning=(
+                    "CLI-valid; model-specific support unverified."
+                ),
+                use_global_unverified=True,
+            )
+        return EffortVerificationResult(
+            efforts=(),
+            warning="No model-specific effort control; using CLI default.",
+        )
+
+    def build_command_with_resolution(
+        self,
+        resolution: CLIResolution,
+        request: ProviderRunRequest,
+    ) -> list[str]:
+        return _build_claude_from_request(resolution, request)
+
+    def new_stream_state(self) -> StreamState:
+        return ClaudeStreamState()
+
+    @staticmethod
+    def _message_text(message: Any) -> str | None:
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip() or None
+        if not isinstance(content, list):
+            return None
+        parts = [
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        text = "".join(parts).strip()
+        return text or None
+
+    def parse_stream_event(
+        self,
+        state: StreamState,
+        event: dict[str, Any],
+    ) -> str | None:
+        assert isinstance(state, ClaudeStreamState)
+        event_type = str(event.get("type") or "")
+        session_id = event.get("session_id") or event.get("sessionId")
+        if session_id:
+            state.session_id = str(session_id)
+        if event_type == "system":
+            if event.get("subtype") == "init":
+                return "Claude context started."
+            return "Claude is preparing the session."
+        if event_type == "stream_event":
+            inner = event.get("event")
+            if not isinstance(inner, dict):
+                return None
+            inner_type = str(inner.get("type") or "")
+            if inner_type == "content_block_start":
+                block = inner.get("content_block")
+                if isinstance(block, dict):
+                    if block.get("type") == "tool_use":
+                        return (
+                            "Claude is using "
+                            + str(block.get("name") or "a tool")
+                            + "."
+                        )
+                    if block.get("type") in {"thinking", "reasoning"}:
+                        return "Claude is reasoning."
+            if inner_type == "content_block_delta":
+                delta = inner.get("delta")
+                if isinstance(delta, dict):
+                    if delta.get("type") == "text_delta":
+                        text = str(delta.get("text") or "")
+                        if text:
+                            state.partial_text.append(text)
+                    elif delta.get("type") in {
+                        "thinking_delta",
+                        "reasoning_delta",
+                    }:
+                        return "Claude is reasoning."
+            if inner_type == "message_start":
+                message = inner.get("message")
+                if isinstance(message, dict) and isinstance(
+                    message.get("usage"), dict
+                ):
+                    state.usage.update(message["usage"])
+            if inner_type == "message_delta":
+                usage = inner.get("usage")
+                if isinstance(usage, dict):
+                    state.usage.update(usage)
+            return None
+        if event_type == "assistant":
+            text = self._message_text(event.get("message"))
+            if text:
+                state.assistant_text = text
+            message = event.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    tool_names = [
+                        str(block.get("name") or "a tool")
+                        for block in content
+                        if isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                    ]
+                    if tool_names:
+                        return f"Claude requested {tool_names[-1]}."
+            return None
+        if event_type == "user":
+            message = event.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list) and any(
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    for block in content
+                ):
+                    return "Claude received a tool result."
+            return None
+        if event_type == "result":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                state.usage.update(usage)
+            for key in (
+                "total_cost_usd",
+                "duration_api_ms",
+                "duration_ms",
+                "num_turns",
+            ):
+                value = event.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    state.usage[key] = value
+            result_text = event.get("result")
+            if isinstance(result_text, str) and result_text.strip():
+                state.final_text = result_text.strip()
+            elif state.assistant_text:
+                state.final_text = state.assistant_text
+            elif state.partial_text:
+                state.final_text = "".join(state.partial_text).strip() or None
+            if event.get("is_error") is True or event.get("subtype") in {
+                "error",
+                "failed",
+            }:
+                state.error_message = (
+                    state.final_text
+                    or str(event.get("error") or "Claude reported an error.")
+                )
+                return state.error_message
+            output = state.usage.get("output_tokens")
+            return (
+                "Claude turn completed"
+                + (f" ({output} output tokens)." if output is not None else ".")
+            )
+        if event_type == "error":
+            error = event.get("error")
+            if isinstance(error, dict):
+                message = str(
+                    error.get("message")
+                    or error.get("type")
+                    or "Claude reported an error."
+                )
+            else:
+                message = str(error or event.get("message") or "Claude reported an error.")
+            state.error_message = message
+            return message
+        return None
+
+
+def build_default_providers() -> tuple[BaseAgentProvider, ...]:
+    return (CodexProvider(), ClaudeProvider())
+
+
+def build_codex_command(*args: Any, **kwargs: Any) -> list[str]:
+    """Build Codex arguments for either normalized or legacy Ogent callers."""
+
+    if (
+        len(args) == 2
+        and isinstance(args[0], CLIResolution)
+        and isinstance(args[1], ProviderRunRequest)
+    ):
+        return _build_codex_from_request(args[0], args[1])
+    if len(args) < 4:
+        raise TypeError("Legacy Codex command construction requires four arguments.")
+    prompt = str(args[0])
+    session_id = args[1]
+    model = str(args[2])
+    effort = str(args[3])
+    image_paths = args[4] if len(args) > 4 else None
+    resolution = resolve_codex_cli()
+    if resolution is None:
+        raise AgentCatalogError(
+            "Codex CLI is not installed.",
+            code="not_installed",
+        )
+    request = ProviderRunRequest(
+        prompt=prompt,
+        working_directory=Path.cwd(),
+        model=model,
+        effort=effort,
+        session_id=str(session_id) if session_id else None,
+        new_session_id=None,
+        persistent=True,
+        image_paths=tuple(image_paths or ()),
+        sandbox=str(kwargs.get("sandbox", "read-only")),
+        writable_directories=tuple(
+            kwargs.get("writable_directories") or ()
+        ),
+    )
+    return _build_codex_from_request(resolution, request)
+
+
+def build_claude_command(*args: Any, **kwargs: Any) -> list[str]:
+    """Build Claude arguments for normalized or stdin-based legacy callers."""
+
+    if (
+        len(args) == 2
+        and isinstance(args[0], CLIResolution)
+        and isinstance(args[1], ProviderRunRequest)
+    ):
+        return _build_claude_from_request(args[0], args[1])
+    if len(args) < 2:
+        raise TypeError("Legacy Claude command construction requires model and effort.")
+    model = str(args[0])
+    effort = str(args[1])
+    session_id = kwargs.get("session_id")
+    resume = bool(kwargs.get("resume"))
+    ephemeral = bool(kwargs.get("ephemeral"))
+    additional_directories = tuple(
+        Path(item) for item in (kwargs.get("additional_directories") or ())
+    )
+    resolution = resolve_claude_cli()
+    if resolution is None:
+        raise AgentCatalogError(
+            "Claude Code is not installed.",
+            code="not_installed",
+        )
+    command = [
+        *resolution.command,
+        "-p",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--model",
+        model,
+    ]
+    if effort != AUTOMATIC_EFFORT:
+        command.extend(["--effort", effort])
+    command.extend(
+        [
+            "--permission-mode",
+            "dontAsk",
+            "--tools",
+            ",".join(DEFAULT_AGENT_TOOL_ALLOWLIST),
+            "--allowedTools",
+            ",".join(DEFAULT_AGENT_ALLOWED_TOOLS),
+        ]
+    )
+    for directory in additional_directories:
+        command.extend(["--add-dir", str(directory)])
+    if ephemeral:
+        command.append("--no-session-persistence")
+    elif resume:
+        if not session_id:
+            raise ValueError("A resumed Claude run requires a session ID.")
+        command.extend(["--resume", str(session_id)])
+    else:
+        if not session_id:
+            raise ValueError("A new Claude run requires a session ID.")
+        uuid.UUID(str(session_id))
+        command.extend(["--session-id", str(session_id)])
+    return command
+
+
+def activity_from_codex_event(event: dict[str, Any]) -> str | None:
+    state = StreamState()
+    return CodexProvider().parse_stream_event(state, event)
+
+
+def claude_session_id(event: dict[str, Any]) -> str | None:
+    value = event.get("session_id") or event.get("sessionId")
+    if value:
+        return str(value)
+    if isinstance(event.get("message"), dict):
+        value = event["message"].get("session_id")
+        if value:
+            return str(value)
+    return None
+
+
+def claude_final_text(event: dict[str, Any]) -> str | None:
+    event_type = str(event.get("type") or "")
+    if event_type == "result":
+        result = event.get("result")
+        return result.strip() if isinstance(result, str) and result.strip() else None
+    if event_type == "assistant":
+        return ClaudeProvider._message_text(event.get("message"))
+    return None
+
+
+def activity_from_claude_event(event: dict[str, Any]) -> str | None:
+    state = ClaudeStreamState()
+    return ClaudeProvider().parse_stream_event(state, event)

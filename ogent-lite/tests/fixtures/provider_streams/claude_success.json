@@ -1,0 +1,62 @@
+{
+  "provider": "claude",
+  "events": [
+    {
+      "type": "system",
+      "subtype": "init",
+      "session_id": "fixture-claude-session"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_start",
+        "content_block": {
+          "type": "tool_use",
+          "name": "mcp__officecli__inspect_document"
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "delta": {
+          "type": "text_delta",
+          "text": "Verified "
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "delta": {
+          "type": "text_delta",
+          "text": "answer."
+        }
+      }
+    },
+    {
+      "type": "result",
+      "subtype": "success",
+      "is_error": false,
+      "session_id": "fixture-claude-session",
+      "usage": {
+        "input_tokens": 14,
+        "output_tokens": 4
+      },
+      "result": "Verified answer."
+    }
+  ],
+  "expected": {
+    "session_id": "fixture-claude-session",
+    "final_text": "Verified answer.",
+    "error_message": null,
+    "output_tokens": 4,
+    "activities": [
+      "Claude context started.",
+      "Claude is using mcp__officecli__inspect_document.",
+      "Claude turn completed (4 output tokens)."
+    ]
+  }
+}

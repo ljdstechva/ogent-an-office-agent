@@ -17,6 +17,7 @@ OGENT_DIR = Path(__file__).resolve().parents[1]
 if str(OGENT_DIR) not in sys.path:
     sys.path.insert(0, str(OGENT_DIR))
 
+from ogent_app.domain.run import ScopeMode  # noqa: E402
 from ogent_agent_catalog import (  # noqa: E402
     AUTOMATIC_EFFORT,
     CatalogDiscoveryError,
@@ -107,8 +108,25 @@ class BlockingRunStream:
         self.items.put(None)
 
 
+class CapturingRunStdin:
+    def __init__(self) -> None:
+        self.value = ""
+        self.closed = False
+
+    def write(self, value: str) -> int:
+        self.value += value
+        return len(value)
+
+    def flush(self) -> None:
+        return
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class SilentRunProcess:
     def __init__(self) -> None:
+        self.stdin = CapturingRunStdin()
         self.stdout = BlockingRunStream()
         self.stderr = BlockingRunStream()
         self.returncode: int | None = None
@@ -178,19 +196,13 @@ class FakeAppServerProcess:
             if self.malformed:
                 self.stdout.feed("{malformed\n")
             else:
-                self.stdout.feed(
-                    json.dumps({"id": request["id"], "result": {}}) + "\n"
-                )
+                self.stdout.feed(json.dumps({"id": request["id"], "result": {}}) + "\n")
             return
         if request.get("method") != "model/list":
             return
         index = self.model_requests
         self.model_requests += 1
-        next_cursor = (
-            f"cursor-{index + 1}"
-            if index + 1 < len(self.pages)
-            else None
-        )
+        next_cursor = f"cursor-{index + 1}" if index + 1 < len(self.pages) else None
         self.stdout.feed(
             json.dumps(
                 {
@@ -336,14 +348,17 @@ class CodexCatalogTests(unittest.TestCase):
                 efforts_verified=True,
             ),
         )
-        with mock.patch.object(
-            provider,
-            "_app_server_catalog",
-            side_effect=CompatibilityError("model/list unavailable"),
-        ), mock.patch.object(
-            provider,
-            "_debug_catalog",
-            return_value=fallback_models,
+        with (
+            mock.patch.object(
+                provider,
+                "_app_server_catalog",
+                side_effect=CompatibilityError("model/list unavailable"),
+            ),
+            mock.patch.object(
+                provider,
+                "_debug_catalog",
+                return_value=fallback_models,
+            ),
         ):
             catalog = provider.discover_catalog(environment("codex"))
 
@@ -387,18 +402,22 @@ class CodexCatalogTests(unittest.TestCase):
             command=("fixture-codex",),
             executable_path=str(Path.cwd() / "fixture-codex.exe"),
         )
-        with mock.patch.object(
-            provider,
-            "resolve_cli",
-            return_value=resolution,
-        ), mock.patch.object(
-            provider,
-            "_version",
-            return_value="fixture-version",
-        ), mock.patch.object(
-            provider,
-            "_run_discovery_command",
-            return_value=subprocess.CompletedProcess([], 1, "", ""),
+        with (
+            mock.patch.object(
+                provider,
+                "resolve_cli",
+                return_value=resolution,
+            ),
+            mock.patch.object(
+                provider,
+                "_version",
+                return_value="fixture-version",
+            ),
+            mock.patch.object(
+                provider,
+                "_run_discovery_command",
+                return_value=subprocess.CompletedProcess([], 1, "", ""),
+            ),
         ):
             signed_out = provider.inspect_environment()
         self.assertTrue(signed_out.installed)
@@ -463,9 +482,7 @@ class ClaudeCatalogTests(unittest.TestCase):
         )
         for field, value in cases:
             with self.subTest(field=field):
-                payload = zero_usage_payload(
-                    "Available: fixture, or a full model ID."
-                )
+                payload = zero_usage_payload("Available: fixture, or a full model ID.")
                 if field.endswith("_tokens"):
                     payload["usage"][field] = value
                 else:
@@ -474,9 +491,7 @@ class ClaudeCatalogTests(unittest.TestCase):
                     validate_claude_zero_usage(payload, exit_code=0)
 
     def test_zero_usage_requires_successful_json_accounting(self) -> None:
-        payload = zero_usage_payload(
-            "Available: fixture, or a full model ID."
-        )
+        payload = zero_usage_payload("Available: fixture, or a full model ID.")
         payload.pop("duration_api_ms")
         with self.assertRaisesRegex(CompatibilityError, "omitted"):
             validate_claude_zero_usage(payload, exit_code=0)
@@ -489,9 +504,7 @@ class ClaudeCatalogTests(unittest.TestCase):
     def test_zero_usage_requires_and_checks_camel_case_cache_accounting(
         self,
     ) -> None:
-        payload = zero_usage_payload(
-            "Available: fixture, or a full model ID."
-        )
+        payload = zero_usage_payload("Available: fixture, or a full model ID.")
         payload["usage"] = {
             "inputTokens": 0,
             "outputTokens": 0,
@@ -553,7 +566,9 @@ class ClaudeCatalogTests(unittest.TestCase):
             "extended",
         )
 
-        def completed(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        def completed(
+            args: list[str], **_kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
             requested = args[args.index("--effort") + 1]
             effective = "focused" if requested == "extended" else requested
             payload = zero_usage_payload(
@@ -619,12 +634,13 @@ class ClaudeCatalogTests(unittest.TestCase):
         )
         calls: list[str] = []
 
-        def completed(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        def completed(
+            args: list[str], **_kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
             requested = args[args.index("--effort") + 1]
             calls.append(requested)
             payload = zero_usage_payload(
-                f"Current model: Fixture (effort: {requested})\n"
-                "Available: fixture."
+                f"Current model: Fixture (effort: {requested})\nAvailable: fixture."
             )
             payload["usage"]["output_tokens"] = 1
             return subprocess.CompletedProcess(
@@ -664,18 +680,22 @@ class ClaudeCatalogTests(unittest.TestCase):
             json.dumps({"loggedIn": False, "email": "not-returned@example.test"}),
             "",
         )
-        with mock.patch.object(
-            provider,
-            "resolve_cli",
-            return_value=resolution,
-        ), mock.patch.object(
-            provider,
-            "_version",
-            return_value="fixture-version",
-        ), mock.patch.object(
-            provider,
-            "_run_discovery_command",
-            return_value=auth_result,
+        with (
+            mock.patch.object(
+                provider,
+                "resolve_cli",
+                return_value=resolution,
+            ),
+            mock.patch.object(
+                provider,
+                "_version",
+                return_value="fixture-version",
+            ),
+            mock.patch.object(
+                provider,
+                "_run_discovery_command",
+                return_value=auth_result,
+            ),
         ):
             signed_out = provider.inspect_environment()
         self.assertTrue(signed_out.installed)
@@ -719,7 +739,65 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
         self.assertNotIn("model_reasoning_effort", " ".join(codex))
         self.assertNotIn("--effort", claude)
 
-    def test_codex_ephemeral_run_ignores_user_config_and_uses_workspace_write(
+    def test_large_prompts_use_stdin_instead_of_windows_command_line(self) -> None:
+        prompt = "Long request " + ("x" * 120_000)
+        codex_request = ProviderRunRequest(
+            prompt=prompt,
+            working_directory=Path.cwd(),
+            model="catalog-model",
+            effort=AUTOMATIC_EFFORT,
+            session_id=None,
+            new_session_id=None,
+            persistent=False,
+        )
+        claude_request = ProviderRunRequest(
+            prompt=prompt,
+            working_directory=Path.cwd(),
+            model="catalog-alias",
+            effort=AUTOMATIC_EFFORT,
+            session_id=None,
+            new_session_id=None,
+            persistent=False,
+        )
+
+        codex = build_codex_command(self.resolution, codex_request)
+        claude = build_claude_command(self.resolution, claude_request)
+
+        self.assertNotIn(prompt, codex)
+        self.assertNotIn(prompt, claude)
+        self.assertEqual(codex[-1], "-")
+        self.assertLess(sum(len(argument) + 1 for argument in codex), 8_192)
+
+        process = SilentRunProcess()
+        provider = CodexProvider(popen_factory=lambda *_args, **_kwargs: process)
+        timed_request = __import__("dataclasses").replace(
+            codex_request,
+            first_event_timeout=0.01,
+            inactivity_timeout=2,
+            total_timeout=3,
+        )
+        with (
+            mock.patch.object(
+                provider,
+                "resolve_cli",
+                return_value=self.resolution,
+            ),
+            mock.patch(
+                "ogent_agent_providers.terminate_process_tree",
+                side_effect=lambda _process: process.stop(),
+            ),
+        ):
+            provider.run_agent(
+                timed_request,
+                on_process=lambda _process: None,
+                on_activity=lambda _stream, _text: None,
+                should_stop=lambda: False,
+            )
+
+        self.assertEqual(process.stdin.value, prompt)
+        self.assertTrue(process.stdin.closed)
+
+    def test_codex_ephemeral_run_ignores_user_config_and_defaults_read_only(
         self,
     ) -> None:
         command = build_codex_command(
@@ -742,10 +820,15 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
             command[command.index("--ask-for-approval") + 1],
             "never",
         )
-        self.assertEqual(command[command.index("-s") + 1], "workspace-write")
+        self.assertEqual(command[command.index("-s") + 1], "read-only")
         self.assertIn("mcp_servers.officecli.required=true", command)
         self.assertIn(
-            'mcp_servers.officecli.enabled_tools=["officecli"]',
+            (
+                'mcp_servers.officecli.enabled_tools=["load_document_skill",'
+                '"inspect_document","read_nodes","query_nodes",'
+                '"apply_atomic_batch","validate_document","refresh_fields",'
+                '"officecli"]'
+            ),
             command,
         )
         self.assertIn(
@@ -753,11 +836,9 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
             command,
         )
         self.assertTrue(
-            any(
-                "ogent_officecli_mcp.py" in argument
-                for argument in command
-            )
+            any("ogent_officecli_mcp.py" in argument for argument in command)
         )
+        self.assertTrue(any("attachments_only" in argument for argument in command))
         self.assertNotIn("danger-full-access", command)
 
     def test_codex_rejects_danger_full_access(self) -> None:
@@ -851,11 +932,53 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
             officecli_server["args"][2],
             str(Path.cwd() / "active.docx"),
         )
+        self.assertEqual(
+            officecli_server["args"][3:5],
+            ["--scope-mode", "attachments_only"],
+        )
+        self.assertNotIn("--allow-mutations", officecli_server["args"])
         self.assertNotIn("Bash", rendered)
         self.assertNotIn("Read", rendered)
+
+        mutation_command = build_claude_command(
+            self.resolution,
+            ProviderRunRequest(
+                prompt="Edit.",
+                working_directory=Path.cwd(),
+                model="catalog-alias",
+                effort=AUTOMATIC_EFFORT,
+                session_id=None,
+                new_session_id=str(uuid.uuid4()),
+                persistent=True,
+                office_document=Path.cwd() / "active.docx",
+                allow_document_mutation=True,
+                scope_mode=ScopeMode.SELECTED_ONLY,
+                allowed_document_paths=("/body/p[2]",),
+            ),
+        )
+        mutation_config = json.loads(
+            mutation_command[mutation_command.index("--mcp-config") + 1]
+        )
+        self.assertIn(
+            "--allow-mutations",
+            mutation_config["mcpServers"]["officecli"]["args"],
+        )
+        self.assertIn(
+            "/body/p[2]",
+            mutation_config["mcpServers"]["officecli"]["args"],
+        )
         self.assertEqual(
             command[command.index("--allowedTools") + 1],
-            "mcp__officecli__officecli",
+            (
+                "mcp__officecli__load_document_skill,"
+                "mcp__officecli__inspect_document,"
+                "mcp__officecli__read_nodes,"
+                "mcp__officecli__query_nodes,"
+                "mcp__officecli__apply_atomic_batch,"
+                "mcp__officecli__validate_document,"
+                "mcp__officecli__refresh_fields,"
+                "mcp__officecli__officecli"
+            ),
         )
         self.assertNotIn("--dangerously-skip-permissions", command)
         self.assertNotIn("bypassPermissions", command)
@@ -878,9 +1001,7 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
             state,
             {
                 "type": "assistant",
-                "message": {
-                    "content": [{"type": "text", "text": "Done."}]
-                },
+                "message": {"content": [{"type": "text", "text": "Done."}]},
                 "session_id": "session-fixture",
             },
         )
@@ -942,9 +1063,7 @@ class ProviderCommandAndStreamTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 124)
         self.assertIn("produced no event", result.error_message or "")
-        self.assertTrue(
-            any(phase == "provider_timeout" for phase, _detail in phases)
-        )
+        self.assertTrue(any(phase == "provider_timeout" for phase, _detail in phases))
         self.assertIsNotNone(process.poll())
 
     def test_structured_claude_error_is_captured(self) -> None:
@@ -1029,18 +1148,22 @@ class ProviderSessionTests(unittest.TestCase):
                 attachment_count=0,
                 materialized_bytes=0,
             )
-            with mock.patch.object(
-                ogent,
-                "ensure_watch",
-                return_value=None,
-            ), mock.patch.object(
-                ogent,
-                "_run_codex_once",
-                side_effect=fake_codex,
-            ), mock.patch.object(
-                ogent,
-                "run_quiet",
-                return_value=subprocess.CompletedProcess([], 0, "{}", ""),
+            with (
+                mock.patch.object(
+                    ogent,
+                    "ensure_watch",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    ogent,
+                    "_run_codex_once",
+                    side_effect=fake_codex,
+                ),
+                mock.patch.object(
+                    ogent,
+                    "run_quiet",
+                    return_value=subprocess.CompletedProcess([], 0, "{}", ""),
+                ),
             ):
                 ogent._agent_worker(
                     session,
@@ -1126,14 +1249,17 @@ class ProviderSessionTests(unittest.TestCase):
                             session.stop_requested = True
                         return exit_code, "unusable-thread", None, ["failed"]
 
-                    with mock.patch.object(
-                        ogent,
-                        "ensure_watch",
-                        return_value=None,
-                    ), mock.patch.object(
-                        ogent,
-                        "_run_codex_once",
-                        side_effect=fake_codex,
+                    with (
+                        mock.patch.object(
+                            ogent,
+                            "ensure_watch",
+                            return_value=None,
+                        ),
+                        mock.patch.object(
+                            ogent,
+                            "_run_codex_once",
+                            side_effect=fake_codex,
+                        ),
                     ):
                         timing = ogent.RunTiming(
                             provider="codex",

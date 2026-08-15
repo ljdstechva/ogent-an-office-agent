@@ -141,14 +141,10 @@ def live_stop(
             )
         stop_returned = ogent.stop_active_run(session)
         if not session.run_complete.wait(timeout=timeout):
-            raise TimeoutError(
-                f"{selection.provider_id} did not stop in time."
-            )
+            raise TimeoutError(f"{selection.provider_id} did not stop in time.")
         with session.lock:
             status = session.run_status
-        process_stopped = bool(
-            process_box and process_box[0].poll() is not None
-        )
+        process_stopped = bool(process_box and process_box[0].poll() is not None)
         if not stop_returned or status != "stopped" or not process_stopped:
             raise RuntimeError(
                 f"{selection.provider_id} Stop did not terminate its process."
@@ -219,9 +215,7 @@ def live_reference(
         )
         wait_for_run(session, selection.provider_id, timeout)
         with session.lock:
-            reference_messages = [
-                item["text"] for item in session.transcript
-            ]
+            reference_messages = [item["text"] for item in session.transcript]
             provider_context_after_reference = (
                 session.codex_thread_id
                 if selection.provider_id == "codex"
@@ -252,7 +246,8 @@ def live_reference(
         wait_for_run(session, selection.provider_id, timeout)
         with session.lock:
             next_messages = [
-                item["text"] for item in session.transcript[transcript_start:]
+                item["text"]
+                for item in session.transcript[transcript_start:]
                 if item.get("role") == "assistant"
             ]
             provider_context_after_normal = (
@@ -296,8 +291,7 @@ def main() -> int:
     }
     reference_source = args.reference_source.expanduser().resolve(strict=True)
     source_hashes = {
-        provider_id: sha256(source)
-        for provider_id, source in sources.items()
+        provider_id: sha256(source) for provider_id, source in sources.items()
     }
     ogent = load_ogent()
     state = ogent.OgentState()
@@ -317,8 +311,7 @@ def main() -> int:
             for provider_id in ("codex", "claude")
         }
         sessions = {
-            provider_id: state.create_session()
-            for provider_id in ("codex", "claude")
+            provider_id: state.create_session() for provider_id in ("codex", "claude")
         }
         markers = {
             "codex": "CODEX-ISOLATION-V090-PASS",
@@ -380,9 +373,7 @@ def main() -> int:
             "workingDocumentsDistinct": codex_working != claude_working,
             "watchPortsDistinct": codex_port != claude_port,
             "providerContextsDistinct": codex_context != claude_context,
-            "contextIdsNeverCrossed": not (
-                codex_cross_context or claude_cross_context
-            ),
+            "contextIdsNeverCrossed": not (codex_cross_context or claude_cross_context),
             "sourceHashesUnchanged": True,
             "livePreviewsIsolated": True,
             "workingDocuments": {

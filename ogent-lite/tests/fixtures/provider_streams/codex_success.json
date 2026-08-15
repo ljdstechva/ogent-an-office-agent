@@ -1,0 +1,46 @@
+{
+  "provider": "codex",
+  "events": [
+    {
+      "type": "thread.started",
+      "thread_id": "fixture-codex-thread"
+    },
+    {
+      "type": "turn.started"
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "type": "command_execution",
+        "command": "officecli inspect_document",
+        "status": "completed"
+      }
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "type": "agent_message",
+        "text": "Verified answer."
+      }
+    },
+    {
+      "type": "turn.completed",
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 3
+      }
+    }
+  ],
+  "expected": {
+    "session_id": "fixture-codex-thread",
+    "final_text": "Verified answer.",
+    "error_message": null,
+    "output_tokens": 3,
+    "activities": [
+      "Codex context started.",
+      "Codex is working.",
+      "completed: officecli inspect_document",
+      "Codex turn completed (3 output tokens)."
+    ]
+  }
+}

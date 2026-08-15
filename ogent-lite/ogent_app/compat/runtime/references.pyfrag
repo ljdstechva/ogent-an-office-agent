@@ -1,0 +1,740 @@
+def _reference_session_root(session: SessionState) -> Path:
+    return REFERENCE_ROOT / session.session_id
+
+
+def _public_references(session: SessionState) -> list[dict[str, Any]]:
+    with session.reference_lock:
+        return [
+            attachment.public_metadata()
+            for attachment in session.pending_references
+        ]
+
+
+def _public_retained_references(session: SessionState) -> list[dict[str, Any]]:
+    with session.reference_lock:
+        return [
+            attachment.public_metadata()
+            for attachment in session.retained_references.values()
+        ]
+
+
+def emit_references(
+    session: SessionState,
+    *,
+    expected_generation: int | None = None,
+) -> None:
+    if session.closed:
+        return
+    session.emit(
+        "references",
+        {
+            "items": _public_references(session),
+            "pending": _public_references(session),
+            "retained": _public_retained_references(session),
+        },
+        expected_generation=expected_generation,
+    )
+
+
+def _reference_user_error(exc: ReferenceError) -> UserFacingError:
+    return UserFacingError(str(exc), exc.status)
+
+
+def _redact_reference_detail(
+    detail: str,
+    *,
+    attachments: list[ReferenceAttachment] | None = None,
+    max_characters: int | None = None,
+) -> str:
+    redacted = detail or ""
+    candidates = [
+        str(REFERENCE_ROOT),
+        str(REFERENCE_ROOT.resolve(strict=False)),
+        str(SESSION_MEMORY_ROOT),
+        str(SESSION_MEMORY_ROOT.resolve(strict=False)),
+    ]
+    for attachment in attachments or []:
+        candidates.extend(
+            [
+                str(attachment.source_path),
+                str(attachment.source_path.parent),
+            ]
+        )
+    for candidate in sorted(set(candidates), key=len, reverse=True):
+        if candidate:
+            parts = [
+                part
+                for part in re.split(r"[\\/]+", candidate)
+                if part
+            ]
+            if parts:
+                pattern = r"[\\/]+".join(re.escape(part) for part in parts)
+                redacted = re.sub(
+                    pattern,
+                    "[temporary reference]",
+                    redacted,
+                    flags=re.IGNORECASE,
+                )
+    if max_characters is not None:
+        bounded = max(1, min(100_000, int(max_characters)))
+        redacted = redacted[-bounded:]
+    return redacted.strip()
+
+
+def _reference_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _project_reference_index_state(
+    session: SessionState,
+    attachment_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+    index_payload: dict[str, Any] | None = None,
+) -> None:
+    with session.reference_lock:
+        canonical = session.retained_references.get(attachment_id)
+        if canonical is None:
+            return
+        updated = dataclasses.replace(
+            canonical,
+            status=status,
+            error_message=error,
+        )
+        session.retained_references[attachment_id] = updated
+        session.pending_references = [
+            updated if item.attachment_id == attachment_id else item
+            for item in session.pending_references
+        ]
+        if session.memory is not None:
+            with contextlib.suppress(SessionMemoryError):
+                session.memory.update_attachment(
+                    attachment_id,
+                    status=status,
+                    processing={
+                        "page_count": updated.page_count,
+                        "frame_count": updated.frame_count,
+                        "index": dict(index_payload or {}),
+                    },
+                )
+    emit_references(session)
+    if index_payload is not None:
+        session.emit(
+            "reference.index",
+            {
+                "attachment_id": attachment_id,
+                **index_payload,
+            },
+        )
+
+
+def _background_reference_index(
+    session: SessionState,
+    attachment: ReferenceAttachment,
+    cancellation: threading.Event,
+) -> None:
+    repository = REFERENCE_INDEX_REPOSITORY
+    store = session.attachment_store
+    if repository is None or store is None:
+        return
+    background_id = uuid.uuid4().hex
+    process_key = f"index:{attachment.attachment_id}"
+    run_root: Path | None = None
+    process: subprocess.Popen[str] | None = None
+    record = None
+    try:
+        source = attachment.source_path.resolve(strict=True)
+        record = repository.begin(
+            workspace_id=session.session_id,
+            attachment_id=attachment.attachment_id,
+            original_name=attachment.original_name,
+            source_sha256=_reference_sha256(source),
+        )
+        _project_reference_index_state(
+            session,
+            attachment.attachment_id,
+            status="Indexing",
+            index_payload=record.public(),
+        )
+        if cancellation.is_set():
+            raise InterruptedError("Reference indexing was cancelled.")
+        materialized, run_root = store.materialize(
+            [attachment],
+            background_id,
+        )
+        if run_root is None or len(materialized) != 1:
+            raise RuntimeError("Reference indexing materialization failed.")
+        if not reference_path_is_within(run_root, REFERENCE_ROOT):
+            raise RuntimeError("Reference indexing root failed containment.")
+        agent_derived = run_root / "agent-derived"
+        agent_derived.mkdir(parents=False, exist_ok=False)
+        manifest_path = run_root / "preparation-manifest.json"
+        result_path = run_root / "preparation-result.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "run_root": str(run_root),
+                    "visual_requested": False,
+                    "office_visual_helper": str(OFFICE_REFERENCE_TO_PDF),
+                    "references": [
+                        materialized[0].preparation_manifest_item()
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(REFERENCE_PREPARER),
+                "prepare",
+                "--manifest",
+                str(manifest_path),
+                "--result",
+                str(result_path),
+            ],
+            cwd=str(run_root),
+            env=command_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
+        )
+        with session.reference_lock:
+            if session.closed or cancellation.is_set():
+                terminate_process_tree(process)
+                raise InterruptedError(
+                    "Reference indexing was cancelled."
+                )
+            session.reference_processes[process_key] = process
+        try:
+            stdout, stderr = process.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process)
+            raise TimeoutError("Reference indexing timed out.") from None
+        if cancellation.is_set() or session.closed:
+            raise InterruptedError("Reference indexing was cancelled.")
+        if process.returncode != 0 or not result_path.is_file():
+            raise RuntimeError(
+                _redact_reference_detail(
+                    stderr
+                    or stdout
+                    or "Reference preparation returned no result.",
+                    attachments=[attachment],
+                    max_characters=1600,
+                )
+            )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        items = result.get("references")
+        if not isinstance(items, list) or len(items) != 1:
+            raise RuntimeError("Reference index result is invalid.")
+        item = items[0]
+        if (
+            not isinstance(item, dict)
+            or str(item.get("id")) != materialized[0].attachment_id
+        ):
+            raise RuntimeError("Reference index identity is invalid.")
+        extracted_raw = item.get("extracted_text_path")
+        extracted = Path(str(extracted_raw)) if extracted_raw else None
+        images = [
+            Path(str(path)) for path in item.get("image_paths", [])
+        ]
+        for candidate in ([extracted] if extracted else []) + images:
+            if (
+                candidate is None
+                or not candidate.is_file()
+                or not reference_path_is_within(
+                    candidate,
+                    REFERENCE_ROOT,
+                )
+                or not path_is_within(candidate, run_root)
+            ):
+                raise RuntimeError(
+                    "A reference index artifact failed containment."
+                )
+        if cancellation.is_set():
+            raise InterruptedError("Reference indexing was cancelled.")
+        prepared = dataclasses.replace(
+            materialized[0],
+            extracted_text_path=extracted,
+            image_paths=images,
+            status=str(item.get("status") or "Ready"),
+            error_message=None,
+        )
+        store.cache_prepared([attachment], [prepared])
+        extracted_text = (
+            extracted.read_text(encoding="utf-8")
+            if extracted is not None
+            else ""
+        )
+        record = repository.complete(
+            attachment.attachment_id,
+            extracted_text,
+            partial=extracted is None,
+        )
+        _project_reference_index_state(
+            session,
+            attachment.attachment_id,
+            status=(
+                "Indexed"
+                if extracted is not None
+                else "Indexed (visual only)"
+            ),
+            index_payload=record.public(),
+        )
+    except Exception as exc:
+        cancelled = isinstance(exc, InterruptedError) or cancellation.is_set()
+        if record is not None:
+            try:
+                record = repository.fail(
+                    attachment.attachment_id,
+                    type(exc).__name__,
+                    cancelled=cancelled,
+                )
+            except Exception as projection_error:
+                backend_log(
+                    "reference_index_failure_projection_failed",
+                    session_id=session.session_id,
+                    error_type=type(projection_error).__name__,
+                )
+        _project_reference_index_state(
+            session,
+            attachment.attachment_id,
+            status=(
+                "Indexing cancelled"
+                if cancelled
+                else "Indexing failed"
+            ),
+            error=(
+                None
+                if cancelled
+                else "Background extraction failed; Send can retry it."
+            ),
+            index_payload=(
+                record.public() if record is not None else None
+            ),
+        )
+    finally:
+        with session.reference_lock:
+            if session.reference_processes.get(process_key) is process:
+                session.reference_processes.pop(process_key, None)
+        if process is not None and process.poll() is None:
+            terminate_process_tree(process)
+        if run_root is not None and run_root.exists():
+            tracked_released = True
+            try:
+                _terminate_tracked_reference_office_processes(run_root)
+            except UserFacingError:
+                tracked_released = False
+            if tracked_released:
+                with contextlib.suppress(ReferenceError, OSError):
+                    cleanup_reference_path(run_root, REFERENCE_ROOT)
+
+
+def queue_reference_index(
+    session: SessionState,
+    attachment: ReferenceAttachment,
+) -> bool:
+    coordinator = REFERENCE_INDEX_COORDINATOR
+    if coordinator is None or REFERENCE_INDEX_REPOSITORY is None:
+        return False
+    _project_reference_index_state(
+        session,
+        attachment.attachment_id,
+        status="Queued for indexing",
+    )
+    return coordinator.schedule(
+        session.session_id,
+        attachment.attachment_id,
+        lambda cancellation: _background_reference_index(
+            session,
+            attachment,
+            cancellation,
+        ),
+    )
+
+
+def cancel_reference_index(
+    session: SessionState,
+    attachment_id: str,
+) -> None:
+    coordinator = REFERENCE_INDEX_COORDINATOR
+    if coordinator is not None:
+        coordinator.cancel(session.session_id, attachment_id)
+    process_key = f"index:{attachment_id}"
+    with session.reference_lock:
+        process = session.reference_processes.get(process_key)
+    terminate_process_tree(process)
+    if coordinator is not None:
+        with contextlib.suppress(
+            concurrent.futures.CancelledError,
+            TimeoutError,
+        ):
+            coordinator.wait(
+                session.session_id,
+                attachment_id,
+                timeout=2,
+            )
+    if REFERENCE_INDEX_REPOSITORY is not None:
+        REFERENCE_INDEX_REPOSITORY.forget(attachment_id)
+
+
+def inspect_reference_upload(
+    session: SessionState,
+    reservation_id: str,
+    source_path: Path,
+    original_name: str,
+) -> dict[str, Any]:
+    result_path = source_path.parent / ".inspection.json"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(REFERENCE_PREPARER),
+            "inspect",
+            "--source",
+            str(source_path),
+            "--filename",
+            original_name,
+            "--result",
+            str(result_path),
+        ],
+        cwd=str(source_path.parent),
+        env=command_env(),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
+    )
+    with session.reference_lock:
+        if session.closed or reservation_id not in session.reference_reservations:
+            terminate_process_tree(process)
+            raise UserFacingError("This Ogent session has closed.", 410)
+        session.reference_processes[reservation_id] = process
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=150)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process)
+            raise UserFacingError(
+                "Reference inspection timed out. Attach a smaller or simpler file.",
+                504,
+            ) from None
+        try:
+            if not result_path.is_file() or result_path.stat().st_size > 64 * 1024:
+                raise UserFacingError(
+                    "Reference inspection returned no valid metadata.",
+                    400,
+                )
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            detail = _redact_reference_detail(
+                stderr or stdout,
+                max_characters=1600,
+            )
+            raise UserFacingError(
+                f"Reference inspection failed. {detail}".strip(),
+                400,
+            ) from exc
+        if process.returncode != 0 or payload.get("error"):
+            status = int(payload.get("status", 400))
+            status = status if 400 <= status <= 599 else 400
+            raise UserFacingError(
+                _redact_reference_detail(
+                    str(payload.get("error") or "Reference inspection failed."),
+                    max_characters=1600,
+                ),
+                status,
+            )
+        return payload
+    finally:
+        with session.reference_lock:
+            if session.reference_processes.get(reservation_id) is process:
+                session.reference_processes.pop(reservation_id, None)
+        with contextlib.suppress(OSError):
+            result_path.unlink()
+
+
+def register_reference_upload(
+    session: SessionState,
+    source_path: Path,
+    original_name: str,
+    inspection: dict[str, Any],
+) -> ReferenceAttachment:
+    try:
+        sanitized_name = sanitize_reference_filename(original_name)
+    except ReferenceError as exc:
+        raise _reference_user_error(exc) from exc
+    kind = str(inspection.get("kind", ""))
+    detected_type = str(inspection.get("detected_type", ""))
+    if (
+        kind not in {"Office", "PDF", "Text", "Image"}
+        or not detected_type
+        or len(detected_type) > 160
+    ):
+        raise UserFacingError("Reference inspection returned invalid metadata.", 500)
+    attachment = ReferenceAttachment(
+        attachment_id=source_path.parent.name,
+        original_name=sanitized_name,
+        source_path=source_path,
+        detected_type=detected_type,
+        kind=kind,
+        byte_size=source_path.stat().st_size,
+        uploaded_at=now_iso(),
+        page_count=(
+            int(inspection["page_count"])
+            if inspection.get("page_count") is not None
+            else None
+        ),
+        frame_count=(
+            int(inspection["frame_count"])
+            if inspection.get("frame_count") is not None
+            else None
+        ),
+    )
+    store = session.attachment_store
+    if store is None:
+        raise UserFacingError("Retained attachment storage is unavailable.", 500)
+    try:
+        attachment = store.commit_upload(source_path, attachment)
+        with session.reference_lock:
+            with session.lock:
+                if session.closed:
+                    raise UserFacingError("This Ogent session has closed.", 410)
+            pending_count = len(session.pending_references)
+            pending_bytes = sum(
+                item.byte_size for item in session.pending_references
+            )
+            reserved_count = len(session.reference_reservations)
+            reserved_bytes = sum(session.reference_reservations.values())
+            send_count = pending_count + reserved_count + 1
+            send_bytes = pending_bytes + reserved_bytes + attachment.byte_size
+            retained_count = (
+                len(session.retained_references) + reserved_count + 1
+            )
+            retained_bytes = (
+                sum(
+                    item.byte_size
+                    for item in session.retained_references.values()
+                )
+                + reserved_bytes
+                + attachment.byte_size
+            )
+            if send_count > MAX_REFERENCES_PER_SEND:
+                raise UserFacingError(
+                    f"The next message already has {MAX_REFERENCES_PER_SEND} "
+                    "attachments. Remove one before attaching another.",
+                    413,
+                )
+            if send_bytes > MAX_COMBINED_BYTES_PER_SEND:
+                raise UserFacingError(
+                    f"The next message would exceed the "
+                    f"{MAX_COMBINED_BYTES_PER_SEND // (1024 * 1024)} MB combined "
+                    "attachment limit. Remove an attachment or choose a smaller file.",
+                    413,
+                )
+            if retained_count > MAX_SESSION_REFERENCE_COUNT:
+                raise UserFacingError(
+                    f"This workspace already retains "
+                    f"{MAX_SESSION_REFERENCE_COUNT} attachments. Forget one before "
+                    "attaching another.",
+                    413,
+                )
+            if retained_bytes > MAX_SESSION_REFERENCE_BYTES:
+                raise UserFacingError(
+                    f"This workspace would exceed the "
+                    f"{MAX_SESSION_REFERENCE_BYTES // (1024 * 1024)} MB retained "
+                    "attachment limit. Forget an attachment or choose a smaller file.",
+                    413,
+                )
+            session.retained_references[attachment.attachment_id] = attachment
+            session.pending_references.append(attachment)
+            if session.memory is not None:
+                session.memory.record_attachment(
+                    attachment_id=attachment.attachment_id,
+                    filename=attachment.original_name,
+                    detected_type=attachment.detected_type,
+                    kind=attachment.kind,
+                    byte_size=attachment.byte_size,
+                    uploaded_at=attachment.uploaded_at,
+                    status=attachment.status,
+                    ocr_or_vision=attachment.ocr_or_vision,
+                    processing={
+                        "page_count": attachment.page_count,
+                        "frame_count": attachment.frame_count,
+                    },
+                    canonical_path=attachment.source_path,
+                )
+    except Exception:
+        if attachment.source_path.parent.parent == store.canonical_root:
+            try:
+                store.forget(attachment)
+            except Exception as cleanup_error:
+                backend_log(
+                    "reference_registration_cleanup_failed",
+                    session_id=session.session_id,
+                    error_type=type(cleanup_error).__name__,
+                )
+        raise
+    queue_reference_index(session, attachment)
+    emit_references(session)
+    return attachment
+
+
+def claim_pending_references(
+    session: SessionState,
+    run_id: str,
+) -> tuple[list[ReferenceAttachment], Path | None]:
+    """Atomically freeze pending canonical references for one message."""
+    with session.reference_lock:
+        with session.lock:
+            if session.closed:
+                raise UserFacingError("This Ogent session has closed.", 410)
+        attachments = list(session.pending_references)
+        if not attachments:
+            return [], None
+        if len(attachments) > MAX_REFERENCES_PER_SEND:
+            raise UserFacingError("Too many references are pending for one run.", 413)
+        if (
+            sum(item.byte_size for item in attachments)
+            > MAX_COMBINED_BYTES_PER_SEND
+        ):
+            raise UserFacingError("Pending references exceed the combined run limit.", 413)
+        session.pending_references.clear()
+        session.run_retained_ids[run_id] = {
+            item.attachment_id for item in attachments
+        }
+    emit_references(session)
+    return attachments, None
+
+
+def _referenced_retained_attachments(
+    session: SessionState,
+    message: str,
+    *,
+    new_attachments: list[ReferenceAttachment],
+) -> list[ReferenceAttachment]:
+    """Choose deterministic prior attachments needed for this turn."""
+    folded = message.casefold()
+    new_ids = {item.attachment_id for item in new_attachments}
+    with session.reference_lock:
+        available = [
+            item
+            for item in session.retained_references.values()
+            if item.attachment_id not in new_ids and item.available_in_session
+        ]
+    explicit = [
+        item
+        for item in available
+        if item.attachment_id in folded
+        or item.original_name.casefold() in folded
+    ]
+    if not explicit and re.search(
+        r"\b(?:attachments?|attached|references?|earlier file|previous file)\b",
+        folded,
+    ):
+        explicit = sorted(
+            available,
+            key=lambda item: (
+                item.sent_sequence if item.sent_sequence is not None else -1,
+                item.uploaded_at,
+                item.attachment_id,
+            ),
+            reverse=True,
+        )
+    return explicit
+
+
+def materialize_run_references(
+    session: SessionState,
+    run_id: str,
+    attachments: list[ReferenceAttachment],
+) -> tuple[list[ReferenceAttachment], Path | None]:
+    if not attachments:
+        return [], None
+    store = session.attachment_store
+    if store is None:
+        raise UserFacingError("Retained attachment storage is unavailable.", 500)
+    try:
+        materialized, run_root = store.materialize(attachments, run_id)
+    except RetainedAttachmentError as exc:
+        raise UserFacingError(str(exc), 500) from exc
+    if run_root is None or not reference_path_is_within(run_root, REFERENCE_ROOT):
+        raise UserFacingError(
+            "The materialized attachment bundle failed containment validation.",
+            500,
+        )
+    with session.reference_lock:
+        session.active_references[run_id] = materialized
+        session.reference_run_roots[run_id] = run_root
+        session.run_retained_ids[run_id] = {
+            item.canonical_attachment_id or item.attachment_id
+            for item in materialized
+        }
+    emit_references(session)
+    return materialized, run_root
+
+
+def _terminate_tracked_reference_office_processes(run_root: Path) -> None:
+    if not reference_path_is_within(run_root, REFERENCE_ROOT) or not run_root.exists():
+        return
+    failures = 0
+    for pid_file in run_root.rglob(".office-process.json"):
+        if not reference_path_is_within(pid_file, REFERENCE_ROOT):
+            continue
+        try:
+            record = json.loads(pid_file.read_text(encoding="utf-8-sig"))
+            process_id = int(record.get("pid", 0))
+            process_name = str(record.get("process_name", "")).upper()
+        except (OSError, ValueError, TypeError, AttributeError):
+            process_id = 0
+            process_name = ""
+        if (
+            os.name == "nt"
+            and process_id > 0
+            and process_name in {"WINWORD.EXE", "POWERPNT.EXE", "EXCEL.EXE"}
+        ):
+            script = (
+                f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId={process_id}\"; "
+                "if (-not $p) { exit 0 }; "
+                f"if ($p.Name -ine '{process_name}' -or "
+                "$p.CommandLine -notmatch '(?i)(/Automation|-Embedding)') { exit 3 }; "
+                f"Stop-Process -Id {process_id} -Force -ErrorAction SilentlyContinue; "
+                f"Wait-Process -Id {process_id} -Timeout 5 -ErrorAction SilentlyContinue; "
+                f"if (Get-Process -Id {process_id} -ErrorAction SilentlyContinue) "
+                "{ exit 4 }; exit 0"
+            )
+            try:
+                result = run_quiet(
+                    ["powershell.exe", "-NoProfile", "-Command", script],
+                    timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                result = None
+            if result is not None and result.returncode == 0:
+                with contextlib.suppress(OSError):
+                    pid_file.unlink()
+            else:
+                failures += 1
+        elif process_id <= 0 or not process_name:
+            failures += 1
+        else:
+            failures += 1
+    if failures:
+        raise UserFacingError(
+            "A tracked Office reference process could not be safely terminated; "
+            "its cleanup record was retained.",
+            500,
+        )
+
+

@@ -8,6 +8,8 @@ if /I "%~1"=="stop" (
     exit /b %errorlevel%
 )
 
+if /I "%~1"=="agent" goto agent_mode
+
 if not "%~1"=="" (
     where pyw.exe >nul 2>&1
     if not errorlevel 1 (
@@ -39,3 +41,12 @@ if not errorlevel 1 (
 
 echo Ogent Lite requires Python 3. Install Python, then confirm "py -3 --version" works.
 exit /b 1
+
+:agent_mode
+rem Interactive workspace picker: runs in this console for the prompt.
+if "%~2"=="" (
+    py -3 "%OGENT_SCRIPT%" --agent
+) else (
+    py -3 "%OGENT_SCRIPT%" --agent "%~2"
+)
+exit /b %errorlevel%

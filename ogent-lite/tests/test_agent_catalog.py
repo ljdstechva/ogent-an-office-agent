@@ -219,9 +219,7 @@ class CapabilityCacheTests(unittest.TestCase):
             catalog = fixture_catalog(first_path)
             cache.store(catalog)
 
-            self.assertIsNone(
-                cache.load("fixture", str(first_path), "fixture-cli 8")
-            )
+            self.assertIsNone(cache.load("fixture", str(first_path), "fixture-cli 8"))
             self.assertIsNone(
                 cache.load(
                     "fixture",
@@ -317,9 +315,7 @@ class CapabilityManagerTests(unittest.TestCase):
                     AUTOMATIC_EFFORT,
                 )
 
-            manager.set_catalog_for_testing(
-                fixture_catalog(root / "fixture.exe")
-            )
+            manager.set_catalog_for_testing(fixture_catalog(root / "fixture.exe"))
             with self.assertRaisesRegex(
                 SelectionValidationError,
                 "no longer reported",
@@ -337,9 +333,7 @@ class CapabilityManagerTests(unittest.TestCase):
                 (StaticProvider(root / "fixture.exe"),),
                 CapabilityCache(root / "cache.json"),
             )
-            manager.set_catalog_for_testing(
-                fixture_catalog(root / "fixture.exe")
-            )
+            manager.set_catalog_for_testing(fixture_catalog(root / "fixture.exe"))
 
             with self.assertRaisesRegex(
                 SelectionValidationError,
@@ -480,6 +474,20 @@ class CapabilityManagerTests(unittest.TestCase):
 
 
 class StaticCatalogGuardTests(unittest.TestCase):
+    @staticmethod
+    def _production_frontend() -> str:
+        source_root = OGENT_DIR / "web" / "src"
+        sources = [
+            OGENT_DIR / "web" / "index.html",
+            OGENT_DIR / "web" / "shell.html",
+            *sorted(
+                path
+                for path in source_root.rglob("*")
+                if path.suffix in {".ts", ".tsx", ".css"} and ".test." not in path.name
+            ),
+        ]
+        return "\n".join(path.read_text(encoding="utf-8") for path in sources)
+
     def test_production_has_no_static_model_or_effort_catalog(self) -> None:
         production = "\n".join(
             (OGENT_DIR / name).read_text(encoding="utf-8")
@@ -496,40 +504,43 @@ class StaticCatalogGuardTests(unittest.TestCase):
                 production,
             )
         )
-        html_model = re.search(
-            r'<select[^>]+id="modelSelect"[^>]*>(.*?)</select>',
-            production,
-            re.DOTALL,
+        agent_settings = (
+            OGENT_DIR / "web" / "src" / "components" / "chat" / "AgentSettings.tsx"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "(selection.provider?.models ?? []).map",
+            agent_settings,
         )
-        self.assertIsNotNone(html_model)
-        assert html_model is not None
-        self.assertNotIn("<option", html_model.group(1))
+        self.assertIn(
+            "capabilities.providers.map",
+            agent_settings,
+        )
+        self.assertNotRegex(
+            agent_settings,
+            re.compile(r'<option\s+value="(?:gpt|claude|o[0-9])', re.I),
+        )
 
     def test_mobile_layout_stacks_without_horizontal_clipping(self) -> None:
-        production = (OGENT_DIR / "ogent.py").read_text(encoding="utf-8")
+        production = self._production_frontend()
 
         self.assertIn("@media (max-width: 760px) {", production)
         self.assertIn("flex-direction: column;", production)
-        self.assertIn(".splitter { display: none; }", production)
-        self.assertIn(
-            "overflow-x: hidden; overflow-y: auto;",
-            production,
-        )
+        self.assertIn(".splitter {", production)
+        self.assertIn("display: none;", production)
+        self.assertIn("overflow-x: hidden;", production)
+        self.assertIn("overflow-y: auto;", production)
 
     def test_saved_ready_provider_wins_after_refresh_fallback(self) -> None:
-        production = (OGENT_DIR / "ogent.py").read_text(encoding="utf-8")
-        selection = re.search(
-            r"const desiredProvider = \[(.*?)\]\.find",
-            production,
-            re.DOTALL,
-        )
-
-        self.assertIsNotNone(selection)
-        assert selection is not None
-        choices = selection.group(1)
+        selection = (
+            OGENT_DIR / "web" / "src" / "hooks" / "useAgentSelection.ts"
+        ).read_text(encoding="utf-8")
         self.assertLess(
-            choices.index("readyProviderIds.has(agentSettings.provider)"),
-            choices.index("readyProviderIds.has(previousProvider)"),
+            selection.index("stored.provider &&"),
+            selection.index("providers.find("),
+        )
+        self.assertIn(
+            'provider.live && provider.status === "ready"',
+            selection,
         )
 
 

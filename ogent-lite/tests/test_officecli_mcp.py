@@ -15,6 +15,7 @@ OGENT_DIR = Path(__file__).resolve().parents[1]
 if str(OGENT_DIR) not in sys.path:
     sys.path.insert(0, str(OGENT_DIR))
 
+from ogent_app.domain.run import ScopeMode  # noqa: E402
 from ogent_officecli_mcp import (  # noqa: E402
     GatewayResult,
     OfficeCLIGate,
@@ -40,23 +41,21 @@ class OfficeCLIGateTests(unittest.TestCase):
             self.document,
             read_roots=[self.references],
             executable=Path(sys.executable),
+            allow_mutations=True,
+            scope_mode=ScopeMode.WHOLE_DOCUMENT,
         )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
     def test_split_command_preserves_quoted_windows_path(self) -> None:
-        arguments = split_command(
-            f'get "{self.document}" "/body/p[2]" --json'
-        )
+        arguments = split_command(f'get "{self.document}" "/body/p[2]" --json')
         self.assertEqual(arguments[0], "get")
         self.assertEqual(Path(arguments[1]), self.document)
         self.assertEqual(arguments[2], "/body/p[2]")
 
     def test_only_active_document_is_accepted(self) -> None:
-        prepared = self.gate.prepare(
-            f'get "{self.document}" "/body/p[2]" --json'
-        )
+        prepared = self.gate.prepare(f'get "{self.document}" "/body/p[2]" --json')
         self.assertEqual(prepared[1], "get")
         self.assertEqual(Path(prepared[2]), self.document.resolve())
         with self.assertRaisesRegex(
@@ -64,6 +63,107 @@ class OfficeCLIGateTests(unittest.TestCase):
             "restricted to the active",
         ):
             self.gate.prepare(f'get "{self.other}" "/body/p[1]" --json')
+
+    def test_every_typed_document_operation_is_identity_and_scope_bound(
+        self,
+    ) -> None:
+        calls: list[list[str]] = []
+
+        def runner(
+            arguments: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0, '{"success":true}', "")
+
+        whole_document = OfficeCLIGate(
+            self.document,
+            executable=Path(sys.executable),
+            runner=runner,
+            allow_mutations=True,
+            scope_mode=ScopeMode.WHOLE_DOCUMENT,
+        )
+        operations = (
+            ("inspect_document", {"mode": "stats"}),
+            ("read_nodes", {"paths": ["/body/p[1]"]}),
+            ("query_nodes", {"selector": "/body/p[1]"}),
+            (
+                "apply_atomic_batch",
+                {
+                    "commands": [
+                        {
+                            "command": "set",
+                            "path": "/body/p[1]",
+                            "props": {"text": "safe"},
+                        }
+                    ]
+                },
+            ),
+            ("validate_document", {}),
+            ("refresh_fields", {}),
+        )
+        for operation, parameters in operations:
+            with self.subTest(operation=operation, scope="whole_document"):
+                whole_document.execute_typed(operation, parameters)
+                self.assertEqual(
+                    Path(calls[-1][2]),
+                    self.document.resolve(),
+                )
+
+        selected_only = OfficeCLIGate(
+            self.document,
+            executable=Path(sys.executable),
+            runner=runner,
+            allow_mutations=True,
+            scope_mode=ScopeMode.SELECTED_ONLY,
+            allowed_document_paths=("/body/p[1]",),
+        )
+        rejected = (
+            ("inspect_document", {"mode": "text"}),
+            ("read_nodes", {"paths": ["/body/p[2]"]}),
+            ("query_nodes", {"selector": "/body/p[2]"}),
+            (
+                "apply_atomic_batch",
+                {
+                    "commands": [
+                        {
+                            "command": "set",
+                            "path": "/body/p[2]",
+                            "props": {"text": "outside scope"},
+                        }
+                    ]
+                },
+            ),
+            ("refresh_fields", {}),
+        )
+        for operation, parameters in rejected:
+            with self.subTest(operation=operation, scope="selected_only"):
+                with self.assertRaises(OfficeCLIGatewayError):
+                    selected_only.execute_typed(operation, parameters)
+
+        selected_only.execute_typed("validate_document", {})
+        self.assertEqual(Path(calls[-1][2]), self.document.resolve())
+        whole_document.execute_typed(
+            "load_document_skill",
+            {"skill": "word"},
+        )
+        self.assertNotIn(str(self.other), " ".join(calls[-1]))
+
+    def test_read_only_gate_rejects_mutations_but_allows_inspection(self) -> None:
+        gate = OfficeCLIGate(
+            self.document,
+            executable=Path(sys.executable),
+            allow_mutations=False,
+            scope_mode=ScopeMode.WHOLE_DOCUMENT,
+        )
+
+        inspection = gate.prepare(f'get "{self.document}" "/body/p[1]" --json')
+        self.assertEqual(inspection[1], "get")
+        with self.assertRaisesRegex(
+            OfficeCLIGatewayError,
+            "read-only",
+        ):
+            gate.prepare(f'set "{self.document}" "/body/p[1]" --text "changed"')
 
     def test_analysis_only_gate_rejects_document_commands(self) -> None:
         gate = OfficeCLIGate(
@@ -77,10 +177,56 @@ class OfficeCLIGateTests(unittest.TestCase):
         ):
             gate.prepare(f'get "{self.document}" "/body/p[1]"')
 
+    def test_selected_scope_rejects_broad_and_out_of_scope_reads(self) -> None:
+        gate = OfficeCLIGate(
+            self.document,
+            executable=Path(sys.executable),
+            allow_mutations=True,
+            scope_mode=ScopeMode.SELECTED_ONLY,
+            allowed_document_paths=("/body/p[2]",),
+        )
+
+        selected = gate.prepare(f'get "{self.document}" "/body/p[2]" --depth 2 --json')
+        descendant = gate.prepare(
+            f'set "{self.document}" "/body/p[2]/r[1]" --text "updated"'
+        )
+        stats = gate.prepare(f'view "{self.document}" stats --json')
+        self.assertIn("/body/p[2]", selected)
+        self.assertIn("/body/p[2]/r[1]", descendant)
+        self.assertIn("stats", stats)
+
+        for command in (
+            f'view "{self.document}" text',
+            f'get "{self.document}" "/" --json',
+            f'get "{self.document}" "/body/p[3]" --json',
+            f'query "{self.document}" "*" --json',
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(OfficeCLIGatewayError):
+                    gate.prepare(command)
+
+    def test_attachments_only_scope_rejects_all_document_commands(self) -> None:
+        gate = OfficeCLIGate(
+            self.document,
+            executable=Path(sys.executable),
+            scope_mode=ScopeMode.ATTACHMENTS_ONLY,
+        )
+
+        for command in (
+            f'view "{self.document}" stats --json',
+            f'validate "{self.document}" --json',
+            f'get "{self.document}" "/body/p[1]" --json',
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(
+                    OfficeCLIGatewayError,
+                    "attachments-only",
+                ):
+                    gate.prepare(command)
+
     def test_external_inputs_are_limited_to_read_roots(self) -> None:
         prepared = self.gate.prepare(
-            f'add "{self.document}" /body --type picture '
-            f'--prop image="{self.image}"'
+            f'add "{self.document}" /body --type picture --prop image="{self.image}"'
         )
         self.assertIn(f"image={self.image}", prepared)
         outside = self.root / "outside.png"
@@ -90,8 +236,7 @@ class OfficeCLIGateTests(unittest.TestCase):
             "read-only references",
         ):
             self.gate.prepare(
-                f'add "{self.document}" /body --type picture '
-                f'--prop image="{outside}"'
+                f'add "{self.document}" /body --type picture --prop image="{outside}"'
             )
 
     def test_relative_external_inputs_are_resolved_before_containment(self) -> None:
@@ -135,8 +280,7 @@ class OfficeCLIGateTests(unittest.TestCase):
         batch = self.root / "batch.json"
         cases = (
             (
-                f'batch "{self.document}" --commands "[]" '
-                "--best-effort=true",
+                f'batch "{self.document}" --commands "[]" --best-effort=true',
                 "--best-effort",
             ),
             (
@@ -144,8 +288,7 @@ class OfficeCLIGateTests(unittest.TestCase):
                 "--browser",
             ),
             (
-                f'set "{self.document}" /body/p[1] --prop text=changed '
-                "--force=true",
+                f'set "{self.document}" /body/p[1] --prop text=changed --force=true',
                 "--force",
             ),
             (
@@ -219,15 +362,12 @@ class OfficeCLIGateTests(unittest.TestCase):
             self.document,
             executable=Path(sys.executable),
             runner=runner,
+            scope_mode=ScopeMode.WHOLE_DOCUMENT,
         )
-        result = gate.execute(
-            f'validate "{self.document}" --json'
-        )
+        result = gate.execute(f'validate "{self.document}" --json')
         self.assertEqual(result, GatewayResult(0, "verified"))
         self.assertFalse(captured["shell"])
-        self.assertTrue(
-            Path(captured["cwd"]).samefile(self.document.parent)
-        )
+        self.assertTrue(Path(captured["cwd"]).samefile(self.document.parent))
         self.assertEqual(
             captured["env"]["OFFICECLI_NO_AUTO_RESIDENT"],
             "1",
@@ -235,16 +375,26 @@ class OfficeCLIGateTests(unittest.TestCase):
 
 
 class OfficeCLIMCPServerTests(unittest.TestCase):
-    def test_protocol_lists_one_string_command_tool(self) -> None:
+    def test_protocol_lists_typed_tools_and_restricted_escape_hatch(self) -> None:
         gate = mock.Mock()
         server = OfficeCLIMCPServer(gate)
-        response = server.handle(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-        )
+        response = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         assert response is not None
         tools = response["result"]["tools"]
-        self.assertEqual([tool["name"] for tool in tools], ["officecli"])
-        schema = tools[0]["inputSchema"]
+        self.assertEqual(
+            [tool["name"] for tool in tools],
+            [
+                "load_document_skill",
+                "inspect_document",
+                "read_nodes",
+                "query_nodes",
+                "apply_atomic_batch",
+                "validate_document",
+                "refresh_fields",
+                "officecli",
+            ],
+        )
+        schema = tools[-1]["inputSchema"]
         self.assertEqual(schema["properties"]["command"]["type"], "string")
         self.assertFalse(schema["additionalProperties"])
 

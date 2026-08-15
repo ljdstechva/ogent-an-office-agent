@@ -1,0 +1,135 @@
+class UserFacingError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        status: int = 400,
+        *,
+        session_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.session_id = session_id
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+SAFE_RUNTIME_LOG_FIELDS = frozenset(
+    {
+        "active_document_id",
+        "active_generation",
+        "bytes",
+        "cache_key",
+        "cached",
+        "client_id",
+        "document_extension",
+        "document_id",
+        "document_revision",
+        "error_type",
+        "event_type",
+        "message_present",
+        "metric_count",
+        "reason",
+        "requested_document_id",
+        "requested_generation",
+        "route",
+        "run_id",
+        "sequence",
+        "session_id",
+        "status",
+        "watch_generation",
+    }
+)
+SAFE_RUNTIME_LOG_TOKEN = re.compile(r"^[A-Za-z0-9_./:-]{0,200}$")
+
+
+def _rotate_runtime_log_unlocked(incoming_bytes: int) -> None:
+    maximum = RESOURCE_QUOTAS.max_log_bytes
+    if (
+        not RUNTIME_LOG_PATH.exists()
+        or RUNTIME_LOG_PATH.stat().st_size + incoming_bytes <= maximum
+    ):
+        return
+    if RUNTIME_LOG_PATH.is_symlink():
+        raise OSError("The runtime log path is not a regular file.")
+    for index in range(RESOURCE_QUOTAS.log_backup_count, 0, -1):
+        source = (
+            RUNTIME_LOG_PATH
+            if index == 1
+            else RUNTIME_LOG_PATH.with_name(
+                f"{RUNTIME_LOG_PATH.name}.{index - 1}"
+            )
+        )
+        if not source.exists():
+            continue
+        target = RUNTIME_LOG_PATH.with_name(
+            f"{RUNTIME_LOG_PATH.name}.{index}"
+        )
+        os.replace(source, target)
+
+
+def backend_log(event: str, **fields: Any) -> None:
+    """Append a rotating, secret-free diagnostic event to the local log."""
+    payload: dict[str, Any] = {
+        "time": now_iso(),
+        "event": str(event)[:120],
+    }
+    for key, value in fields.items():
+        normalized_key = str(key)[:80]
+        if normalized_key not in SAFE_RUNTIME_LOG_FIELDS:
+            continue
+        if value is None or isinstance(value, (bool, int, float)):
+            payload[normalized_key] = value
+            continue
+        text = str(value)
+        if SAFE_RUNTIME_LOG_TOKEN.fullmatch(text):
+            payload[normalized_key] = text
+        else:
+            payload[f"{normalized_key}_redacted"] = True
+    try:
+        RUNTIME_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        encoded_size = len(line.encode("utf-8")) + 1
+        with RUNTIME_LOG_LOCK:
+            _rotate_runtime_log_unlocked(encoded_size)
+            with RUNTIME_LOG_PATH.open("a", encoding="utf-8") as stream:
+                stream.write(f"{line}\n")
+    except OSError:
+        # Diagnostics are best-effort and must not take down the preview.
+        return
+
+
+def json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def safe_name(value: str) -> str:
+    return WORKSPACE_PATH_POLICY.safe_component(value)
+
+
+def safe_upload_filename(value: str) -> str:
+    try:
+        return WORKSPACE_PATH_POLICY.safe_upload_filename(value)
+    except PathPolicyError as exc:
+        raise UserFacingError(str(exc), exc.status) from exc
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    return WORKSPACE_PATH_POLICY.is_within(path, root)
+
+
+def command_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["OFFICECLI_NO_AUTO_RESIDENT"] = "1"
+    env["OFFICECLI_RESIDENT_FLUSH"] = "each"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env

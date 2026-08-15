@@ -1,0 +1,846 @@
+def transition_run_step(
+    session: SessionState,
+    run_id: str,
+    step_id: str,
+    target: RunStepState,
+    *,
+    checkpoint: dict[str, Any] | None = None,
+    verification: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    expected_generation: int | None = None,
+) -> dict[str, Any] | None:
+    """Persist and publish one normalized step transition."""
+    with session.lock:
+        plan = session.run_plan if session.run_id == run_id else None
+    if plan is None or not any(
+        step.step_id == step_id for step in plan.steps
+    ):
+        return None
+    event_type = {
+        RunStepState.RUNNING: "run.step.started",
+        RunStepState.COMPLETED: "run.step.completed",
+        RunStepState.FAILED: "run.step.failed",
+        RunStepState.CANCELLED: "run.step.cancelled",
+        RunStepState.PENDING: "run.step.pending",
+    }[target]
+    durable_sequence = None
+    if session.workspace_actor is not None:
+        step_record, durable_event = session.workspace_actor.dispatch(
+            TransitionRunStep(
+                run_id,
+                step_id,
+                target,
+                checkpoint=checkpoint,
+                verification=verification,
+                error_code=error_code,
+            )
+        )
+        public_step = step_record.public()
+        durable_sequence = durable_event.sequence
+    else:
+        with session.lock:
+            existing = next(
+                (
+                    item
+                    for item in session.run_steps
+                    if item.get("id") == step_id
+                ),
+                None,
+            )
+            if existing is None:
+                return None
+            public_step = {
+                **existing,
+                "state": target.value,
+                "checkpoint": dict(
+                    checkpoint
+                    if checkpoint is not None
+                    else existing.get("checkpoint") or {}
+                ),
+                "verification": dict(
+                    verification
+                    if verification is not None
+                    else existing.get("verification") or {}
+                ),
+                "error_code": error_code,
+                "started_at": (
+                    now_iso()
+                    if target is RunStepState.RUNNING
+                    else existing.get("started_at")
+                ),
+                "completed_at": (
+                    now_iso() if target.terminal else None
+                ),
+            }
+    with session.lock:
+        session.run_steps = [
+            public_step if item.get("id") == step_id else item
+            for item in session.run_steps
+        ]
+    payload = {"run_id": run_id, "step": public_step}
+    session.emit(
+        event_type,
+        payload,
+        expected_generation=expected_generation,
+        durable_sequence=durable_sequence,
+    )
+    return public_step
+
+
+def checkpoint_run_step(
+    session: SessionState,
+    run_id: str,
+    step_id: str,
+    checkpoint: dict[str, Any],
+    *,
+    expected_generation: int | None = None,
+) -> dict[str, Any] | None:
+    with session.lock:
+        if session.run_id != run_id:
+            return None
+    durable_sequence = None
+    if session.workspace_actor is not None:
+        step_record, durable_event = session.workspace_actor.dispatch(
+            CheckpointRunStep(run_id, step_id, checkpoint)
+        )
+        public_step = step_record.public()
+        durable_sequence = durable_event.sequence
+    else:
+        with session.lock:
+            existing = next(
+                (
+                    item
+                    for item in session.run_steps
+                    if item.get("id") == step_id
+                ),
+                None,
+            )
+            if existing is None:
+                return None
+            public_step = {
+                **existing,
+                "checkpoint": dict(checkpoint),
+            }
+    with session.lock:
+        session.run_steps = [
+            public_step if item.get("id") == step_id else item
+            for item in session.run_steps
+        ]
+    session.emit(
+        "run.step.checkpoint",
+        {"run_id": run_id, "step": public_step},
+        expected_generation=expected_generation,
+        durable_sequence=durable_sequence,
+    )
+    return public_step
+
+
+def cancel_incomplete_run_steps(
+    session: SessionState,
+    run_id: str,
+    *,
+    expected_generation: int | None = None,
+) -> None:
+    with session.lock:
+        candidates = [
+            str(item.get("id"))
+            for item in session.run_steps
+            if item.get("state")
+            in {
+                RunStepState.PENDING.value,
+                RunStepState.RUNNING.value,
+            }
+        ]
+    for step_id in candidates:
+        try:
+            transition_run_step(
+                session,
+                run_id,
+                step_id,
+                RunStepState.CANCELLED,
+                expected_generation=expected_generation,
+            )
+        except Exception as projection_error:
+            backend_log(
+                "run_step_cancellation_projection_failed",
+                session_id=session.session_id,
+                run_id=run_id,
+                error_type=type(projection_error).__name__,
+            )
+
+
+def _agent_worker(
+    session: SessionState,
+    message: str,
+    document: Path | None,
+    source: Path | None,
+    provider: str,
+    model: str,
+    effort: str,
+    run_id: str,
+    references: list[ReferenceAttachment],
+    selection_snapshot: PreviewSelectionSnapshot | None,
+    user_sequence: int | None,
+    timing: RunTiming,
+    conversation_generation: int | None = None,
+    client_id: str | None = None,
+    run_contract: RunContract | None = None,
+) -> None:
+    from ogent_app.application.turn_coordinator import (
+        DynamicRuntime,
+        TurnCoordinator,
+    )
+
+    TurnCoordinator(DynamicRuntime(globals())).run(
+        session,
+        message,
+        document,
+        source,
+        provider,
+        model,
+        effort,
+        run_id,
+        references,
+        selection_snapshot,
+        user_sequence,
+        timing,
+        conversation_generation=conversation_generation,
+        client_id=client_id,
+        run_contract=run_contract,
+    )
+
+
+def _rollback_agent_run_acceptance(
+    session: SessionState,
+    run_id: str,
+    *,
+    new_references: list[ReferenceAttachment],
+    selection_snapshot: PreviewSelectionSnapshot | None,
+    prior_run_state: dict[str, Any],
+) -> bool:
+    """Restore composer and run state when Send acceptance did not commit."""
+    with session.reference_lock:
+        with session.lock:
+            if session.run_id != run_id:
+                return False
+            current_pending = list(session.pending_references)
+            restored_ids = {
+                item.attachment_id for item in new_references
+            }
+            session.pending_references = [
+                *new_references,
+                *[
+                    item
+                    for item in current_pending
+                    if item.attachment_id not in restored_ids
+                ],
+            ]
+            session.run_retained_ids.pop(run_id, None)
+            for field, value in prior_run_state.items():
+                setattr(session, field, value)
+            session.run_complete.set()
+    return session.preview_selection.restore_after_failed_send(
+        selection_snapshot
+    )
+
+
+def start_agent_run(
+    session: SessionState,
+    message: str,
+    model: str,
+    effort: str,
+    provider: str = DEFAULT_PROVIDER,
+    *,
+    selection: AgentSelection | None = None,
+    client_id: str | None = None,
+    resume_checkpoint: dict[str, Any] | None = None,
+    fast: bool = False,
+) -> str:
+    if selection is None:
+        selected_model, selected_effort = validate_agent_settings(model, effort)
+        selected_provider = str(provider or DEFAULT_PROVIDER).strip().casefold()
+        if selected_provider not in {"codex", "claude"}:
+            raise UserFacingError("Choose an available agent provider.")
+    else:
+        selected_provider = selection.provider_id
+        selected_model = selection.model
+        selected_effort = selection.effort
+    selection_snapshot: PreviewSelectionSnapshot | None = None
+    prior_run_state: dict[str, Any] = {}
+    with session.reference_lock:
+        with session.lock:
+            if session.closed:
+                raise UserFacingError("This Ogent session has closed.", 410)
+            if session.run_status in ACTIVE_RUN_STATUSES:
+                raise UserFacingError(
+                    "Ogent is still working. Stop that run or wait for it to finish.",
+                    409,
+                )
+            if session.snapshot_in_progress:
+                raise UserFacingError(
+                    "Word view is still being generated. Wait for it to finish.",
+                    409,
+                )
+            document = session.active_doc
+            source = session.active_source
+            new_references = list(session.pending_references)
+            prior_references = _referenced_retained_attachments(
+                session,
+                message,
+                new_attachments=new_references,
+            )
+            references = [
+                *new_references,
+                *prior_references,
+            ]
+            references = list(
+                {
+                    item.attachment_id: item
+                    for item in references
+                }.values()
+            )
+            if len(references) > MAX_REFERENCES_PER_SEND:
+                raise UserFacingError(
+                    "This turn would materialize more than 20 attachments. "
+                    "Attach fewer files or name fewer retained attachments.",
+                    413,
+                )
+            if (
+                sum(item.byte_size for item in references)
+                > MAX_COMBINED_BYTES_PER_SEND
+            ):
+                raise UserFacingError(
+                    "This turn would materialize more than 100 MB of attachments. "
+                    "Use a smaller set.",
+                    413,
+                )
+            if document is None and not references:
+                raise UserFacingError(
+                    "Open an Office document or reference a retained attachment first.",
+                    409,
+                )
+            # Validate staleness before changing run or composer state.
+            session.preview_selection.snapshot_for_send()
+            prior_run_state = {
+                "run_status": session.run_status,
+                "last_run_outcome": session.last_run_outcome,
+                "run_id": session.run_id,
+                "run_contract": session.run_contract,
+                "run_plan": session.run_plan,
+                "run_steps": list(session.run_steps),
+                "run_resume_checkpoint": (
+                    dict(session.run_resume_checkpoint)
+                    if session.run_resume_checkpoint is not None
+                    else None
+                ),
+                "assistant_stream": (
+                    dict(session.assistant_stream)
+                    if session.assistant_stream is not None
+                    else None
+                ),
+                "owned_cancel_events": dict(
+                    session.owned_cancel_events
+                ),
+                "run_capability": session.run_capability,
+                "stop_requested": session.stop_requested,
+                "last_provider_usage": dict(session.last_provider_usage),
+                "preview_update_status": session.preview_update_status,
+                "preview_update_message": session.preview_update_message,
+                "preview_confirmation": (
+                    dict(session.preview_confirmation)
+                    if session.preview_confirmation is not None
+                    else None
+                ),
+                "run_conversation_generation": (
+                    session.run_conversation_generation
+                ),
+                "run_client_id": session.run_client_id,
+                "run_fast": session.run_fast,
+                "run_thread": session.run_thread,
+                "active_timing": session.active_timing,
+                "run_user_sequence": session.run_user_sequence,
+                "run_user_turn_id": session.run_user_turn_id,
+            }
+            session.run_status = "starting"
+            session.last_run_outcome = "working"
+            session.run_id = uuid.uuid4().hex
+            session.run_contract = None
+            session.run_plan = None
+            session.run_steps = []
+            session.run_resume_checkpoint = (
+                dict(resume_checkpoint)
+                if resume_checkpoint is not None
+                else None
+            )
+            session.assistant_stream = None
+            session.run_capability = None
+            session.stop_requested = False
+            session.run_complete.clear()
+            session.last_provider_usage = {}
+            session.preview_update_status = "idle"
+            session.preview_update_message = ""
+            session.preview_confirmation = None
+            run_id = session.run_id
+            session.owned_cancel_events[run_id] = threading.Event()
+            conversation_generation = session.conversation_generation
+            session.run_conversation_generation = conversation_generation
+            session.run_client_id = client_id
+            session.run_fast = fast
+        try:
+            claimed_new, _ = claim_pending_references(session, run_id)
+            if {
+                item.attachment_id for item in claimed_new
+            } != {
+                item.attachment_id for item in new_references
+            }:
+                raise UserFacingError(
+                    "The pending attachment set changed before Send completed.",
+                    409,
+                )
+            selection_snapshot = session.preview_selection.claim_for_send()
+            session.run_retained_ids[run_id] = {
+                item.attachment_id for item in references
+            }
+        except Exception:
+            _rollback_agent_run_acceptance(
+                session,
+                run_id,
+                new_references=new_references,
+                selection_snapshot=selection_snapshot,
+                prior_run_state=prior_run_state,
+            )
+            raise
+    try:
+        run_contract = resolve_run_contract(
+            message,
+            has_active_document=document is not None,
+            has_attachments=bool(references),
+            selected_paths=(
+                target.path
+                for target in (
+                    selection_snapshot.targets
+                    if selection_snapshot is not None
+                    else ()
+                )
+            ),
+        )
+        with session.lock:
+            index_payload = (
+                dict(session.document_index)
+                if session.document_index is not None
+                else None
+            )
+        target_node_ids: tuple[str, ...] = ()
+        if (
+            DOCUMENT_REPOSITORY is not None
+            and index_payload is not None
+            and index_payload.get("revision_id")
+            and run_contract.selected_paths
+        ):
+            target_node_ids = DOCUMENT_REPOSITORY.resolve_node_ids(
+                str(index_payload["revision_id"]),
+                run_contract.selected_paths,
+            )
+        run_plan = RUN_PLANNER.build(
+            message,
+            run_contract,
+            target_node_ids=target_node_ids,
+            attachment_ids=(
+                item.attachment_id for item in references
+            ),
+            has_document=document is not None,
+        )
+    except Exception:
+        _rollback_agent_run_acceptance(
+            session,
+            run_id,
+            new_references=new_references,
+            selection_snapshot=selection_snapshot,
+            prior_run_state=prior_run_state,
+        )
+        raise
+    with session.lock:
+        if session.run_id != run_id:
+            raise UserFacingError(
+                "The run changed before its execution contract was recorded.",
+                409,
+            )
+        session.run_contract = run_contract
+        session.run_plan = run_plan
+        session.run_steps = [
+            {
+                **step.public(),
+                "state": RunStepState.PENDING.value,
+                "checkpoint": {},
+                "verification": {},
+                "started_at": None,
+                "completed_at": None,
+                "error_code": None,
+            }
+            for step in run_plan.steps
+        ]
+    selection_payload = (
+        selection_snapshot.to_dict()["targets"]
+        if selection_snapshot is not None
+        else []
+    )
+    attachment_snapshots = [
+        {
+            **item.public_metadata(),
+            "processing_status": item.status,
+            "status": "Available in this session",
+            "pending": False,
+        }
+        for item in new_references
+    ]
+    accepted_turn = None
+    accepted_event_sequence = None
+    if session.workspace_actor is not None:
+        try:
+            accepted = session.workspace_actor.dispatch(
+                AcceptTurn(
+                    content=message,
+                    provider=selected_provider,
+                    model=selected_model,
+                    effort=selected_effort,
+                    mode=run_contract.mode,
+                    scope=run_contract.scope,
+                    plan=run_plan,
+                    run_id=run_id,
+                    metadata={
+                        "attachment_ids": [
+                            item.attachment_id for item in new_references
+                        ],
+                        "attachments": attachment_snapshots,
+                        "preview_selections": selection_payload,
+                    },
+                )
+            )
+            accepted_turn = accepted.turn
+            accepted_event_sequence = accepted.event_sequence
+        except WorkspaceBusyError as exc:
+            _rollback_agent_run_acceptance(
+                session,
+                run_id,
+                new_references=new_references,
+                selection_snapshot=selection_snapshot,
+                prior_run_state=prior_run_state,
+            )
+            raise UserFacingError(str(exc), 409) from exc
+        except Exception:
+            _rollback_agent_run_acceptance(
+                session,
+                run_id,
+                new_references=new_references,
+                selection_snapshot=selection_snapshot,
+                prior_run_state=prior_run_state,
+            )
+            raise
+    try:
+        user_message = session.add_message(
+            "user",
+            message,
+            provider=selected_provider,
+            model=selected_model,
+            effort=selected_effort,
+            attachment_ids=[item.attachment_id for item in new_references],
+            attachment_snapshots=attachment_snapshots,
+            preview_selections=selection_payload,
+            run_outcome="working",
+            expected_generation=conversation_generation,
+            durable_turn=accepted_turn,
+            durable_event_sequence=accepted_event_sequence,
+        )
+        if user_message.get("rejected"):
+            raise UserFacingError(
+                "The document chat changed before Send completed. Retry.",
+                409,
+            )
+        session.emit(
+            "run.plan",
+            {
+                "run_id": run_id,
+                "plan": run_plan.public(),
+                "steps": list(session.run_steps),
+            },
+            expected_generation=conversation_generation,
+        )
+    except Exception as exc:
+        if accepted_turn is not None and session.workspace_actor is not None:
+            try:
+                session.workspace_actor.dispatch(
+                    TransitionRun(
+                        run_id,
+                        RunState.FAILED,
+                        verification={"acceptance_publish_failed": True},
+                    )
+                )
+            except Exception as projection_error:
+                backend_log(
+                    "run_acceptance_failure_projection_failed",
+                    session_id=session.session_id,
+                    run_id=run_id,
+                    error_type=type(projection_error).__name__,
+                )
+        restored = _rollback_agent_run_acceptance(
+            session,
+            run_id,
+            new_references=new_references,
+            selection_snapshot=selection_snapshot,
+            prior_run_state=prior_run_state,
+        )
+        if restored:
+            emit_references(session)
+            emit_preview_selection(session)
+            STATE.broadcast_sessions()
+        if isinstance(exc, (OSError, SessionMemoryError)):
+            raise UserFacingError(
+                "Ogent could not persist this message. Nothing was sent; "
+                "attachments and selection were restored.",
+                500,
+            ) from exc
+        raise
+    user_sequence = (
+        int(user_message["sequence"])
+        if isinstance(user_message.get("sequence"), int)
+        else None
+    )
+    with session.reference_lock:
+        for item in new_references:
+            updated = dataclasses.replace(
+                session.retained_references[item.attachment_id],
+                sent_sequence=user_sequence,
+                status="Available in this session",
+            )
+            session.retained_references[item.attachment_id] = updated
+    timing = RunTiming(
+        provider=selected_provider,
+        model=selected_model,
+        effort=selected_effort,
+        context_mode="fresh",
+        prompt_bytes=0,
+        attachment_count=len(references),
+        materialized_bytes=0,
+    )
+    with session.lock:
+        session.active_timing = timing
+        session.run_user_sequence = user_sequence
+        session.run_user_turn_id = (
+            str(user_message.get("turn_id"))
+            if user_message.get("turn_id")
+            else None
+        )
+    emit_references(
+        session,
+        expected_generation=conversation_generation,
+    )
+    emit_preview_selection(
+        session,
+        expected_generation=conversation_generation,
+    )
+    session.emit(
+        "preview_status",
+        {
+            "status": "idle",
+            "message": "",
+            "confirmation": None,
+        },
+        expected_generation=conversation_generation,
+    )
+    session.emit(
+        "run",
+        {
+            "status": "starting",
+            "kind": selected_provider,
+            "run_id": run_id,
+            "provider": selected_provider,
+            "model": selected_model,
+            "effort": selected_effort,
+            "references": len(references),
+            "selection_targets": (
+                len(selection_snapshot.targets)
+                if selection_snapshot is not None
+                else 0
+            ),
+            "mode": run_contract.mode.value,
+            "scope": run_contract.scope.value,
+            "requires_mutation": run_contract.requires_mutation,
+            "analysis_only": run_contract.analysis_only,
+            "complexity": run_plan.complexity.value,
+        },
+        expected_generation=conversation_generation,
+    )
+    STATE.broadcast_sessions()
+    thread = threading.Thread(
+        target=_agent_worker,
+        args=(
+            session,
+            message,
+            document,
+            source,
+            selected_provider,
+            selected_model,
+            selected_effort,
+            run_id,
+            references,
+            selection_snapshot,
+            user_sequence,
+            timing,
+        ),
+        name=(
+            f"ogent-{selected_provider}-{session.session_id}-{run_id[:8]}"
+        ),
+        daemon=True,
+    )
+    with session.lock:
+        session.run_thread = thread
+    try:
+        thread.start()
+    except Exception:
+        try:
+            cleanup_run_references(session, run_id)
+        except Exception as cleanup_error:
+            backend_log(
+                "worker_start_reference_cleanup_failed",
+                session_id=session.session_id,
+                run_id=run_id,
+                error_type=type(cleanup_error).__name__,
+            )
+        with session.lock:
+            if session.run_id == run_id:
+                session.run_status = "error"
+                session.run_id = None
+                session.run_thread = None
+                session.run_conversation_generation = None
+                session.run_client_id = None
+                session.run_contract = None
+                session.run_plan = None
+                session.run_steps = []
+                session.run_resume_checkpoint = None
+                session.assistant_stream = None
+                session.owned_cancel_events.pop(run_id, None)
+                session.run_capability = None
+                session.last_run_outcome = "error"
+                session.run_user_turn_id = None
+                session.run_complete.set()
+        if session.workspace_actor is not None:
+            try:
+                session.workspace_actor.dispatch(
+                    TransitionRun(
+                        run_id,
+                        RunState.FAILED,
+                        verification={"worker_start_failed": True},
+                    )
+                )
+            except Exception as projection_error:
+                backend_log(
+                    "worker_start_failure_projection_failed",
+                    session_id=session.session_id,
+                    run_id=run_id,
+                    error_type=type(projection_error).__name__,
+                )
+        raise
+    return run_id
+
+
+def resume_agent_run(
+    session: SessionState,
+    prior_run_id: str,
+    *,
+    client_id: str | None = None,
+) -> dict[str, Any]:
+    """Start a safe read-only continuation from a durable partition manifest."""
+
+    if RUN_REPOSITORY is None or TURN_REPOSITORY is None:
+        raise UserFacingError("Durable run recovery is unavailable.", 503)
+    prior = RUN_REPOSITORY.get(prior_run_id)
+    if prior is None or prior.workspace_id != session.session_id:
+        raise UserFacingError("The interrupted run was not found.", 404)
+    if prior.state not in {RunState.FAILED, RunState.CANCELLED}:
+        raise UserFacingError(
+            "Only a failed or stopped run can be resumed.",
+            409,
+        )
+    if (
+        prior.scope is not ScopeMode.WHOLE_DOCUMENT
+        or prior.mode.value in {"edit", "generate"}
+    ):
+        raise UserFacingError(
+            "Only read-only whole-document analysis can resume from a "
+            "partition checkpoint.",
+            409,
+        )
+    execute_step = next(
+        (
+            item
+            for item in RUN_REPOSITORY.steps(prior_run_id)
+            if item.step.step_id == "execute"
+        ),
+        None,
+    )
+    checkpoint = (
+        dict(execute_step.checkpoint)
+        if execute_step is not None
+        else {}
+    )
+    if (
+        not checkpoint.get("partition_manifest_blob_id")
+        or checkpoint.get("next_partition") is None
+    ):
+        raise UserFacingError(
+            "This run has no incomplete partition checkpoint to resume.",
+            409,
+        )
+    with session.lock:
+        index = (
+            dict(session.document_index)
+            if session.document_index is not None
+            else {}
+        )
+    if str(index.get("revision_id") or "") != str(
+        checkpoint.get("revision_id") or ""
+    ):
+        raise UserFacingError(
+            "The document revision changed after this checkpoint. Start a "
+            "new review against the current document.",
+            409,
+        )
+    turn = TURN_REPOSITORY.get(prior.request_turn_id)
+    if turn is None:
+        raise UserFacingError(
+            "The original lossless request is unavailable.",
+            409,
+        )
+    if turn.metadata.get("attachment_ids"):
+        raise UserFacingError(
+            "Runs that depend on attachments must be retried from the "
+            "original request so attachment state can be revalidated.",
+            409,
+        )
+    selection = validate_agent_selection(
+        turn.provider or DEFAULT_PROVIDER,
+        turn.model,
+        turn.effort or AUTOMATIC_EFFORT,
+    )
+    new_run_id = start_agent_run(
+        session,
+        TURN_REPOSITORY.raw_content(turn.turn_id),
+        selection.model,
+        selection.effort,
+        selection.provider_id,
+        selection=selection,
+        client_id=client_id,
+        resume_checkpoint=checkpoint,
+    )
+    return {
+        "run_id": new_run_id,
+        "resumed_from_run_id": prior_run_id,
+        "completed_partitions": int(
+            checkpoint.get("completed_partitions") or 0
+        ),
+        "partition_count": int(
+            checkpoint.get("partition_count") or 0
+        ),
+    }
+
+

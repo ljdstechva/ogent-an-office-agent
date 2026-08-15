@@ -1,0 +1,488 @@
+class SessionState:
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        memory: SessionMemory | None = None,
+        workspace_actor: WorkspaceActor | None = None,
+        durable_conversation: DurableConversation | None = None,
+        event_repository: EventRepository | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.workspace_actor = workspace_actor
+        self.durable_conversation = durable_conversation
+        self.event_repository = event_repository
+        self.memory = (
+            DurableMemoryProjection(memory, durable_conversation)
+            if memory is not None and durable_conversation is not None
+            else memory
+        )
+        self.attachment_store = (
+            RetainedAttachmentStore(
+                memory.root,
+                REFERENCE_ROOT / session_id,
+            )
+            if memory is not None
+            else None
+        )
+        self.preview_selection = PreviewSelectionState(session_id)
+        self.preview_sync = PreviewSyncState()
+        self.selection_multi_mode = False
+        self.selection_broker: OfficeCLISelectionBroker | None = None
+        self.created_at = time.time()
+        self.created_at_iso = now_iso()
+        self.last_browser_activity = self.created_at
+        self.lock = threading.RLock()
+        self.watch_lock = threading.RLock()
+        self.reference_lock = threading.RLock()
+        self.close_lock = threading.Lock()
+        self.close_complete = threading.Event()
+        self.condition = threading.Condition(self.lock)
+        self.events: collections.deque[dict[str, Any]] = collections.deque(maxlen=2000)
+        actor_state = (
+            workspace_actor.dispatch(GetWorkspaceState())
+            if workspace_actor is not None
+            else None
+        )
+        self.sequence = (
+            actor_state.last_event_sequence
+            if actor_state is not None
+            else 0
+        )
+        self._legacy_transcript: list[dict[str, Any]] = []
+        self.conversation_generation = (
+            actor_state.workspace.conversation_generation
+            if actor_state is not None
+            else 1
+        )
+        self.active_source: Path | None = None
+        self.active_doc: Path | None = None
+        self.document_mode = "none"
+        self.document_id = ""
+        self.document_revision = 0
+        self.document_package_sha256 = ""
+        self.document_index: dict[str, Any] | None = None
+        self.source_document_index: dict[str, Any] | None = None
+        self.document_watch_event_fingerprint = ""
+        self.recovery_backup: BackupRecord | None = None
+        self.opening_source: Path | None = None
+        self.watch_process: subprocess.Popen[str] | None = None
+        self.watch_port: int | None = None
+        self.watch_generation = ""
+        self.historical_focus = HistoricalFocusState(session_id)
+        self.retired_watches: list[
+            tuple[Path | None, subprocess.Popen[str] | None, int | None]
+        ] = []
+        self.watch_tail: collections.deque[str] = collections.deque(maxlen=40)
+        self.run_process: subprocess.Popen[str] | None = None
+        self.run_thread: threading.Thread | None = None
+        self.run_complete = threading.Event()
+        self.run_complete.set()
+        self.run_status = "idle"
+        self.last_run_outcome = "neutral"
+        self.run_id: str | None = None
+        self.stop_requested = False
+        self.codex_thread_id: str | None = None
+        self.codex_model_id: str | None = None
+        self.claude_session_id: str | None = None
+        self.claude_model_id: str | None = None
+        self.pending_pdf = False
+        self.last_error: str | None = None
+        self.preview_update_status = "idle"
+        self.preview_update_message = ""
+        self.preview_confirmation: dict[str, Any] | None = None
+        self.sse_clients = 0
+        self.sse_client_refs: collections.Counter[str] = collections.Counter()
+        self.orphan_since: float | None = time.time()
+        self.complex_layout = False
+        self.complex_layout_detail: str | None = None
+        self.snapshot_in_progress = False
+        self.snapshot_process: subprocess.Popen[str] | None = None
+        self.snapshot_complete = threading.Event()
+        self.snapshot_complete.set()
+        self.snapshot_pid_file: Path | None = None
+        self.snapshot_path: Path | None = None
+        self.snapshot_cache_key: str | None = None
+        self.snapshot_document_id: str | None = None
+        self.snapshot_document_revision = 0
+        self.snapshot_package_sha256 = ""
+        self.snapshot_error: str | None = None
+        self.pending_references: list[ReferenceAttachment] = []
+        self.retained_references: dict[str, ReferenceAttachment] = {}
+        self.active_references: dict[str, list[ReferenceAttachment]] = {}
+        self.run_retained_ids: dict[str, set[str]] = {}
+        self.reference_run_roots: dict[str, Path] = {}
+        self.reference_operations = 0
+        self.reference_reservations: dict[str, int] = {}
+        self.reference_connections: dict[str, socket.socket] = {}
+        self.reference_processes: dict[str, subprocess.Popen[str]] = {}
+        self.reference_idle = threading.Event()
+        self.reference_idle.set()
+        self.active_timing: RunTiming | None = None
+        self.last_timing: dict[str, Any] | None = None
+        self.last_provider_usage: dict[str, Any] = {}
+        self.run_user_sequence: int | None = None
+        self.run_user_turn_id: str | None = None
+        self.run_conversation_generation: int | None = None
+        self.run_client_id: str | None = None
+        self.run_fast: bool = False
+        self.run_contract: RunContract | None = None
+        self.run_plan: RunPlan | None = None
+        self.run_steps: list[dict[str, Any]] = []
+        self.run_resume_checkpoint: dict[str, Any] | None = None
+        self.assistant_stream: dict[str, Any] | None = None
+        self.owned_cancel_events: dict[str, threading.Event] = {}
+        self.run_capability: Any | None = None
+        self.closed = False
+
+    @property
+    def transcript(self) -> list[dict[str, Any]]:
+        if self.durable_conversation is not None:
+            return list(DurableTranscriptView(self.durable_conversation))
+        return self._legacy_transcript
+
+    @transcript.setter
+    def transcript(self, value: list[dict[str, Any]]) -> None:
+        if self.durable_conversation is not None:
+            raise RuntimeError("Durable transcripts cannot be replaced in memory.")
+        self._legacy_transcript = list(value)
+
+    def transcript_count(self) -> int:
+        if self.durable_conversation is not None:
+            return self.durable_conversation.turns.count(self.session_id)
+        return len(self._legacy_transcript)
+
+    def emit(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+        durable_sequence: int | None = None,
+        durable_event_type: str | None = None,
+        durable_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            current_generation = self.conversation_generation
+            rejected = (
+                expected_generation is not None
+                and expected_generation != current_generation
+            )
+        if rejected:
+            return {
+                "seq": self.sequence,
+                "type": event_type,
+                "time": now_iso(),
+                "generation": current_generation,
+                "data": data,
+                "rejected": True,
+            }
+        persisted_sequence = durable_sequence
+        if persisted_sequence is None and self.workspace_actor is not None:
+            payload = (
+                durable_payload
+                if durable_payload is not None
+                else {
+                    **data,
+                    "generation": current_generation,
+                }
+            )
+            try:
+                durable_event = self.workspace_actor.dispatch(
+                    RecordEvent(
+                        durable_event_type or event_type,
+                        payload,
+                        run_id=self.run_id,
+                    )
+                )
+            except Exception as exc:
+                backend_log(
+                    "durable_event_append_failed",
+                    session_id=self.session_id,
+                    event_type=durable_event_type or event_type,
+                    error_type=type(exc).__name__,
+                )
+            else:
+                persisted_sequence = durable_event.sequence
+        with self.condition:
+            if (
+                expected_generation is not None
+                and expected_generation != self.conversation_generation
+            ):
+                return {
+                    "seq": self.sequence,
+                    "type": event_type,
+                    "time": now_iso(),
+                    "generation": self.conversation_generation,
+                    "data": data,
+                    "rejected": True,
+                }
+            if persisted_sequence is None:
+                self.sequence += 1
+            else:
+                self.sequence = max(self.sequence, int(persisted_sequence))
+            event = {
+                "seq": self.sequence,
+                "type": event_type,
+                "time": now_iso(),
+                "generation": self.conversation_generation,
+                "data": data,
+            }
+            self.events.append(event)
+            self.condition.notify_all()
+            return event
+
+    def add_message(
+        self,
+        role: str,
+        text: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        attachment_ids: list[str] | None = None,
+        attachment_snapshots: list[dict[str, Any]] | None = None,
+        preview_selections: list[dict[str, Any]] | None = None,
+        run_outcome: str | None = None,
+        verification: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
+        durable_turn: Any | None = None,
+        durable_event_sequence: int | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if (
+                self.closed
+                or (
+                    expected_generation is not None
+                    and expected_generation != self.conversation_generation
+                )
+            ):
+                return {
+                    "role": role,
+                    "text": text,
+                    "time": now_iso(),
+                    "attachments": list(attachment_snapshots or []),
+                    "preview_selections": list(preview_selections or []),
+                    "rejected": True,
+                }
+            generation = self.conversation_generation
+            metadata = {
+                "attachment_ids": list(attachment_ids or []),
+                "attachments": list(attachment_snapshots or []),
+                "preview_selections": list(preview_selections or []),
+                "verification": dict(verification or {}),
+            }
+            if self.durable_conversation is not None:
+                turn = durable_turn
+                if turn is None:
+                    if self.workspace_actor is None:
+                        raise RuntimeError(
+                            "Durable conversation has no workspace actor."
+                        )
+                    turn = self.workspace_actor.dispatch(
+                        AppendTurn(
+                            role=role,
+                            content=text,
+                            provider=provider,
+                            model=model,
+                            effort=effort,
+                            run_outcome=run_outcome,
+                            metadata=metadata,
+                        )
+                    )
+                message = self.durable_conversation.public_turn(turn)
+            elif self.memory is not None:
+                turn = self.memory.append_turn(
+                    role,
+                    text,
+                    provider=provider,
+                    model=model,
+                    effort=effort,
+                    attachment_ids=attachment_ids,
+                    attachment_snapshots=attachment_snapshots,
+                    preview_selections=preview_selections,
+                    run_outcome=run_outcome,
+                    verification=verification,
+                )
+                message = turn.public_metadata()
+            else:
+                message = {
+                    "role": role,
+                    "text": text,
+                    "time": now_iso(),
+                    "attachments": list(attachment_snapshots or []),
+                    "preview_selections": list(preview_selections or []),
+                }
+            if self.durable_conversation is None:
+                self.transcript.append(message)
+        self.emit(
+            "message",
+            message,
+            expected_generation=generation,
+            durable_sequence=durable_event_sequence,
+            durable_event_type="turn.appended",
+            durable_payload={
+                "turn_id": message.get("turn_id"),
+                "turn_sequence": message.get("sequence"),
+                "role": role,
+                "generation": generation,
+            },
+        )
+        return message
+
+    def add_activity(
+        self,
+        stream: str,
+        text: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
+        if text:
+            self.emit(
+                "activity",
+                {"stream": stream, "text": text[-4000:]},
+                expected_generation=expected_generation,
+            )
+
+    def update_run_request_outcome(
+        self,
+        outcome: str,
+        *,
+        verification: dict[str, Any] | None = None,
+        completed_actions: list[str] | None = None,
+    ) -> None:
+        if self.workspace_actor is None or self.run_user_turn_id is None:
+            return
+        metadata: dict[str, Any] = {
+            "verification": dict(verification or {}),
+        }
+        if completed_actions:
+            metadata["completed_actions"] = list(completed_actions)
+        self.workspace_actor.dispatch(
+            UpdateTurnOutcome(
+                self.run_user_turn_id,
+                outcome,
+                metadata,
+            )
+        )
+
+    def set_run_status(
+        self,
+        status: str,
+        *,
+        expected_generation: int | None = None,
+        **extra: Any,
+    ) -> None:
+        with self.lock:
+            if (
+                self.closed
+                or (
+                    expected_generation is not None
+                    and expected_generation != self.conversation_generation
+                )
+            ):
+                return
+            self.run_status = status
+            if status in {"starting", "working", "stopping"}:
+                self.last_run_outcome = "working"
+        self.emit(
+            "run",
+            {"status": status, **extra},
+            expected_generation=expected_generation,
+        )
+
+    def public_snapshot(self, include_watch_probe: bool = True) -> dict[str, Any]:
+        return build_workspace_snapshot(
+            self,
+            preview_selection_public=preview_selection_public,
+            stable_watch_url=stable_watch_url,
+            watch_http_alive=watch_http_alive,
+            include_watch_probe=include_watch_probe,
+        )
+
+    def current_events_after(self, sequence: int) -> list[dict[str, Any]]:
+        if self.event_repository is not None:
+            durable = self.event_repository.replay(
+                self.session_id,
+                after_sequence=sequence,
+                limit=1000,
+            )
+            return [
+                {
+                    "seq": event.sequence,
+                    "type": event.event_type,
+                    "time": event.created_at,
+                    "generation": int(
+                        event.payload.get(
+                            "generation",
+                            self.conversation_generation,
+                        )
+                    ),
+                    "data": dict(event.payload),
+                }
+                for event in durable
+            ]
+        with self.lock:
+            return [event for event in self.events if event["seq"] > sequence]
+
+    def connect_sse(self, client_id: str) -> None:
+        with self.lock:
+            if self.closed:
+                raise UserFacingError("This Ogent session has closed.", 410)
+            self.sse_client_refs[client_id] += 1
+            self.sse_clients = sum(self.sse_client_refs.values())
+            self.orphan_since = None
+            self.last_browser_activity = time.time()
+
+    def touch_browser_activity(self) -> None:
+        with self.lock:
+            if self.closed:
+                raise UserFacingError("This Ogent session has closed.", 410)
+            self.last_browser_activity = time.time()
+
+    def disconnect_sse(self, client_id: str) -> None:
+        with self.lock:
+            if self.sse_client_refs[client_id] > 1:
+                self.sse_client_refs[client_id] -= 1
+            else:
+                self.sse_client_refs.pop(client_id, None)
+            self.sse_clients = sum(self.sse_client_refs.values())
+            if self.sse_clients == 0 and self.orphan_since is None:
+                self.orphan_since = time.time()
+
+    def mark_page_closed(self, client_id: str) -> None:
+        with self.lock:
+            # The close beacon and the SSE disconnect can arrive in either
+            # order. Removing by stable tab id makes both operations idempotent
+            # and preserves any other tab connected to this deduped session.
+            self.sse_client_refs.pop(client_id, None)
+            self.sse_clients = sum(self.sse_client_refs.values())
+            if self.sse_clients == 0:
+                self.orphan_since = time.time()
+
+
+def capture_sse_snapshot(
+    session: SessionState,
+) -> tuple[int, dict[str, Any]]:
+    """Capture reconnect state without nesting session and reference locks."""
+    if session.event_repository is not None:
+        event_cursor = session.event_repository.last_sequence(
+            session.session_id
+        )
+    else:
+        with session.lock:
+            event_cursor = session.sequence
+    snapshot = session.public_snapshot()
+    return event_cursor, snapshot
+
+
+def invalidate_word_snapshot_locked(session: SessionState) -> None:
+    """Invalidate the session pointer without deleting Ogent-owned cache files."""
+    session.snapshot_path = None
+    session.snapshot_cache_key = None
+    session.snapshot_document_id = None
+    session.snapshot_document_revision = 0
+    session.snapshot_package_sha256 = ""
+    session.snapshot_error = None
+
+

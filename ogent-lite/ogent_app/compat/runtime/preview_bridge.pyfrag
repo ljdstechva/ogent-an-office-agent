@@ -1,0 +1,687 @@
+def http_json(url: str, timeout: float = 1.0) -> dict[str, Any] | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            if response.status != 200:
+                return None
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def watch_http_alive(port: int | None) -> bool:
+    if port is None:
+        return False
+    try:
+        request = urllib.request.Request(f"http://{HOST}:{port}/", method="GET")
+        with urllib.request.urlopen(request, timeout=1.25) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def stable_watch_url(
+    port: int | None,
+    watch_generation: str | None,
+) -> str | None:
+    if port is None:
+        return None
+    base = f"http://{HOST}:{int(port)}/"
+    generation = str(watch_generation or "")
+    if re.fullmatch(r"[0-9a-f]{32}", generation):
+        return f"{base}?generation={generation}"
+    return base
+
+
+def preview_identity_public(session: "SessionState") -> dict[str, Any] | None:
+    with session.lock:
+        if (
+            session.active_doc is None
+            or not session.document_id
+            or session.watch_port is None
+            or not session.watch_generation
+        ):
+            return None
+        return {
+            "session_id": session.session_id,
+            "document_id": session.document_id,
+            "watch_port": session.watch_port,
+            "watch_generation": session.watch_generation,
+        }
+
+
+def record_preview_client_status(
+    session: "SessionState",
+    client_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    status = str(payload.get("status") or "").strip().casefold()
+    if status not in {"ready", "failed", "meaningless"}:
+        raise UserFacingError("Invalid preview client status.", 400)
+    document_id = str(payload.get("document_id") or "").strip()
+    watch_generation = str(payload.get("watch_generation") or "").strip()
+    message = str(payload.get("message") or "").strip()[:1000]
+    raw_metrics = payload.get("metrics")
+    metrics: dict[str, int] = {}
+    if isinstance(raw_metrics, dict):
+        for key in (
+            "text_length",
+            "visible_visuals",
+            "visible_paths",
+            "document_height",
+        ):
+            try:
+                metrics[key] = max(0, int(raw_metrics.get(key, 0)))
+            except (TypeError, ValueError):
+                raise UserFacingError("Invalid preview readiness metrics.", 400) from None
+    with session.lock:
+        if (
+            session.active_doc is None
+            or session.document_id != document_id
+            or session.watch_generation != watch_generation
+        ):
+            raise UserFacingError("That preview status belongs to a stale document.", 409)
+        document_extension = session.active_doc.suffix.casefold()
+        revision = session.document_revision
+    backend_log(
+        "preview_client_status",
+        session_id=session.session_id,
+        client_id=client_id,
+        document_id=document_id,
+        document_extension=document_extension,
+        document_revision=revision,
+        watch_generation=watch_generation,
+        status=status,
+        message_present=bool(message),
+        metric_count=len(metrics),
+    )
+    if status != "ready":
+        session.add_activity(
+            "preview",
+            (
+                f"Live View reported {status}: "
+                f"{message or 'no meaningful preview content was available'}"
+            ),
+        )
+    return {
+        "status": status,
+        "document_id": document_id,
+        "watch_generation": watch_generation,
+        "metrics": metrics,
+    }
+
+
+def preview_proxy_parameters(
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> dict[str, str]:
+    with session.lock:
+        parameters = {
+            "s": session.session_id,
+            "client": client_id,
+            "document": (
+                session.document_id
+                if document_id is None
+                else document_id
+            ),
+            "generation": (
+                session.watch_generation
+                if watch_generation is None
+                else watch_generation
+            ),
+            "channel": channel,
+        }
+    if comparison_only:
+        parameters["canonical"] = "1"
+    return parameters
+
+
+def preview_proxy_path(
+    endpoint: str,
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> str:
+    query = urllib.parse.urlencode(
+        preview_proxy_parameters(
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+            comparison_only=comparison_only,
+        )
+    )
+    return f"{endpoint}?{query}"
+
+
+def preview_ack_script(
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    package_fingerprint: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> str:
+    ack_url = (
+        f"http://{HOST}:{STATE.server_port}"
+        + preview_proxy_path(
+            "/preview/ack",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        )
+    )
+    control_url = preview_proxy_path(
+        "/preview/control",
+        session,
+        client_id,
+        channel,
+        document_id=document_id,
+        watch_generation=watch_generation,
+    )
+    with session.lock:
+        status_document_id = (
+            session.document_id
+            if document_id is None
+            else document_id
+        )
+        status_watch_generation = (
+            session.watch_generation
+            if watch_generation is None
+            else watch_generation
+        )
+    config = json.dumps(
+        {
+            "ackUrl": ack_url,
+            "controlUrl": control_url,
+            "canonicalUrl": preview_proxy_path(
+                "/preview",
+                session,
+                client_id,
+                channel,
+                document_id=document_id,
+                watch_generation=watch_generation,
+                comparison_only=True,
+            ),
+            "packageSha256": package_fingerprint,
+            "comparisonOnly": comparison_only,
+            "documentId": status_document_id,
+            "watchGeneration": status_watch_generation,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return f"""
+<div id="ogent-preview-fingerprint" hidden aria-hidden="true"
+     data-package-sha256="{package_fingerprint}"></div>
+<script>
+(() => {{
+  "use strict";
+  const config = {config};
+  if (config.comparisonOnly) return;
+  const postStatus = (type, detail = {{}}) => {{
+    try {{
+      window.parent.postMessage(
+        Object.assign(
+          {{
+            protocol: "ogent-preview-status",
+            version: 1,
+            type,
+            document_id: config.documentId,
+            watch_generation: config.watchGeneration
+          }},
+          detail
+        ),
+        "*"
+      );
+    }} catch (_) {{}}
+  }};
+  function previewMetrics() {{
+    const bodyText = String(document.body?.innerText || "")
+      .replace(/\\s+/g, " ")
+      .trim();
+    const visible = element => {{
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity || "1") > 0 &&
+        rect.width > 1 &&
+        rect.height > 1
+      );
+    }};
+    const visibleVisuals = Array.from(
+      document.querySelectorAll("img,svg,canvas,video,object,embed")
+    ).filter(visible).length;
+    const visiblePaths = Array.from(
+      document.querySelectorAll("[data-path]")
+    ).filter(visible).length;
+    const metrics = {{
+      text_length: bodyText.length,
+      visible_visuals: visibleVisuals,
+      visible_paths: visiblePaths,
+      document_height: Math.max(
+        Number(document.documentElement?.scrollHeight || 0),
+        Number(document.body?.scrollHeight || 0)
+      )
+    }};
+    return {{
+      meaningful:
+        metrics.text_length >= 24 ||
+        metrics.visible_visuals > 0,
+      metrics
+    }};
+  }}
+  const mutationActions = new Set([
+    "add", "doc-switched", "excel-patch", "full",
+    "remove", "replace", "word-patch"
+  ]);
+  const marker = () => document.getElementById("ogent-preview-fingerprint");
+  const packageSha = message =>
+    String(message?._ogent?.package_sha256 || marker()?.dataset.packageSha256 ||
+      config.packageSha256 || "");
+  const dynamicClasses = new Set([
+    "officecli-mark",
+    "officecli-mark-block",
+    "officecli-mark-stale",
+    "officecli-selected",
+    "officecli-sel-range",
+    "officecli-sel-rowcol"
+  ]);
+  async function digest(value) {{
+    if (!globalThis.crypto?.subtle) return null;
+    const bytes = new TextEncoder().encode(String(value || ""));
+    const result = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(result))
+      .map(item => item.toString(16).padStart(2, "0")).join("");
+  }}
+  function normalizedNodeHtml(node) {{
+    const clone = node.cloneNode(true);
+    clone.querySelectorAll(".officecli-mark,.cjk-done").forEach(item => {{
+      item.replaceWith(...Array.from(item.childNodes));
+    }});
+    clone.querySelectorAll("span").forEach(item => {{
+      const attributes = Array.from(item.attributes || []);
+      if (
+        item.style?.length === 1 &&
+        item.style.marginRight === "-0.2em" &&
+        attributes.every(attribute => attribute.name === "style")
+      ) {{
+        // OfficeCLI's CJK typography pass can add, omit, or nest this
+        // visually equivalent punctuation wrapper after an in-place patch.
+        item.replaceWith(...Array.from(item.childNodes));
+      }}
+    }});
+    [clone, ...clone.querySelectorAll("*")].forEach(item => {{
+      const marked = Array.from(item.classList || [])
+        .some(value => dynamicClasses.has(value));
+      dynamicClasses.forEach(value => item.classList?.remove(value));
+      if (marked) {{
+        item.style.boxShadow = "";
+        if (item.dataset?.officecliMarkBg) {{
+          item.style.backgroundColor = "";
+          delete item.dataset.officecliMarkBg;
+        }}
+        item.removeAttribute("title");
+      }}
+      if (item.getAttribute?.("class") === "") item.removeAttribute("class");
+      if (item.getAttribute?.("style") === "") item.removeAttribute("style");
+    }});
+    return clone.outerHTML;
+  }}
+  function semanticSignature(root) {{
+    const styles = Array.from(root.querySelectorAll("head style"))
+      .map(item => item.textContent || "");
+    const values = Array.from(root.querySelectorAll("[data-path]"))
+      .filter(item => !item.closest(".sidebar,.thumb"))
+      .filter(item => !item.parentElement?.closest("[data-path]"))
+      .map(item => [
+        String(item.getAttribute("data-path") || ""),
+        normalizedNodeHtml(item)
+      ]);
+    values.sort((left, right) =>
+      left[0].localeCompare(right[0]) || left[1].localeCompare(right[1]));
+    return JSON.stringify({{ styles, values }});
+  }}
+  async function semanticFingerprint(root = document) {{
+    return digest(semanticSignature(root));
+  }}
+  function visiblePath() {{
+    const items = Array.from(document.querySelectorAll("[data-path]"))
+      .filter(item => {{
+        if (item.closest(".sidebar,.thumb,.sheet-tabs")) return false;
+        const rect = item.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 &&
+          rect.bottom > 0 && rect.top < innerHeight &&
+          rect.right > 0 && rect.left < innerWidth;
+      }});
+    if (!items.length) return null;
+    const centerY = innerHeight / 2;
+    const centerX = innerWidth / 2;
+    items.sort((left, right) => {{
+      const a = left.getBoundingClientRect();
+      const b = right.getBoundingClientRect();
+      const scoreA = Math.abs((a.top + a.bottom) / 2 - centerY) +
+        Math.abs((a.left + a.right) / 2 - centerX) * 0.2;
+      const scoreB = Math.abs((b.top + b.bottom) / 2 - centerY) +
+        Math.abs((b.left + b.right) / 2 - centerX) * 0.2;
+      return scoreA - scoreB;
+    }});
+    return items[0].getAttribute("data-path");
+  }}
+  async function sendAck(
+    kind,
+    message = null,
+    viewportPath = null,
+    packageOverride = null,
+    canonicalDom = null
+  ) {{
+    const body = {{
+      kind,
+      version: Number(window._clientVersion || message?.version || 0),
+      event_fingerprint:
+        message?._ogent?.event_fingerprint || null,
+      package_sha256: String(packageOverride || packageSha(message)),
+      dom_fingerprint: await semanticFingerprint(document),
+      canonical_dom_fingerprint: canonicalDom,
+      control_id: message?._ogent?.control_id || null,
+      viewport_path: viewportPath
+    }};
+    try {{
+      await fetch(config.ackUrl, {{
+        method: "POST",
+        mode: "no-cors",
+        cache: "no-store",
+        keepalive: true,
+        headers: {{ "Content-Type": "text/plain;charset=UTF-8" }},
+        body: JSON.stringify(body)
+      }});
+    }} catch (_) {{}}
+  }}
+  const nextFrame = () =>
+    new Promise(resolve => requestAnimationFrame(resolve));
+  async function renderedCanonical(message) {{
+    const frame = document.createElement("iframe");
+    frame.setAttribute("aria-hidden", "true");
+    frame.tabIndex = -1;
+    frame.style.cssText =
+      "position:fixed;left:-100000px;top:0;border:0;opacity:0;" +
+      "pointer-events:none;width:" + Math.max(320, innerWidth) + "px;" +
+      "height:" + Math.max(240, innerHeight) + "px;";
+    const url = new URL(config.canonicalUrl, location.href);
+    url.searchParams.set(
+      "proof",
+      globalThis.crypto?.randomUUID?.() ||
+        Math.random().toString(16).slice(2)
+    );
+    const loaded = new Promise((resolve, reject) => {{
+      const timer = setTimeout(
+        () => reject(new Error("Canonical preview timed out.")),
+        8000
+      );
+      frame.addEventListener("load", () => {{
+        clearTimeout(timer);
+        resolve();
+      }}, {{ once: true }});
+      frame.addEventListener("error", () => {{
+        clearTimeout(timer);
+        reject(new Error("Canonical preview failed to load."));
+      }}, {{ once: true }});
+    }});
+    frame.src = url.toString();
+    document.body.appendChild(frame);
+    try {{
+      await loaded;
+      const proofDocument = frame.contentDocument;
+      if (!proofDocument) {{
+        frame.remove();
+        return null;
+      }}
+      if (proofDocument.fonts?.ready) {{
+        await proofDocument.fonts.ready.catch(() => {{}});
+      }}
+      let previous = null;
+      let stableFrames = 0;
+      let expectedDom = null;
+      for (let count = 0; count < 90; count += 1) {{
+        await nextFrame();
+        const candidate = await semanticFingerprint(proofDocument);
+        if (candidate && candidate === previous) {{
+          stableFrames += 1;
+        }} else {{
+          stableFrames = 0;
+        }}
+        previous = candidate;
+        if (stableFrames >= 2) {{
+          expectedDom = candidate;
+          break;
+        }}
+      }}
+      if (!expectedDom) {{
+        frame.remove();
+        return null;
+      }}
+      const expectedPackage = String(
+        proofDocument
+          .getElementById("ogent-preview-fingerprint")
+          ?.dataset.packageSha256 || packageSha(message)
+      );
+      return {{ frame, expectedDom, expectedPackage }};
+    }} catch (_) {{
+      frame.remove();
+      return null;
+    }}
+  }}
+  async function confirmCanonical(kind, message, dispatchUpdate = false) {{
+    let proof = null;
+    try {{
+      proof = await renderedCanonical(message);
+      if (!proof) return;
+      const {{ frame, expectedDom, expectedPackage }} = proof;
+      if (dispatchUpdate) {{
+        source.dispatchEvent(new MessageEvent("update", {{
+          data: JSON.stringify(message)
+        }}));
+      }}
+      let frames = 0;
+      const check = async () => {{
+        frames += 1;
+        const currentDom = await semanticFingerprint(document);
+        if (currentDom === expectedDom) {{
+          if (marker()) marker().dataset.packageSha256 = expectedPackage;
+          frame.remove();
+          requestAnimationFrame(
+            () => sendAck(
+              kind,
+              message,
+              null,
+              expectedPackage,
+              expectedDom
+            )
+          );
+          return;
+        }}
+        if (frames < 240) {{
+          requestAnimationFrame(check);
+        }} else {{
+          frame.remove();
+        }}
+      }};
+      requestAnimationFrame(check);
+    }} catch (_) {{
+      proof?.frame?.remove();
+    }}
+  }}
+  const source = window._watchEs;
+  if (source && typeof source.addEventListener === "function") {{
+    source.addEventListener("update", event => {{
+      try {{
+        const message = JSON.parse(event.data);
+        if (!mutationActions.has(String(message.action || ""))) return;
+        if (message?._ogent?.control_id) return;
+        confirmCanonical("mutation", message);
+      }} catch (_) {{}}
+    }});
+    const control = new EventSource(config.controlUrl);
+    control.onmessage = event => {{
+      try {{
+        const message = JSON.parse(event.data);
+        if (message.action === "ogent-capture") {{
+          sendAck("viewport", message, visiblePath());
+          return;
+        }}
+        if (message.action === "full") {{
+          confirmCanonical("refresh", message, true);
+        }}
+      }} catch (_) {{
+        return;
+      }}
+    }};
+  }}
+  async function announceInitialPreview() {{
+    try {{
+      await nextFrame();
+      await nextFrame();
+      await sendAck("initial");
+      const readiness = previewMetrics();
+      postStatus("preview.ready", readiness);
+    }} catch (error) {{
+      postStatus("preview.failed", {{
+        message: String(error?.message || error || "Live View initialization failed.")
+      }});
+    }}
+  }}
+  requestAnimationFrame(() =>
+    requestAnimationFrame(announceInitialPreview));
+}})();
+</script>
+"""
+
+
+def rewrite_preview_html(
+    html: str,
+    session: "SessionState",
+    client_id: str,
+    channel: str,
+    package_fingerprint: str,
+    *,
+    document_id: str | None = None,
+    watch_generation: str | None = None,
+    comparison_only: bool = False,
+) -> str:
+    replacements = {
+        "/events": preview_proxy_path(
+            "/preview/events",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        ),
+        "/api/selection": preview_proxy_path(
+            "/preview/api/selection",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        ),
+        "/api/send": preview_proxy_path(
+            "/preview/api/send",
+            session,
+            client_id,
+            channel,
+            document_id=document_id,
+            watch_generation=watch_generation,
+        ),
+    }
+    rewritten = html
+    for original, replacement in replacements.items():
+        for quote in ("'", '"'):
+            rewritten = rewritten.replace(
+                f"{quote}{original}{quote}",
+                f"{quote}{replacement}{quote}",
+            )
+    root = preview_proxy_path(
+        "/preview",
+        session,
+        client_id,
+        channel,
+        document_id=document_id,
+        watch_generation=watch_generation,
+    )
+    rewritten = rewritten.replace("fetch('/')", f"fetch({json.dumps(root)})")
+    rewritten = rewritten.replace('fetch("/")', f"fetch({json.dumps(root)})")
+    injection = preview_ack_script(
+        session,
+        client_id,
+        channel,
+        package_fingerprint,
+        document_id=document_id,
+        watch_generation=watch_generation,
+        comparison_only=comparison_only,
+    )
+    if "</body>" in rewritten:
+        return rewritten.replace("</body>", f"{injection}</body>", 1)
+    return f"{rewritten}{injection}"
+
+
+def port_available(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((HOST, port))
+            return True
+        except OSError:
+            return False
+
+
+def wait_for_port_closed(port: int | None, timeout: float = 3.0) -> bool:
+    if port is None:
+        return True
+    deadline = time.monotonic() + timeout
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.1)
+            if sock.connect_ex((HOST, port)) != 0:
+                return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # This is bounded process-shutdown synchronization, not a background
+        # polling loop. It keeps "session removed" and "port released" atomic
+        # from the browser's point of view.
+        threading.Event().wait(min(0.05, remaining))
+
+
+def load_recent() -> list[str]:
+    try:
+        data = json.loads(RECENT_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(item) for item in data if isinstance(item, str)][:12]
+    except (OSError, ValueError):
+        # Intentional cache fallback: recents are non-authoritative UI state.
+        pass
+    return []
+
+
+def save_recent(paths: list[str]) -> None:
+    LOCAL_DATA.mkdir(parents=True, exist_ok=True)
+    temp = RECENT_PATH.with_suffix(".tmp")
+    temp.write_text(json.dumps(paths[:12], ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, RECENT_PATH)
+
+

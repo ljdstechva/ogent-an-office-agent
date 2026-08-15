@@ -207,7 +207,9 @@ class V0102WorkspaceTests(unittest.TestCase):
         workspace_b = self.state.get_session(str(result_b["session_id"]))
         self.assertIsNot(workspace_b, shell)
         self.assertEqual(workspace_b.transcript, [])
-        self.assertNotIn("DOCUMENT-A-ONLY", self._context(workspace_b, provider="codex"))
+        self.assertNotIn(
+            "DOCUMENT-A-ONLY", self._context(workspace_b, provider="codex")
+        )
         workspace_b.add_message(
             "user",
             "DOCUMENT-B-ONLY",
@@ -345,10 +347,7 @@ class V0102WorkspaceTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(len(results), 2)
-        owners = {
-            str(item["session_id"])
-            for item in results
-        }
+        owners = {str(item["session_id"]) for item in results}
         self.assertEqual(len(owners), 1)
         owner = self.state.get_session(owners.pop())
         owner.add_message("user", "OWNER-ONLY")
@@ -364,12 +363,8 @@ class V0102WorkspaceTests(unittest.TestCase):
         self._open(active, document)
         active.add_message("user", "ACTIVE-DOCUMENT-CHAT")
 
-        import_workspace, created = self.state.allocate_document_session(
-            active
-        )
-        import_directory = (
-            ogent.IMPORT_ROOT / import_workspace.session_id / ("a" * 32)
-        )
+        import_workspace, created = self.state.allocate_document_session(active)
+        import_directory = ogent.IMPORT_ROOT / import_workspace.session_id / ("a" * 32)
         import_directory.mkdir(parents=True)
         imported = import_directory / "browser.docx"
         imported.write_bytes(b"browser")
@@ -382,9 +377,7 @@ class V0102WorkspaceTests(unittest.TestCase):
                 target_session=import_workspace,
                 target_created=created,
             )
-        imported_workspace = self.state.get_session(
-            str(imported_result["session_id"])
-        )
+        imported_workspace = self.state.get_session(str(imported_result["session_id"]))
         self.assertEqual(imported_workspace.transcript, [])
         self.assertEqual(
             imported_workspace.document_mode,
@@ -713,9 +706,7 @@ class V0102PreviewSyncTests(unittest.TestCase):
     def test_stale_generation_cannot_authorize_ack_or_receive_controls(
         self,
     ) -> None:
-        state, document_id, old_generation, client_id, old_channel = (
-            self._state()
-        )
+        state, document_id, old_generation, client_id, old_channel = self._state()
         state.enqueue_control(
             client_id=client_id,
             document_id=document_id,
@@ -1070,9 +1061,7 @@ class V0102PreviewSyncTests(unittest.TestCase):
                 mock.patch.object(
                     session.preview_sync,
                     "enqueue_control",
-                    return_value={
-                        "_ogent": {"control_id": "e" * 32}
-                    },
+                    return_value={"_ogent": {"control_id": "e" * 32}},
                 ),
                 mock.patch.object(
                     session.preview_sync,

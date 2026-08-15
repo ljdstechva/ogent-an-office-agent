@@ -47,7 +47,9 @@ class RetainedAttachmentStoreTests(unittest.TestCase):
         )
         return self.store.commit_upload(source, pending)
 
-    def test_validated_upload_becomes_canonical_and_run_copy_is_independent(self) -> None:
+    def test_validated_upload_becomes_canonical_and_run_copy_is_independent(
+        self,
+    ) -> None:
         identifier = "1" * 32
         canonical = self.upload(identifier, b"retained evidence")
         run_id = "2" * 32
@@ -132,13 +134,9 @@ class RetainedAttachmentStoreTests(unittest.TestCase):
             "safe extracted text",
         )
         self.assertEqual(len(restored.image_paths), 1)
-        self.assertTrue(
-            restored.extracted_text_path.is_relative_to(second_bundle)
-        )
+        self.assertTrue(restored.extracted_text_path.is_relative_to(second_bundle))
         self.assertFalse(
-            restored.extracted_text_path.is_relative_to(
-                self.store.canonical_root
-            )
+            restored.extracted_text_path.is_relative_to(self.store.canonical_root)
         )
         self.assertTrue(self.store.cleanup_run("8" * 32))
 

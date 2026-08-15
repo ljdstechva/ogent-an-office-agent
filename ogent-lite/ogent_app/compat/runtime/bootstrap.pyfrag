@@ -1,0 +1,966 @@
+#!/usr/bin/env python3
+"""Ogent Lite: a local, multi-document Office workspace and agent bridge.
+
+Standard-library only. The server binds to 127.0.0.1, owns the OfficeCLI watch
+lifecycle, preserves source documents by editing working copies, and runs one
+selected CLI agent per document session at a time.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import collections
+import concurrent.futures
+import contextlib
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import os
+import queue
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import winreg
+except ImportError:  # pragma: no cover - Ogent is a Windows app.
+    winreg = None  # type: ignore[assignment]
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from ogent_references import (  # noqa: E402
+    MAX_COMBINED_BYTES_PER_SEND,
+    MAX_CONCURRENT_REFERENCE_UPLOADS,
+    MAX_REFERENCE_BYTES,
+    MAX_REFERENCES_PER_SEND,
+    MAX_SESSION_REFERENCE_BYTES,
+    MAX_SESSION_REFERENCE_COUNT,
+    ReferenceAttachment,
+    ReferenceError,
+    cleanup_reference_path,
+    reference_path_is_within,
+    reset_reference_root,
+    sanitize_reference_filename,
+    visual_analysis_requested,
+)
+from ogent_backup_store import BackupError, BackupRecord, BackupStore  # noqa: E402
+from ogent_preview_selection import (  # noqa: E402
+    OfficeCLISelectionBroker,
+    PreviewSelectionError,
+    PreviewSelectionSnapshot,
+    PreviewSelectionState,
+    post_watch_selection,
+)
+from ogent_selection_focus import (  # noqa: E402
+    HistoricalFocusError,
+    HistoricalFocusState,
+    clear_historical_focus,
+    focus_historical_target,
+    package_sha256,
+    resolve_current_target,
+    resolve_memory_selection,
+    validate_focus_payload,
+)
+from ogent_preview_sync import (  # noqa: E402
+    CLIENT_ID_PATTERN as PREVIEW_CLIENT_ID_PATTERN,
+    MUTATION_ACTIONS as PREVIEW_MUTATION_ACTIONS,
+    PreviewAck as PreviewAck,
+    PreviewConfirmation,
+    PreviewRunBaseline,
+    PreviewSyncError,
+    PreviewSyncState,
+    WatchMutation as WatchMutation,
+    event_fingerprint,
+)
+from ogent_retained_attachments import (  # noqa: E402
+    RetainedAttachmentError,
+    RetainedAttachmentStore,
+)
+from ogent_run_timing import RunTiming  # noqa: E402
+from ogent_app.application import (  # noqa: E402
+    AcceptTurn,
+    AppendTurn,
+    ChangeReviewError,
+    ChangeReviewService,
+    DocumentCapabilityBootstrap,
+    DocumentContextService,
+    DocumentIntelligenceCoordinator,
+    DurableConversation,
+    DurableMemoryProjection,
+    DurableTranscriptView,
+    GatewayAuditIngestor,
+    OutcomeVerifier,
+    GetWorkspaceState,
+    PathPolicyError,
+    ProviderContextBudget,
+    ProviderTransportPolicy,
+    RecordEvent,
+    RecoverInterruptedRun,
+    ReferenceIndexCoordinator,
+    RequestRunCancellation,
+    RollbackManager,
+    RunPlanner,
+    CheckpointRunStep,
+    TransitionRun,
+    TransitionRunStep,
+    UpdateTurnOutcome,
+    VisualRegionService,
+    WorkspaceActor,
+    WorkspaceActorRegistry,
+    WorkspaceBusyError,
+    WorkspacePathPolicy,
+)
+from ogent_app.domain.run import (  # noqa: E402
+    RunContract,
+    ScopeMode,
+    resolve_run_contract,
+)
+from ogent_app.domain.planning import (  # noqa: E402
+    RunPlan,
+    RunStepState,
+)
+from ogent_app.domain.document_intelligence import NodeKind  # noqa: E402
+from ogent_app.domain.workspace import RunState  # noqa: E402
+from ogent_app.settings import DEFAULT_SETTINGS  # noqa: E402
+from ogent_app.api.frontend import load_html_template  # noqa: E402
+from ogent_app.api.workspace_snapshot import (  # noqa: E402
+    build_workspace_snapshot,
+)
+from ogent_app.infrastructure.processes import (  # noqa: E402
+    DEFAULT_OWNED_PROCESS_SUPERVISOR,
+)
+from ogent_app.infrastructure.fault_injection import (  # noqa: E402
+    FaultInjector,
+)
+from ogent_app.infrastructure.storage import (  # noqa: E402
+    StorageResourceManager,
+)
+from ogent_app.infrastructure.indexing import DocumentIndexer  # noqa: E402
+from ogent_app.infrastructure.officecli import (  # noqa: E402
+    OfficeCliExecutor,
+    SkillRegistry,
+    TypedOfficeCliGateway,
+)
+from ogent_app.infrastructure.sqlite import (  # noqa: E402
+    CapabilityReceiptRepository,
+    ChangesetRepository,
+    ContentAddressedBlobStore,
+    CoverageRepository,
+    DocumentRepository,
+    EventRepository,
+    LegacyImportSummary,
+    LegacyMetadataImporter,
+    MetadataRepository,
+    ReferenceIndexRepository,
+    RunRepository,
+    SqliteDatabase,
+    SkillPolicyRepository,
+    ToolReceiptRepository,
+    TurnRepository,
+    VisualRegionRepository,
+    WorkspaceRepository,
+)
+from ogent_session_memory import (  # noqa: E402
+    SessionMemory,
+    SessionMemoryError,
+    SessionMemoryStore,
+)
+from ogent_agent_catalog import (  # noqa: E402
+    AUTOMATIC_EFFORT,
+    AgentSelection,
+    CapabilityCache,
+    CapabilityManager,
+    SelectionValidationError,
+)
+from ogent_agent_providers import (  # noqa: E402
+    CLIResolution,
+    ProviderRunRequest,
+    BaseAgentProvider,
+    build_codex_command as _build_codex_provider_command,
+    build_default_providers,
+    resolve_codex_cli,
+)
+
+APP_NAME = "Ogent Lite"
+APP_VERSION = "1.0.0"
+MIN_OFFICECLI_VERSION = (1, 0, 143)
+MIN_OFFICECLI_VERSION_TEXT = ".".join(str(item) for item in MIN_OFFICECLI_VERSION)
+HOST = "127.0.0.1"
+BASE_PORT = 8765
+WATCH_PORT_FIRST = 26320
+WATCH_PORT_LAST = 26380
+DEFAULT_SESSION_GRACE_SECONDS = 120.0
+DEFAULT_REAPER_TICK_SECONDS = 30.0
+DEFAULT_IDLE_EXIT_MINUTES = 10.0
+SNAPSHOT_SHUTDOWN_GRACE_SECONDS = 55.0
+SUPPORTED_OFFICE = {".docx", ".xlsx", ".pptx"}
+SUPPORTED_UPLOADS = {*SUPPORTED_OFFICE, ".pdf"}
+WORKSPACE_PATH_POLICY = WorkspacePathPolicy(SUPPORTED_UPLOADS)
+SHELL_EXTENSIONS = (".docx", ".xlsx", ".pptx")
+ACTIVE_RUN_STATUSES = {"starting", "working", "stopping"}
+REAPABLE_RUN_STATUSES = {"idle", "error", "stopped"}
+SETTINGS = DEFAULT_SETTINGS
+RESOURCE_QUOTAS = SETTINGS.quotas
+FEATURE_FLAGS = SETTINGS.features
+FAULT_INJECTOR = FaultInjector.load(FEATURE_FLAGS)
+MAX_BODY_BYTES = RESOURCE_QUOTAS.max_proxy_body_bytes
+MAX_JSON_BODY_BYTES = RESOURCE_QUOTAS.max_json_body_bytes
+MAX_CHAT_MESSAGE_CHARS = RESOURCE_QUOTAS.max_inline_turn_characters
+MAX_UPLOAD_BYTES = RESOURCE_QUOTAS.max_document_upload_bytes
+DEFAULT_PROVIDER = "codex"
+
+REPO_ROOT = SCRIPT_DIR.parent
+ASSETS_DIR = SCRIPT_DIR / "assets"
+ICON_PATH = ASSETS_DIR / "ogent.ico"
+PDF_TO_DOCX = REPO_ROOT / "tools" / "pdf2docx.ps1"
+DOCX_TO_PDF = REPO_ROOT / "tools" / "docx2pdf.ps1"
+REFERENCE_PREPARER = SCRIPT_DIR / "ogent_references.py"
+OFFICE_REFERENCE_TO_PDF = REPO_ROOT / "tools" / "office-reference-to-pdf.ps1"
+LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "OgentLite"
+WORK_ROOT = LOCAL_DATA / "work"
+IMPORT_ROOT = LOCAL_DATA / "imports"
+REFERENCE_ROOT = LOCAL_DATA / "temporary-references"
+BACKUP_ROOT = LOCAL_DATA / "backups"
+SESSION_MEMORY_ROOT = LOCAL_DATA / "session-memory"
+RECENT_PATH = LOCAL_DATA / "recent.json"
+SERVER_INFO_PATH = LOCAL_DATA / "server.json"
+AGENT_CAPABILITIES_PATH = LOCAL_DATA / "agent-capabilities-v1.json"
+RUNTIME_LOG_PATH = LOCAL_DATA / "ogent.log"
+STORAGE_RESOURCES = StorageResourceManager(
+    LOCAL_DATA,
+    RESOURCE_QUOTAS,
+    fault_injector=FAULT_INJECTOR,
+)
+
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+WINDOWS_CHILD_FLAGS = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+
+AGENT_PROVIDERS = build_default_providers()
+AGENT_PROVIDER_BY_ID: dict[str, BaseAgentProvider] = {
+    provider.provider_id: provider for provider in AGENT_PROVIDERS
+}
+AGENT_CATALOG = CapabilityManager(
+    AGENT_PROVIDERS,
+    CapabilityCache(AGENT_CAPABILITIES_PATH),
+)
+BACKUP_STORE = BackupStore(BACKUP_ROOT, application_version=APP_VERSION)
+SESSION_MEMORY_STORE = SessionMemoryStore(SESSION_MEMORY_ROOT)
+DURABLE_SERVICES_ROOT: Path | None = None
+DURABLE_DATABASE: SqliteDatabase | None = None
+DURABLE_BLOB_STORE: ContentAddressedBlobStore | None = None
+WORKSPACE_REPOSITORY: WorkspaceRepository | None = None
+TURN_REPOSITORY: TurnRepository | None = None
+RUN_REPOSITORY: RunRepository | None = None
+EVENT_REPOSITORY: EventRepository | None = None
+METADATA_REPOSITORY: MetadataRepository | None = None
+WORKSPACE_ACTORS: WorkspaceActorRegistry | None = None
+LEGACY_IMPORTER: LegacyMetadataImporter | None = None
+SKILL_POLICY_REPOSITORY: SkillPolicyRepository | None = None
+CAPABILITY_RECEIPT_REPOSITORY: CapabilityReceiptRepository | None = None
+TOOL_RECEIPT_REPOSITORY: ToolReceiptRepository | None = None
+OFFICECLI_EXECUTOR: OfficeCliExecutor | None = None
+OFFICECLI_TYPED_GATEWAY: TypedOfficeCliGateway | None = None
+OFFICECLI_SKILL_REGISTRY: SkillRegistry | None = None
+DOCUMENT_CAPABILITY_BOOTSTRAP: DocumentCapabilityBootstrap | None = None
+GATEWAY_AUDIT_INGESTOR: GatewayAuditIngestor | None = None
+ROLLBACK_MANAGER: RollbackManager | None = None
+CHANGE_REVIEW_SERVICE: ChangeReviewService | None = None
+OUTCOME_VERIFIER: OutcomeVerifier | None = None
+RUN_PLANNER = RunPlanner()
+PROVIDER_TRANSPORT_POLICY = ProviderTransportPolicy(
+    warm_enabled=FEATURE_FLAGS.warm_provider_transport,
+)
+DOCUMENT_REPOSITORY: DocumentRepository | None = None
+DOCUMENT_INDEXER: DocumentIndexer | None = None
+DOCUMENT_INTELLIGENCE: DocumentIntelligenceCoordinator | None = None
+DOCUMENT_CONTEXT_SERVICE: DocumentContextService | None = None
+RUN_COVERAGE_REPOSITORY: CoverageRepository | None = None
+VISUAL_REGION_REPOSITORY: VisualRegionRepository | None = None
+VISUAL_REGION_SERVICE: VisualRegionService | None = None
+REFERENCE_INDEX_REPOSITORY: ReferenceIndexRepository | None = None
+REFERENCE_INDEX_COORDINATOR: ReferenceIndexCoordinator | None = None
+LAST_LEGACY_IMPORT = LegacyImportSummary()
+LAST_STORAGE_CLEANUP: dict[str, int | str] = {
+    "deleted": 0,
+    "reclaimed_bytes": 0,
+}
+SERVICE_INITIALIZATION_LOCK = threading.RLock()
+SERVICES_INITIALIZED = False
+OFFICECLI_RUNTIME_LOCK = threading.RLock()
+OFFICECLI_RUNTIME_VERSION: tuple[int, int, int] | None = None
+OFFICECLI_RUNTIME_VERSION_TEXT: str | None = None
+RUNTIME_LOG_LOCK = threading.RLock()
+
+
+def _document_index_progress(
+    workspace_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """Project content-safe current progress into the owning live session."""
+    try:
+        with STATE.registry_lock:
+            session = STATE.sessions.get(workspace_id)
+    except NameError:
+        # Intentional startup boundary: progress can arrive before STATE binds.
+        return
+    if session is None:
+        return
+    safe_payload = json.loads(
+        json.dumps(payload, ensure_ascii=False, default=str)
+    )
+    document_id = str(safe_payload.get("document_id", ""))
+    with session.lock:
+        if session.closed:
+            return
+        if document_id and document_id == session.document_id:
+            session.document_index = safe_payload
+        elif (
+            session.source_document_index is not None
+            and document_id
+            == session.source_document_index.get("document_id")
+        ):
+            session.source_document_index = safe_payload
+        else:
+            return
+    session.emit("index_progress", safe_payload)
+
+
+def record_document_index_failure(
+    session: SessionState,
+    error: Exception,
+    *,
+    role: str,
+) -> None:
+    payload = {
+        "status": "failed",
+        "progress": 0.0,
+        "indexed_nodes": 0,
+        "total_estimate": 0,
+        "error_code": type(error).__name__,
+    }
+    with session.lock:
+        if role == "source":
+            session.source_document_index = payload
+        else:
+            session.document_index = payload
+    session.emit("index_progress", {**payload, "role": role})
+
+
+def observe_session_document_index(
+    session: SessionState,
+    document: Path,
+    *,
+    source_path: Path | None,
+    mode: str,
+    package_fingerprint: str | None = None,
+    role: str = "active",
+) -> tuple[Any, bool]:
+    """Observe one immutable package revision and schedule its owned attempt."""
+    if DOCUMENT_INTELLIGENCE is None:
+        raise RuntimeError("Document intelligence is not initialized.")
+    active = Path(document).expanduser().resolve(strict=True)
+    with session.lock:
+        previous_revision_id = (
+            session.source_document_index.get("revision_id")
+            if role == "source"
+            and session.source_document_index is not None
+            else session.document_index.get("revision_id")
+            if role == "active"
+            and session.document_index is not None
+            else None
+        )
+    observed = DOCUMENT_INTELLIGENCE.observe_and_schedule(
+        workspace_id=session.session_id,
+        source_path=source_path,
+        active_path=active,
+        mode=mode,
+        expected_package_sha256=package_fingerprint,
+    )
+    payload = DOCUMENT_INTELLIGENCE.payload_for_revision(
+        observed.revision.revision_id
+    )
+    if payload is None:
+        raise RuntimeError("The document index attempt was not persisted.")
+    with session.lock:
+        if role == "active":
+            if (
+                session.closed
+                or session.active_doc is None
+                or session.active_doc.resolve() != active
+            ):
+                raise RuntimeError(
+                    "The index observation belongs to a stale document."
+                )
+            previous_document_id = session.document_id
+            session.document_id = observed.document.document_id
+            session.document_revision = (
+                observed.revision.revision_number
+            )
+            session.document_package_sha256 = (
+                observed.revision.package_sha256
+            )
+            session.document_index = payload
+            if previous_document_id != session.document_id:
+                session.preview_selection.reset_for_watch(
+                    document_id=session.document_id,
+                    document_name=active.name,
+                    document_format=active.suffix,
+                    revision=session.document_revision,
+                )
+                if session.watch_generation:
+                    session.preview_sync.activate_watch(
+                        session.document_id,
+                        session.watch_generation,
+                    )
+            if session.memory is not None:
+                memory_state = dict(session.memory.active_document)
+                memory_state["document_id"] = session.document_id
+                memory_state["revision"] = session.document_revision
+                session.memory.set_active_document(**memory_state)
+            advanced = (
+                previous_revision_id
+                != observed.revision.revision_id
+            )
+        elif role == "source":
+            session.source_document_index = payload
+            advanced = (
+                previous_revision_id
+                != observed.revision.revision_id
+            )
+        else:
+            raise ValueError("Unknown document-index role.")
+    session.emit("index_progress", {**payload, "role": role})
+    return observed, advanced
+
+
+def _configure_durable_services(root: Path) -> None:
+    """Bind durable adapters to the active local-data root.
+
+    Tests replace the legacy stores with temporary roots. Deriving this bundle
+    from the active store keeps those tests isolated and keeps one production
+    source of truth.
+    """
+    global DURABLE_SERVICES_ROOT
+    global DURABLE_DATABASE
+    global DURABLE_BLOB_STORE
+    global WORKSPACE_REPOSITORY
+    global TURN_REPOSITORY
+    global RUN_REPOSITORY
+    global EVENT_REPOSITORY
+    global METADATA_REPOSITORY
+    global WORKSPACE_ACTORS
+    global LEGACY_IMPORTER
+    global SKILL_POLICY_REPOSITORY
+    global CAPABILITY_RECEIPT_REPOSITORY
+    global TOOL_RECEIPT_REPOSITORY
+    global OFFICECLI_EXECUTOR
+    global OFFICECLI_TYPED_GATEWAY
+    global OFFICECLI_SKILL_REGISTRY
+    global DOCUMENT_CAPABILITY_BOOTSTRAP
+    global GATEWAY_AUDIT_INGESTOR
+    global ROLLBACK_MANAGER
+    global CHANGE_REVIEW_SERVICE
+    global OUTCOME_VERIFIER
+    global DOCUMENT_REPOSITORY
+    global DOCUMENT_INDEXER
+    global DOCUMENT_INTELLIGENCE
+    global DOCUMENT_CONTEXT_SERVICE
+    global RUN_COVERAGE_REPOSITORY
+    global VISUAL_REGION_REPOSITORY
+    global VISUAL_REGION_SERVICE
+    global REFERENCE_INDEX_REPOSITORY
+    global REFERENCE_INDEX_COORDINATOR
+    global STORAGE_RESOURCES
+
+    resolved = Path(root).expanduser().resolve(strict=False)
+    if (
+        DURABLE_SERVICES_ROOT == resolved
+        and DURABLE_DATABASE is not None
+        and WORKSPACE_ACTORS is not None
+        and DOCUMENT_INTELLIGENCE is not None
+        and not DOCUMENT_INTELLIGENCE.closed
+        and REFERENCE_INDEX_COORDINATOR is not None
+        and not REFERENCE_INDEX_COORDINATOR.closed
+    ):
+        return
+    if DOCUMENT_INTELLIGENCE is not None:
+        try:
+            DOCUMENT_INTELLIGENCE.stop()
+        except Exception as stop_error:
+            backend_log(
+                "document_intelligence_reconfigure_stop_failed",
+                error_type=type(stop_error).__name__,
+            )
+    if REFERENCE_INDEX_COORDINATOR is not None:
+        try:
+            REFERENCE_INDEX_COORDINATOR.stop()
+        except Exception as stop_error:
+            backend_log(
+                "reference_index_reconfigure_stop_failed",
+                error_type=type(stop_error).__name__,
+            )
+    if WORKSPACE_ACTORS is not None:
+        try:
+            WORKSPACE_ACTORS.stop_all()
+        except Exception as stop_error:
+            backend_log(
+                "workspace_actor_reconfigure_stop_failed",
+                error_type=type(stop_error).__name__,
+            )
+    STORAGE_RESOURCES = StorageResourceManager(
+        resolved,
+        RESOURCE_QUOTAS,
+        fault_injector=FAULT_INJECTOR,
+    )
+    database = SqliteDatabase(
+        resolved / "ogent-state-v1.sqlite3",
+        fault_injector=FAULT_INJECTOR,
+    )
+    blobs = ContentAddressedBlobStore(
+        resolved / "blobs",
+        capacity_guard=(
+            lambda required: STORAGE_RESOURCES.ensure_capacity(
+                required,
+                purpose="durable state",
+            )
+            if FEATURE_FLAGS.strict_disk_forecast
+            else None
+        ),
+    )
+    workspaces = WorkspaceRepository(database)
+    turns = TurnRepository(database, blobs)
+    runs = RunRepository(database)
+    events = EventRepository(database)
+    metadata = MetadataRepository(database)
+    actors = WorkspaceActorRegistry(
+        database,
+        workspaces,
+        turns,
+        runs,
+        events,
+    )
+    skill_policies = SkillPolicyRepository(database, blobs)
+    capability_receipts = CapabilityReceiptRepository(database)
+    tool_receipts = ToolReceiptRepository(database)
+    officecli_executor = OfficeCliExecutor(
+        fault_injector=FAULT_INJECTOR,
+    )
+    officecli_gateway = TypedOfficeCliGateway(officecli_executor)
+    skill_registry = SkillRegistry(officecli_executor, skill_policies)
+    capability_bootstrap = DocumentCapabilityBootstrap(
+        skill_registry,
+        officecli_gateway,
+        capability_receipts,
+        tool_receipts,
+    )
+    audit_ingestor = GatewayAuditIngestor(tool_receipts)
+    changesets = ChangesetRepository(database)
+    rollback_manager = RollbackManager(database, blobs, changesets)
+    outcome_verifier = OutcomeVerifier(officecli_gateway, tool_receipts)
+    document_repository = DocumentRepository(database, blobs)
+    change_review_service = ChangeReviewService(
+        changesets,
+        document_repository,
+        rollback_manager,
+    )
+    document_indexer = DocumentIndexer()
+    document_intelligence = DocumentIntelligenceCoordinator(
+        document_repository,
+        document_indexer,
+        on_progress=_document_index_progress,
+    )
+    coverage_repository = CoverageRepository(database)
+    document_context_service = DocumentContextService(
+        document_repository,
+        coverage_repository,
+    )
+    visual_region_repository = VisualRegionRepository(database, blobs)
+    visual_region_service = VisualRegionService(
+        officecli_executor,
+        visual_region_repository,
+    )
+    reference_index_repository = ReferenceIndexRepository(
+        database,
+        blobs,
+    )
+    reference_index_coordinator = ReferenceIndexCoordinator()
+    DURABLE_SERVICES_ROOT = resolved
+    DURABLE_DATABASE = database
+    DURABLE_BLOB_STORE = blobs
+    WORKSPACE_REPOSITORY = workspaces
+    TURN_REPOSITORY = turns
+    RUN_REPOSITORY = runs
+    EVENT_REPOSITORY = events
+    METADATA_REPOSITORY = metadata
+    WORKSPACE_ACTORS = actors
+    LEGACY_IMPORTER = LegacyMetadataImporter(
+        database,
+        workspaces,
+        turns,
+        metadata,
+    )
+    SKILL_POLICY_REPOSITORY = skill_policies
+    CAPABILITY_RECEIPT_REPOSITORY = capability_receipts
+    TOOL_RECEIPT_REPOSITORY = tool_receipts
+    OFFICECLI_EXECUTOR = officecli_executor
+    OFFICECLI_TYPED_GATEWAY = officecli_gateway
+    OFFICECLI_SKILL_REGISTRY = skill_registry
+    DOCUMENT_CAPABILITY_BOOTSTRAP = capability_bootstrap
+    GATEWAY_AUDIT_INGESTOR = audit_ingestor
+    ROLLBACK_MANAGER = rollback_manager
+    CHANGE_REVIEW_SERVICE = change_review_service
+    OUTCOME_VERIFIER = outcome_verifier
+    DOCUMENT_REPOSITORY = document_repository
+    DOCUMENT_INDEXER = document_indexer
+    DOCUMENT_INTELLIGENCE = document_intelligence
+    DOCUMENT_CONTEXT_SERVICE = document_context_service
+    RUN_COVERAGE_REPOSITORY = coverage_repository
+    VISUAL_REGION_REPOSITORY = visual_region_repository
+    VISUAL_REGION_SERVICE = visual_region_service
+    REFERENCE_INDEX_REPOSITORY = reference_index_repository
+    REFERENCE_INDEX_COORDINATOR = reference_index_coordinator
+
+
+def initialize_owned_stores() -> None:
+    """Initialize durable state before deleting launch-local crash leftovers."""
+    global SERVICES_INITIALIZED
+    global LAST_LEGACY_IMPORT
+    global LAST_STORAGE_CLEANUP
+    with SERVICE_INITIALIZATION_LOCK:
+        durable_root = SESSION_MEMORY_STORE.root.parent
+        _configure_durable_services(durable_root)
+        try:
+            LAST_STORAGE_CLEANUP = STORAGE_RESOURCES.cleanup_partials()
+        except OSError as exc:
+            LAST_STORAGE_CLEANUP = {
+                "deleted": 0,
+                "reclaimed_bytes": 0,
+                "error": type(exc).__name__,
+            }
+            print(
+                "Ogent stale-partial cleanup could not complete.",
+                file=sys.stderr,
+            )
+        if (
+            SERVICES_INITIALIZED
+            and DURABLE_SERVICES_ROOT == durable_root.resolve(strict=False)
+            and SESSION_MEMORY_STORE.launch_root.is_dir()
+        ):
+            return
+        assert DURABLE_DATABASE is not None
+        assert LEGACY_IMPORTER is not None
+        DURABLE_DATABASE.initialize()
+        LAST_LEGACY_IMPORT = LEGACY_IMPORTER.import_all(
+            recent_path=durable_root / RECENT_PATH.name,
+            backup_root=BACKUP_STORE.root,
+            session_memory_root=SESSION_MEMORY_STORE.root,
+        )
+        SESSION_MEMORY_STORE.initialize()
+        BACKUP_STORE.initialize()
+        SERVICES_INITIALIZED = True
+
+
+def codex_launch_prefix() -> list[str]:
+    """Resolve Codex without asking CreateProcess to execute an npm shim."""
+    resolution = resolve_codex_cli()
+    if resolution is None:
+        raise UserFacingError("Codex CLI is not installed.", 500)
+    return list(resolution.command)
+
+
+def provider_label(provider_id: str) -> str:
+    provider = AGENT_PROVIDER_BY_ID.get(provider_id)
+    return provider.label if provider is not None else provider_id
+
+
+def _provider_or_error(provider_id: str) -> BaseAgentProvider:
+    provider = AGENT_PROVIDER_BY_ID.get(provider_id)
+    if provider is None:
+        raise UserFacingError("Choose an available agent provider.", 409)
+    return provider
+
+
+def activity_from_codex_event(event: dict[str, Any]) -> str | None:
+    provider = _provider_or_error("codex")
+    return provider.parse_stream_event(provider.new_stream_state(), event)
+
+
+def validate_agent_settings(model: Any, reasoning: Any) -> tuple[str, str]:
+    """Legacy command-builder validation without a static model catalog."""
+
+    selected_model = str(model or "").strip()
+    selected_reasoning = str(reasoning or AUTOMATIC_EFFORT).strip()
+    if (
+        not selected_model
+        or len(selected_model) > 256
+        or any(ord(character) < 32 for character in selected_model)
+    ):
+        raise UserFacingError("Choose a model reported by the selected CLI.")
+    if (
+        not selected_reasoning
+        or len(selected_reasoning) > 64
+        or any(ord(character) < 32 for character in selected_reasoning)
+    ):
+        raise UserFacingError("Choose an effort reported for the selected model.")
+    return selected_model, selected_reasoning
+
+
+def validate_agent_selection(
+    provider: Any,
+    model: Any,
+    effort: Any,
+) -> AgentSelection:
+    try:
+        return AGENT_CATALOG.validate_selection(provider, model, effort)
+    except SelectionValidationError as exc:
+        raise UserFacingError(str(exc), 409) from exc
+
+
+def build_codex_command(
+    prompt: str,
+    session_id: str | None,
+    model: str,
+    reasoning: str,
+    image_paths: list[Path] | None = None,
+    *,
+    sandbox: str = "read-only",
+    writable_directories: list[Path] | None = None,
+) -> list[str]:
+    selected_model, selected_reasoning = validate_agent_settings(model, reasoning)
+    prefix = codex_launch_prefix()
+    resolution = CLIResolution(
+        command=tuple(prefix),
+        executable_path=prefix[0],
+    )
+    request = ProviderRunRequest(
+        prompt=prompt,
+        working_directory=Path.cwd(),
+        model=selected_model,
+        effort=selected_reasoning,
+        session_id=session_id,
+        new_session_id=None,
+        persistent=True,
+        image_paths=tuple(image_paths or ()),
+        sandbox=sandbox,
+        writable_directories=tuple(writable_directories or ()),
+    )
+    return _build_codex_provider_command(resolution, request)
+
+
+def run_quiet(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float = 20,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        env=command_env(),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
+        check=False,
+    )
+
+
+def ensure_officecli_compatible() -> str:
+    """Fail closed before starting a watch with an incompatible renderer."""
+    global OFFICECLI_RUNTIME_VERSION, OFFICECLI_RUNTIME_VERSION_TEXT
+    with OFFICECLI_RUNTIME_LOCK:
+        if (
+            OFFICECLI_RUNTIME_VERSION is not None
+            and OFFICECLI_RUNTIME_VERSION_TEXT is not None
+        ):
+            return OFFICECLI_RUNTIME_VERSION_TEXT
+        try:
+            result = run_quiet(["officecli", "--version"], timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise UserFacingError(
+                f"OfficeCLI {MIN_OFFICECLI_VERSION_TEXT} or later is required.",
+                503,
+            ) from exc
+        output = "\n".join(
+            item.strip()
+            for item in (result.stdout, result.stderr)
+            if item and item.strip()
+        )
+        match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", output)
+        if result.returncode != 0 or match is None:
+            raise UserFacingError(
+                "Ogent could not verify the installed OfficeCLI version. "
+                f"Install OfficeCLI {MIN_OFFICECLI_VERSION_TEXT} or later.",
+                503,
+            )
+        version = tuple(int(match.group(index)) for index in range(1, 4))
+        if version < MIN_OFFICECLI_VERSION:
+            raise UserFacingError(
+                f"OfficeCLI {MIN_OFFICECLI_VERSION_TEXT} or later is required "
+                f"for stable preview position and historical selection links; "
+                f"found {match.group(0)}.",
+                503,
+            )
+        OFFICECLI_RUNTIME_VERSION = version
+        OFFICECLI_RUNTIME_VERSION_TEXT = match.group(0)
+        return OFFICECLI_RUNTIME_VERSION_TEXT
+
+
+def initialize_blank_office_document(document: Path) -> None:
+    """Turn a zero-byte Explorer placeholder into a valid blank Office package."""
+    target = document.resolve(strict=False)
+    extension = target.suffix.casefold()
+    if extension not in SUPPORTED_OFFICE:
+        raise UserFacingError(
+            "Only empty DOCX, XLSX, and PPTX files can be initialized.",
+            415,
+        )
+    if not target.parent.is_dir():
+        raise UserFacingError(
+            f"The blank document folder does not exist: {target.parent}",
+            404,
+        )
+    initial_stat = target.stat() if target.exists() else None
+    if initial_stat is not None and initial_stat.st_size != 0:
+        raise UserFacingError(
+            "Ogent refused to initialize a non-empty Office document.",
+            409,
+        )
+
+    ensure_officecli_compatible()
+    temporary = target.with_name(
+        f".{safe_name(target.stem)}-ogent-blank-{uuid.uuid4().hex}{extension}"
+    )
+    try:
+        created = run_quiet(
+            ["officecli", "create", str(temporary)],
+            cwd=target.parent,
+            timeout=45,
+        )
+        if (
+            created.returncode != 0
+            or not temporary.is_file()
+            or temporary.stat().st_size <= 0
+        ):
+            detail = "\n".join(
+                f"{created.stdout}\n{created.stderr}".splitlines()[-6:]
+            ).strip()
+            raise UserFacingError(
+                f"Ogent could not create a valid blank {extension[1:].upper()} "
+                f"document. {detail}".strip(),
+                500,
+            )
+        validated = run_quiet(
+            ["officecli", "validate", str(temporary)],
+            cwd=target.parent,
+            timeout=45,
+        )
+        if validated.returncode != 0:
+            detail = "\n".join(
+                f"{validated.stdout}\n{validated.stderr}".splitlines()[-6:]
+            ).strip()
+            raise UserFacingError(
+                f"The new blank {extension[1:].upper()} document did not "
+                f"validate. {detail}".strip(),
+                500,
+            )
+        current_stat = target.stat() if target.exists() else None
+        initial_identity = (
+            (
+                initial_stat.st_size,
+                initial_stat.st_mtime_ns,
+                getattr(initial_stat, "st_ino", None),
+            )
+            if initial_stat is not None
+            else None
+        )
+        current_identity = (
+            (
+                current_stat.st_size,
+                current_stat.st_mtime_ns,
+                getattr(current_stat, "st_ino", None),
+            )
+            if current_stat is not None
+            else None
+        )
+        if current_identity != initial_identity:
+            raise UserFacingError(
+                "The empty document changed while Ogent initialized it. "
+                "Close other editors and try again.",
+                409,
+            )
+        os.replace(temporary, target)
+    except UserFacingError:
+        raise
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UserFacingError(
+            f"Ogent could not initialize the blank {extension[1:].upper()} "
+            f"document: {exc}",
+            500,
+        ) from exc
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def terminate_process_tree(process: subprocess.Popen[str] | None) -> None:
+    DEFAULT_OWNED_PROCESS_SUPERVISOR.terminate(process)
+
+
+def cleanup_word_snapshot_process(
+    process: subprocess.Popen[str] | None,
+    pid_file: Path | None,
+) -> None:
+    terminate_process_tree(process)
+    if (
+        pid_file is None
+        or not path_is_within(pid_file, WORK_ROOT)
+        or not pid_file.is_file()
+    ):
+        return
+    try:
+        word_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        word_pid = 0
+    if os.name == "nt" and word_pid > 0:
+        # Word COM is activated through svchost, so it is not reliably part of
+        # PowerShell's child tree. Validate the exact converter-recorded PID
+        # before terminating an automation instance after forced cancellation.
+        script = (
+            f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId={word_pid}\"; "
+            "if ($p -and $p.Name -ieq 'WINWORD.EXE' -and "
+            "$p.CommandLine -match '(?i)(/Automation|-Embedding)') { "
+            f"Stop-Process -Id {word_pid} -Force -ErrorAction SilentlyContinue "
+            "}"
+        )
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            run_quiet(
+                ["powershell.exe", "-NoProfile", "-Command", script],
+                timeout=10,
+            )
+    with contextlib.suppress(OSError):
+        pid_file.unlink()
+
+

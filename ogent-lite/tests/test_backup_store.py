@@ -71,6 +71,27 @@ class BackupStoreTests(unittest.TestCase):
         )
         self.assertFalse(any(self.root.rglob("*.partial")))
 
+    def test_zero_byte_placeholder_can_be_backed_up_and_atomically_restored(
+        self,
+    ) -> None:
+        self.source.write_bytes(b"")
+        record = self.store.create_backup(self.source)
+
+        self.assertEqual(record.byte_size, 0)
+        self.assertEqual(
+            record.sha256,
+            hashlib.sha256(b"").hexdigest(),
+        )
+        self.assertEqual(record.backup_path.read_bytes(), b"")
+
+        self.source.write_bytes(b"initialized-office-package")
+        self.store.restore_backup(
+            record.backup_id,
+            self.source,
+            replace_existing=True,
+        )
+        self.assertEqual(self.source.read_bytes(), b"")
+
     def test_source_change_during_copy_aborts_without_committed_backup(self) -> None:
         digest = hashlib.sha256(self.source.read_bytes()).hexdigest()
         with mock.patch.object(
@@ -192,7 +213,9 @@ class BackupStoreTests(unittest.TestCase):
         self.store.restore_backup(first.backup_id, restored)
         self.assertEqual(restored.read_bytes(), self.source.read_bytes())
 
-    def test_initialize_uses_injected_clock_and_schedules_six_hour_cleanup(self) -> None:
+    def test_initialize_uses_injected_clock_and_schedules_six_hour_cleanup(
+        self,
+    ) -> None:
         result = self.store.initialize()
         self.assertEqual(result["reason"], "startup")
         self.assertEqual(

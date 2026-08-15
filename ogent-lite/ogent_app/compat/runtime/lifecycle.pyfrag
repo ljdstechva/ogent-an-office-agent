@@ -1,0 +1,560 @@
+def valid_pdf_file(path: Path | None) -> bool:
+    if path is None or not path.is_file() or path.stat().st_size <= 5:
+        return False
+    try:
+        with path.open("rb") as stream:
+            return stream.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def generate_word_snapshot(session: SessionState) -> Path:
+    with session.lock:
+        if session.closed:
+            raise UserFacingError("This Ogent session has closed.", 410)
+        if session.run_status in ACTIVE_RUN_STATUSES:
+            raise UserFacingError(
+                "Wait for the active agent run to finish before creating Word view.",
+                409,
+            )
+        if session.snapshot_in_progress:
+            raise UserFacingError("Word view is already being generated.", 409)
+        document = session.active_doc
+        if document is None:
+            raise UserFacingError("Open a Word document first.", 409)
+        if document.suffix.lower() != ".docx":
+            raise UserFacingError(
+                "Word view is currently available only for DOCX files.", 415
+            )
+        if not document.exists():
+            raise UserFacingError(
+                f"The working document no longer exists: {document}", 404
+            )
+        document_id = session.document_id
+        document_revision = session.document_revision
+        session.snapshot_in_progress = True
+        session.snapshot_complete.clear()
+        session.snapshot_error = None
+    session.emit(
+        "snapshot_status",
+        {
+            "status": "working",
+            "document_id": document_id,
+            "document_revision": document_revision,
+        },
+    )
+
+    process: subprocess.Popen[str] | None = None
+    pid_file: Path | None = None
+    try:
+        package_fingerprint = package_sha256(document)
+        cache_key = hashlib.sha256(
+            (f"{document_id}|{document_revision}|{package_fingerprint}").encode("utf-8")
+        ).hexdigest()[:32]
+        snapshot_root = WORK_ROOT / session.session_id / "word-view"
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        if not path_is_within(snapshot_root, WORK_ROOT / session.session_id):
+            raise UserFacingError(
+                "Word View temporary storage escaped the Ogent workspace.",
+                500,
+            )
+        output = snapshot_root / f"{cache_key}.pdf"
+        pid_file = snapshot_root / f".{cache_key}-word-process.pid"
+        with contextlib.suppress(OSError):
+            pid_file.unlink()
+        with session.lock:
+            if (
+                session.closed
+                or session.active_doc is None
+                or session.active_doc.resolve() != document.resolve()
+                or session.document_id != document_id
+                or session.document_revision != document_revision
+            ):
+                raise UserFacingError(
+                    "The document changed before Word View could start. Retry.",
+                    409,
+                )
+            session.snapshot_pid_file = pid_file
+            session.snapshot_path = None
+            session.snapshot_cache_key = None
+            session.snapshot_document_id = None
+            session.snapshot_document_revision = 0
+            session.snapshot_package_sha256 = ""
+        if valid_pdf_file(output):
+            if package_sha256(document) != package_fingerprint:
+                raise UserFacingError(
+                    "The document changed while Word View was opening. Retry.",
+                    409,
+                )
+            with session.lock:
+                if (
+                    session.closed
+                    or session.active_doc is None
+                    or session.active_doc.resolve() != document.resolve()
+                    or session.document_id != document_id
+                    or session.document_revision != document_revision
+                ):
+                    raise UserFacingError(
+                        "The document changed while Word View was opening. Retry.",
+                        409,
+                    )
+                session.snapshot_path = output
+                session.snapshot_cache_key = cache_key
+                session.snapshot_document_id = document_id
+                session.snapshot_document_revision = document_revision
+                session.snapshot_package_sha256 = package_fingerprint
+                session.snapshot_in_progress = False
+                session.snapshot_error = None
+                if session.sse_clients == 0:
+                    session.orphan_since = time.time()
+            session.emit(
+                "snapshot_status",
+                {
+                    "status": "ready",
+                    "url": f"/snapshot.pdf?s={session.session_id}",
+                    "cache_key": cache_key,
+                    "document_id": document_id,
+                    "document_revision": document_revision,
+                    "cached": True,
+                },
+            )
+            backend_log(
+                "word_view_ready",
+                session_id=session.session_id,
+                document_id=document_id,
+                document_extension=document.suffix.casefold(),
+                document_revision=document_revision,
+                cache_key=cache_key,
+                cached=True,
+                bytes=output.stat().st_size,
+            )
+            return output
+
+        with session.lock:
+            process = subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(DOCX_TO_PDF),
+                    "-Docx",
+                    str(document),
+                    "-OutPdf",
+                    str(output),
+                    "-Engine",
+                    "Word",
+                    "-Force",
+                    "-WordPidFile",
+                    str(pid_file),
+                ],
+                cwd=str(REPO_ROOT),
+                env=command_env(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
+            )
+            session.snapshot_process = process
+        try:
+            stdout, _ = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            raise UserFacingError(
+                "Word view timed out after 120 seconds.", 504
+            ) from None
+        if process.returncode != 0:
+            tail = "\n".join((stdout or "").splitlines()[-8:])
+            raise UserFacingError(
+                f"Word view failed with exit code {process.returncode}. {tail}".strip(),
+                500,
+            )
+        if not valid_pdf_file(output):
+            raise UserFacingError("Word view did not create a valid PDF.", 500)
+        if package_sha256(document) != package_fingerprint:
+            raise UserFacingError(
+                "The source document changed during Word View generation. "
+                "Retry after document editing is complete.",
+                409,
+            )
+        with session.lock:
+            if (
+                session.closed
+                or session.active_doc is None
+                or session.active_doc.resolve() != document.resolve()
+                or session.document_id != document_id
+                or session.document_revision != document_revision
+            ):
+                raise UserFacingError(
+                    "The document changed during Word View generation. Retry.",
+                    409,
+                )
+            session.snapshot_path = output
+            session.snapshot_cache_key = cache_key
+            session.snapshot_document_id = document_id
+            session.snapshot_document_revision = document_revision
+            session.snapshot_package_sha256 = package_fingerprint
+            session.snapshot_in_progress = False
+            session.snapshot_process = None
+            session.snapshot_error = None
+            if session.sse_clients == 0:
+                session.orphan_since = time.time()
+        session.emit(
+            "snapshot_status",
+            {
+                "status": "ready",
+                "url": f"/snapshot.pdf?s={session.session_id}",
+                "cache_key": cache_key,
+                "document_id": document_id,
+                "document_revision": document_revision,
+                "cached": False,
+            },
+        )
+        backend_log(
+            "word_view_ready",
+            session_id=session.session_id,
+            document_id=document_id,
+            document_extension=document.suffix.casefold(),
+            document_revision=document_revision,
+            cache_key=cache_key,
+            cached=False,
+            bytes=output.stat().st_size,
+        )
+        return output
+    except UserFacingError as exc:
+        with session.lock:
+            session.snapshot_in_progress = False
+            if session.snapshot_process is process:
+                session.snapshot_process = None
+            session.snapshot_error = str(exc)
+            if session.sse_clients == 0:
+                session.orphan_since = time.time()
+        session.emit(
+            "snapshot_status",
+            {
+                "status": "error",
+                "error": str(exc),
+                "document_id": document_id,
+                "document_revision": document_revision,
+            },
+        )
+        backend_log(
+            "word_view_failed",
+            session_id=session.session_id,
+            document_id=document_id,
+            document_extension=document.suffix.casefold(),
+            document_revision=document_revision,
+            error_type=type(exc).__name__,
+        )
+        raise
+    except Exception as exc:
+        with session.lock:
+            session.snapshot_in_progress = False
+            if session.snapshot_process is process:
+                session.snapshot_process = None
+            session.last_error = str(exc)
+            session.snapshot_error = str(exc)
+            if session.sse_clients == 0:
+                session.orphan_since = time.time()
+        session.emit(
+            "snapshot_status",
+            {
+                "status": "error",
+                "error": str(exc),
+                "document_id": document_id,
+                "document_revision": document_revision,
+            },
+        )
+        backend_log(
+            "word_view_failed",
+            session_id=session.session_id,
+            document_id=document_id,
+            document_extension=document.suffix.casefold(),
+            document_revision=document_revision,
+            error_type=type(exc).__name__,
+        )
+        raise UserFacingError(f"Word view failed: {exc}", 500) from exc
+    finally:
+        cleanup_word_snapshot_process(process, pid_file)
+        with session.lock:
+            if session.snapshot_pid_file == pid_file:
+                session.snapshot_pid_file = None
+        session.snapshot_complete.set()
+
+
+def pick_document_path() -> str | None:
+    if not STATE.pick_lock.acquire(blocking=False):
+        raise UserFacingError("A document picker is already open.", 409)
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$owner = New-Object System.Windows.Forms.Form
+$owner.Text = 'Ogent document picker'
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Opacity = 0.01
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Open in Ogent'
+$dialog.Filter = 'Supported documents (*.docx;*.xlsx;*.pptx;*.pdf)|*.docx;*.xlsx;*.pptx;*.pdf|Word (*.docx)|*.docx|Excel (*.xlsx)|*.xlsx|PowerPoint (*.pptx)|*.pptx|PDF (*.pdf)|*.pdf'
+$dialog.Multiselect = $false
+try {
+    $owner.Show()
+    $owner.Activate()
+    if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+        [Console]::Out.Write($dialog.FileName)
+    }
+}
+finally {
+    $dialog.Dispose()
+    $owner.Close()
+    $owner.Dispose()
+}
+"""
+    process: subprocess.Popen[str] | None = None
+    try:
+        with STATE.registry_lock:
+            if STATE.shutdown_requested:
+                raise UserFacingError("Ogent is shutting down.", 503)
+            process = subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+                cwd=str(REPO_ROOT),
+                env=command_env(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            STATE.pick_process = process
+        stdout, stderr = process.communicate(timeout=600)
+        if process.returncode != 0:
+            detail = "\n".join((stderr or "").splitlines()[-6:])
+            raise UserFacingError(f"Document picker failed. {detail}".strip(), 500)
+        selected = (stdout or "").strip()
+        return selected or None
+    except subprocess.TimeoutExpired:
+        terminate_process_tree(process)
+        raise UserFacingError("Document picker timed out.", 504) from None
+    finally:
+        with STATE.registry_lock:
+            if STATE.pick_process is process:
+                STATE.pick_process = None
+        STATE.pick_lock.release()
+
+
+def close_session(
+    session: SessionState,
+    *,
+    require_reapable_at: float | None = None,
+) -> bool:
+    # Mark the session closed before resource cleanup so no new request can
+    # enter it, but keep it in summaries until its watch port is actually
+    # released. This avoids both premature "removed" announcements and holding
+    # the global registry lock while waiting for child processes.
+    initiated = STATE.begin_session_close(
+        session,
+        require_reapable_at=require_reapable_at,
+    )
+    if not initiated and require_reapable_at is not None:
+        return False
+    reference_index_coordinator = REFERENCE_INDEX_COORDINATOR
+    if reference_index_coordinator is not None:
+        reference_index_coordinator.cancel_workspace(session.session_id)
+    # Explicit shutdown may arrive while the reaper is already closing this
+    # session. Serialize cleanup so shutdown waits for (or safely takes over)
+    # the bounded child-process/watch teardown instead of exiting around it.
+    with session.close_lock:
+        if session.close_complete.is_set():
+            return True
+        try:
+            with session.lock:
+                run_process = session.run_process
+                run_thread = session.run_thread
+                run_active = session.run_status in ACTIVE_RUN_STATUSES
+                if run_active:
+                    session.stop_requested = True
+                    for cancellation in session.owned_cancel_events.values():
+                        cancellation.set()
+                snapshot_process = session.snapshot_process
+                snapshot_busy = session.snapshot_in_progress
+                snapshot_pid_file = session.snapshot_pid_file
+            with session.reference_lock:
+                run_roots = list(session.reference_run_roots.values())
+                upload_connections = list(session.reference_connections.values())
+                inspection_processes = list(session.reference_processes.values())
+            for connection in upload_connections:
+                with contextlib.suppress(OSError):
+                    connection.shutdown(socket.SHUT_RD)
+            for inspection_process in inspection_processes:
+                terminate_process_tree(inspection_process)
+            uploads_finished = session.reference_idle.wait(timeout=35)
+            reference_indexes_finished = (
+                reference_index_coordinator.wait_workspace(
+                    session.session_id,
+                    timeout=35,
+                )
+                if reference_index_coordinator is not None
+                else True
+            )
+
+            terminate_process_tree(run_process)
+            tracked_processes_released = True
+            for run_root in run_roots:
+                try:
+                    _terminate_tracked_reference_office_processes(run_root)
+                except UserFacingError:
+                    tracked_processes_released = False
+            run_finished = True
+            if run_active:
+                run_finished = session.run_complete.wait(timeout=120)
+            if run_finished and (
+                run_thread is not None
+                and run_thread is not threading.current_thread()
+                and run_thread.is_alive()
+            ):
+                run_thread.join(timeout=5)
+            if snapshot_busy:
+                # Let Word COM reach the converter's finally block and quit
+                # cleanly. If it exceeds the bounded grace, terminate both the
+                # PowerShell wrapper and its exact tracked automation instance.
+                snapshot_finished = session.snapshot_complete.wait(
+                    SNAPSHOT_SHUTDOWN_GRACE_SECONDS
+                )
+                if not snapshot_finished:
+                    with session.lock:
+                        snapshot_process = session.snapshot_process
+                        snapshot_pid_file = session.snapshot_pid_file
+                    cleanup_word_snapshot_process(
+                        snapshot_process,
+                        snapshot_pid_file,
+                    )
+                    session.snapshot_complete.wait(timeout=5)
+            else:
+                cleanup_word_snapshot_process(
+                    snapshot_process,
+                    snapshot_pid_file,
+                )
+            stop_watch(session, clear_document=False, release_port=True)
+            if (
+                uploads_finished
+                and reference_indexes_finished
+                and run_finished
+                and tracked_processes_released
+            ):
+                try:
+                    cleanup_session_references(session)
+                    SESSION_MEMORY_STORE.delete_session(session.session_id)
+                except (
+                    UserFacingError,
+                    SessionMemoryError,
+                    RetainedAttachmentError,
+                    OSError,
+                ) as exc:
+                    with session.lock:
+                        session.last_error = _redact_reference_detail(
+                            str(exc),
+                            max_characters=1600,
+                        )
+            else:
+                with session.lock:
+                    session.last_error = (
+                        "Temporary references were not deleted because an owning "
+                        "operation did not release them before shutdown."
+                    )
+        finally:
+            STATE.finish_session_close(session)
+    return True
+
+
+def reaper_loop(server: "OgentServer") -> None:
+    while not STATE.shutdown_requested:
+        if threading.Event().wait(STATE.reaper_tick_seconds):
+            return
+        now = time.time()
+        with STATE.registry_lock:
+            sessions = list(STATE.sessions.values())
+        for session in sessions:
+            close_session(session, require_reapable_at=now)
+        with contextlib.suppress(BackupError, OSError):
+            BACKUP_STORE.cleanup_if_due()
+
+        should_shutdown = False
+        with STATE.registry_lock:
+            empty_since = STATE.empty_since
+            idle_exit_minutes = STATE.idle_exit_minutes
+            if (
+                not STATE.sessions
+                and idle_exit_minutes > 0
+                and empty_since is not None
+                and now - empty_since >= idle_exit_minutes * 60
+            ):
+                STATE.shutdown_requested = True
+                should_shutdown = True
+        if should_shutdown:
+            server.shutdown()
+            return
+
+
+def cleanup() -> None:
+    with STATE.registry_lock:
+        if STATE.cleanup_started:
+            return
+        STATE.cleanup_started = True
+        STATE.shutdown_requested = True
+        sessions = list(STATE.sessions.values())
+        pick_process = STATE.pick_process
+    terminate_process_tree(pick_process)
+    AGENT_CATALOG.shutdown()
+    for session in sessions:
+        close_session(session)
+    if DOCUMENT_INTELLIGENCE is not None:
+        try:
+            DOCUMENT_INTELLIGENCE.stop()
+        except RuntimeError as exc:
+            print(
+                f"Document intelligence shutdown failed: {exc}",
+                file=sys.stderr,
+            )
+    if REFERENCE_INDEX_COORDINATOR is not None:
+        try:
+            REFERENCE_INDEX_COORDINATOR.stop()
+        except RuntimeError as exc:
+            print(
+                f"Reference indexing shutdown failed: {exc}",
+                file=sys.stderr,
+            )
+    if WORKSPACE_ACTORS is not None:
+        try:
+            WORKSPACE_ACTORS.stop_all()
+        except RuntimeError as exc:
+            print(f"Workspace actor shutdown failed: {exc}", file=sys.stderr)
+    if REFERENCE_ROOT.exists():
+        try:
+            reset_reference_root(REFERENCE_ROOT)
+        except (ReferenceError, OSError) as exc:
+            print(
+                f"Temporary reference cleanup failed: {exc}",
+                file=sys.stderr,
+            )
+    if SERVICES_INITIALIZED:
+        try:
+            SESSION_MEMORY_STORE.clear_all()
+        except (SessionMemoryError, OSError) as exc:
+            print(f"Session memory cleanup failed: {exc}", file=sys.stderr)
+    try:
+        if SERVER_INFO_PATH.exists():
+            info = json.loads(SERVER_INFO_PATH.read_text(encoding="utf-8"))
+            if info.get("pid") == os.getpid():
+                SERVER_INFO_PATH.unlink()
+    except (OSError, ValueError):
+        # Intentional shutdown cleanup: a stale/malformed record is harmless.
+        pass
+
+
+HTML_TEMPLATE = load_html_template()

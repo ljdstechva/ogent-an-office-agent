@@ -117,9 +117,7 @@ class MarkRunner:
             return completed(arguments, {"marks": copy.deepcopy(self.marks)})
         if operation == ["watch", "unmark"]:
             mark_id = arguments[arguments.index("--id") + 1]
-            self.marks = [
-                item for item in self.marks if str(item.get("id")) != mark_id
-            ]
+            self.marks = [item for item in self.marks if str(item.get("id")) != mark_id]
             return completed(arguments, {"removed": True})
         if operation == ["watch", "goto"]:
             return completed(arguments, {"data": {"text": "centered"}})
@@ -279,7 +277,9 @@ class PreviewFocusTests(unittest.TestCase):
                 with self.assertRaises(HistoricalFocusError):
                     validate_focus_payload(payload)
 
-    def test_canonical_memory_resolution_rejects_cross_session_and_wrong_turn(self) -> None:
+    def test_canonical_memory_resolution_rejects_cross_session_and_wrong_turn(
+        self,
+    ) -> None:
         resolved = resolve_memory_selection(
             self.memory,
             expected_session_id=self.session_id,
@@ -314,7 +314,7 @@ class PreviewFocusTests(unittest.TestCase):
                 expected_session_id=self.session_id,
                 message_sequence=assistant.sequence,
                 selection_id=self.selection_id,
-                )
+            )
 
     def test_officecli_10143_is_enforced_before_watch_start(self) -> None:
         original_version = ogent.OFFICECLI_RUNTIME_VERSION
@@ -419,7 +419,9 @@ class PreviewFocusTests(unittest.TestCase):
                 current_revision=9,
             )
 
-    def test_owned_highlight_replaces_itself_and_preserves_unrelated_marks(self) -> None:
+    def test_owned_highlight_replaces_itself_and_preserves_unrelated_marks(
+        self,
+    ) -> None:
         state = HistoricalFocusState(self.session_id)
         owner_note = f"{state.note_prefix}old-selection"
         runner = MarkRunner(
@@ -483,9 +485,7 @@ class PreviewFocusTests(unittest.TestCase):
             f"{state.note_prefix}{self.selection_id}",
             notes,
         )
-        self.assertTrue(
-            all(call[0] == "officecli" for call in runner.calls)
-        )
+        self.assertTrue(all(call[0] == "officecli" for call in runner.calls))
 
     def test_large_excel_range_centers_and_marks_only_its_primary_cell(self) -> None:
         reference = self.reference(
@@ -562,9 +562,9 @@ class PreviewFocusTests(unittest.TestCase):
                 document_format="docx",
                 path="/../../secret",
             )
-        preview_source = (
-            OGENT_DIR / "ogent_preview_selection.py"
-        ).read_text(encoding="utf-8")
+        preview_source = (OGENT_DIR / "ogent_preview_selection.py").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("NamedPipe", preview_source)
         self.assertNotIn("CoreFxPipe_", preview_source)
 
@@ -677,24 +677,30 @@ class PreviewFocusTests(unittest.TestCase):
             ogent.stable_watch_url(26320, generation),
             f"http://127.0.0.1:26320/?generation={generation}",
         )
-        html = ogent.HTML_TEMPLATE
-        for expected in (
-            "function canonicalPreviewUrl(url)",
-            "function previewIdentityKey(identity, path, url)",
-            "loadedPreviewKey !== key",
-            'api("/selection/focus"',
-            'card.type = "button"',
-            "Focus submitted selection:",
-            'headers["X-Ogent-Client"] = CLIENT_ID',
-            '["v", "refresh", "revision", "cache", "_"]',
-        ):
-            self.assertIn(expected, html)
-        self.assertNotIn("${state.watch_url}?v=", html)
-        self.assertNotIn("${result.watch_url}?v=", html)
-        self.assertNotRegex(
-            html,
-            re.compile(r"preview\.src\s*=\s*`[^`]*Date\.now"),
+        preview = (
+            OGENT_DIR / "web" / "src" / "components" / "document" / "PreviewSurface.tsx"
+        ).read_text(encoding="utf-8")
+        transcript = (
+            OGENT_DIR / "web" / "src" / "components" / "chat" / "Transcript.tsx"
+        ).read_text(encoding="utf-8")
+        client = (OGENT_DIR / "web" / "src" / "api" / "client.ts").read_text(
+            encoding="utf-8"
         )
+        for expected in (
+            'new URL("/preview", window.location.origin)',
+            "function identityKey(",
+            "identity.document_id",
+            "identity.watch_generation",
+            "revision ?? 0",
+        ):
+            self.assertIn(expected, preview)
+        self.assertIn('}>("/selection/focus"', transcript)
+        self.assertIn(
+            'headers.set("X-Ogent-Client", clientId)',
+            client,
+        )
+        self.assertNotIn('searchParams.set("attempt"', preview)
+        self.assertNotRegex(preview, re.compile(r"Date\.now\(\).*preview"))
 
 
 if __name__ == "__main__":

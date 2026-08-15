@@ -114,7 +114,9 @@ class PreviewSelectionTests(unittest.TestCase):
                 source_matches=False,
             )
 
-    def test_wrong_channel_watch_document_session_and_revision_fail_closed(self) -> None:
+    def test_wrong_channel_watch_document_session_and_revision_fail_closed(
+        self,
+    ) -> None:
         checks = {
             "channel_id": ("wrong-channel-1234567890", "channel"),
             "watch_id": ("wrong-watch", "generation"),
@@ -260,6 +262,22 @@ class PreviewSelectionTests(unittest.TestCase):
         assert snapshot is not None
         self.assertEqual(snapshot.targets[0].path, "/body/p[1]")
 
+    def test_failed_send_restores_claimed_composer_targets(self) -> None:
+        self.state.apply_paths(
+            ["/body/p[1]", "/body/p[2]"],
+            self.resolver,
+        )
+        snapshot = self.state.claim_for_send()
+        self.assertEqual(self.state.targets, [])
+
+        self.assertTrue(self.state.restore_after_failed_send(snapshot))
+        self.assertEqual(
+            [target.path for target in self.state.targets],
+            ["/body/p[1]", "/body/p[2]"],
+        )
+        self.assertTrue(self.state.targets[0].primary)
+        self.assertFalse(self.state.targets[1].primary)
+
     def test_broker_dispatches_only_selection_and_document_events(self) -> None:
         selections: list[list[str]] = []
         documents: list[dict[str, object]] = []
@@ -297,9 +315,7 @@ class PreviewSelectionTests(unittest.TestCase):
             broker.post_selection(["/body/p[1]"])
 
         post_selection.assert_called_once_with(26320, ["/body/p[1]"])
-        echo = json.dumps(
-            {"action": "selection-update", "paths": ["/body/p[1]"]}
-        )
+        echo = json.dumps({"action": "selection-update", "paths": ["/body/p[1]"]})
         broker._dispatch(echo)
         self.assertEqual(selections, [])
 
@@ -322,7 +338,9 @@ class PreviewSelectionTests(unittest.TestCase):
         self.assertEqual(request.full_url, "http://127.0.0.1:26320/events")
         self.assertNotIn("timeout", urlopen.call_args.kwargs)
 
-    def test_native_selection_update_posts_only_to_fixed_loopback_endpoint(self) -> None:
+    def test_native_selection_update_posts_only_to_fixed_loopback_endpoint(
+        self,
+    ) -> None:
         response = mock.MagicMock()
         response.status = 204
         response.__enter__.return_value = response

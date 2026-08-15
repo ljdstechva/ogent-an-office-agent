@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 OGENT_PATH = Path(__file__).resolve().parents[1] / "ogent.py"
@@ -200,6 +201,114 @@ class ShellOpenTests(unittest.TestCase):
         self.assertEqual(imported.name, filename)
         self.assertTrue(imported.is_relative_to(ogent.IMPORT_ROOT))
         self.assertEqual(Path(result["import_source"]), imported)
+
+    def test_zero_byte_office_upload_is_initialized_and_opened(self) -> None:
+        session = self.state.create_session()
+        session.connect_sse("blank-upload-client")
+
+        def initialize(document: Path) -> None:
+            self.assertEqual(document.stat().st_size, 0)
+            document.write_bytes(b"valid-blank-office-package")
+
+        def start_watch(current: Any, _document: Path) -> None:
+            with current.lock:
+                current.watch_port = 26320
+
+        request = urllib.request.Request(
+            f"http://{ogent.HOST}:{self.port}/upload",
+            data=b"",
+            headers={
+                "X-Ogent-Token": self.state.token,
+                "X-Ogent-Session": session.session_id,
+                "X-Ogent-Filename": urllib.parse.quote(
+                    "Blank document.docx",
+                    safe="",
+                ),
+                "Content-Type": "application/octet-stream",
+                "Content-Length": "0",
+            },
+            method="POST",
+        )
+
+        with (
+            mock.patch.object(
+                ogent,
+                "initialize_blank_office_document",
+                side_effect=initialize,
+            ),
+            mock.patch.object(
+                ogent,
+                "start_watch",
+                side_effect=start_watch,
+            ),
+            mock.patch.object(
+                ogent,
+                "start_selection_broker",
+                return_value=None,
+            ),
+            mock.patch.object(
+                ogent,
+                "detect_complex_layout",
+                return_value=(False, None),
+            ),
+        ):
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode("utf-8"))
+
+        imported = Path(result["import_source"])
+        self.assertTrue(result["blank_initialized"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(imported.read_bytes(), b"valid-blank-office-package")
+        self.assertEqual(result["document_mode"], "browser_import")
+
+        with mock.patch.object(ogent, "stop_watch", return_value=None):
+            ogent.close_session(session)
+
+    def test_chat_accepts_request_body_larger_than_old_64k_limit(self) -> None:
+        session = self.state.create_session()
+        message = "Large request: " + ("x" * 120_000)
+        captured: list[str] = []
+
+        def handle(
+            _session: Any,
+            text: str,
+            _provider: Any,
+            _model: Any,
+            _effort: Any,
+            _client_id: str | None,
+            fast: bool = False,
+        ) -> tuple[int, dict[str, Any]]:
+            captured.append(text)
+            return 202, {"message": "Run started.", "run_id": "fixture"}
+
+        request = urllib.request.Request(
+            f"http://{ogent.HOST}:{self.port}/chat",
+            data=json.dumps(
+                {
+                    "message": message,
+                    "provider": "codex",
+                    "model": "fixture",
+                    "effort": "automatic",
+                }
+            ).encode("utf-8"),
+            headers={
+                "X-Ogent-Token": self.state.token,
+                "X-Ogent-Session": session.session_id,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        with mock.patch.object(
+            ogent,
+            "handle_chat_message",
+            side_effect=handle,
+        ):
+            with urllib.request.urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(result["message"], "Run started.")
+        self.assertEqual(captured, [message])
 
     def test_safe_upload_filename_blocks_traversal_and_unsupported_types(self) -> None:
         self.assertEqual(

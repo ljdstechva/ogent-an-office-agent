@@ -4,10 +4,10 @@
 
 # Ogent Lite
 
-Ogent Lite 0.10.2 is a featherweight, local document workspace: OfficeCLI keeps a
-live Word, Excel, or PowerPoint preview on the left, while either Codex or
-Claude Code handles plain-language editing requests in the chat pane on the
-right.
+Ogent Lite 1.0.0 is a local-first document-intelligence workspace: OfficeCLI
+keeps a live Word, Excel, or PowerPoint preview on the left, while either Codex
+or Claude Code handles plain-language analysis and verified editing requests
+in the chat pane on the right.
 
 It runs entirely on `127.0.0.1`, uses the selected CLI's existing sign-in, and
 never asks for an OpenAI or Anthropic API key. A DOCX, XLSX, or PPTX opened by
@@ -19,9 +19,27 @@ Composer attachments follow a retained, read-only session lifecycle and never
 become active documents.
 
 For the AI-agent installation sentence and complete human setup, see the
-[repository README](../README.md). Release details and the temporary verified
-OfficeCLI fork dependency are in
-[RELEASE-NOTES-v0.10.2.md](RELEASE-NOTES-v0.10.2.md).
+[repository README](../README.md). The modular boundaries and reviewed
+exceptions are documented in [ARCHITECTURE.md](ARCHITECTURE.md); release
+details are in [RELEASE-NOTES-v1.0.0.md](RELEASE-NOTES-v1.0.0.md).
+
+## What 1.0 adds
+
+- Lossless SQLite-backed turns, paged transcripts, durable run events, and
+  content-addressed large-text assets.
+- Per-workspace actors and revision/generation checks for serialized mutation
+  state without nested request-handler locks.
+- Deterministic OfficeCLI skill loading, real preflight inspection, structured
+  tool receipts, server-owned verification, per-run rollback, change review,
+  and Undo.
+- Revision-aware DOCX, XLSX, PPTX, and searchable-PDF structural indexes with
+  FTS retrieval, graph relationships, coverage ledgers, incremental deltas,
+  and lazy visual evidence.
+- Model-budget-aware whole-document partitions with durable checkpoints,
+  bounded synthesis, honest incomplete-coverage disclosures, and safe resume.
+- A typed React/Vite interface with virtualized transcript and document-map
+  lists, streamed provisional answers, visible plans, context inspection,
+  coverage, responsive states, and accessible dialogs.
 
 ## Start and stop
 
@@ -51,6 +69,11 @@ a CLI, use the compact Refresh button and check again.
 
 - Drag a `.docx`, `.xlsx`, `.pptx`, or `.pdf` anywhere into the running Ogent
   window. The drop area can also be clicked to choose a file.
+- Zero-byte `.docx`, `.xlsx`, and `.pptx` placeholders created by Windows
+  Explorer are initialized automatically as valid blank Office packages. A
+  local placeholder is backed up before initialization; a dropped placeholder
+  becomes an imported copy. Empty PDFs are rejected because they contain no
+  pages.
 - Double-click `ogent.cmd` in this folder.
 - Or double-click the optional **Ogent** desktop shortcut after creating it
   with the instructions in the repository README. You can drag one supported
@@ -60,6 +83,31 @@ a CLI, use the compact Refresh button and check again.
 
 If Ogent is already running, another launch creates a fresh browser workspace
 inside the existing server instead of starting a second backend process.
+
+## Workspace agent command
+
+Run Ogent as a folder-scoped agent workspace from any documents folder:
+
+```powershell
+Set-Location 'C:\path\to\your\documents'
+D:\'14 OfficeCLI'\ogent-lite\ogent.cmd agent      # or: py -3 ogent.py --agent
+```
+
+With the PowerShell profile function installed, plain `ogent` from any folder
+does the same thing (`ogent stop` stops the server; `ogent app` launches the
+plain drop-zone app).
+
+The current directory is treated as the workspace: every `.docx` under it is
+listed recursively (Word `~$` lock files and `.officecli-checkpoints` folders
+are ignored) in an interactive console picker — **Up/Down** moves the
+selection, **typing filters by file name**, **Backspace** edits the filter,
+**Enter** opens, **Esc** cancels. Piped or non-console input falls back to a
+numbered prompt. Ogent then opens the chosen file with the live preview and
+agent chat. `agent <dir>` picks from another folder.
+Startup fails with an exact diagnostic when OfficeCLI, its MCP gateway, or the
+word (DOCX) skill is unavailable. `tools\officecli-agent.cmd` is the same
+command as a PATH-friendly shim (officecli.exe itself is a third-party binary,
+so the agent command ships beside it rather than inside it).
 
 ## Right-click integration
 
@@ -128,6 +176,10 @@ The per-turn icon distinguishes **working**, **completed**, **error**, and
 **stopped**. Agent Activity shows provider/model/effort, preparation and tool
 phases, OfficeCLI call counts, and elapsed time. The gear opens recovery,
 retention, and session-memory settings.
+
+One chat message may contain up to 200,000 characters. Ogent sends the assembled
+provider prompt over standard input, so long requests do not hit Windows'
+command-line length limit.
 
 ## Stable preview and submitted selection links
 
@@ -232,21 +284,36 @@ and starts a new chat for the current document. To restore manually: stop
 Ogent, copy the chosen backup over the original, reopen it, and validate it with
 OfficeCLI. Deletion is best-effort, not forensic erasure.
 
+## Checkpoints beside the document
+
+The **Checkpoints** button in the document toolbar saves and restores
+timestamped copies stored beside the document under
+`.officecli-checkpoints\<document-name>\`. Names are collision-proof
+(`YYYYMMDD-HHMMSS-<source>-<id>`), the list shows time, source, and size,
+and restore always requires confirmation. Restoring first checkpoints the
+current file as `pre-restore`, so every restore is reversible; the restored
+package is OfficeCLI-validated (and rolled back if validation fails) and the
+live preview refreshes automatically. Checkpoint folders are ignored by the
+workspace agent command's document listing.
+
 ## Sessions and automatic cleanup
 
 One Ogent session is one document workspace, not merely one browser tab. The
-workspace owns the stable document identity, transcript, provider-neutral
-memory, retained/pending attachments, submitted/current selections, provider
-continuation IDs, conversation generation, run state, recovery metadata, and
-OfficeCLI watch port from 26320-26380.
+workspace owns the stable document identity, durable transcript and run-event
+history, provider-neutral memory, retained/pending attachments,
+submitted/current selections, conversation generation, run state, recovery
+metadata, and OfficeCLI watch port from 26320-26380.
 
 An empty browser session may bind to its first document. Opening a different
 document creates or focuses that document's workspace and navigates directly
 to it, so the previous transcript is never rendered under the new filename.
-Reopening a document during the same backend lifetime restores only its own
-launch-scoped state. Windows case, separator, dot, relative/absolute, and
-supported path aliases deduplicate; distinct files with the same basename do
-not. Browser imports and PDF working documents follow the same isolation.
+Reopening a document restores only its own workspace state. A crash/restart can
+recover canonical history and mark an interrupted run honestly; a compatible
+whole-document read-only run can resume completed partitions only while its
+document revision still matches. Windows case, separator, dot,
+relative/absolute, and supported path aliases deduplicate; distinct files with
+the same basename do not. Browser imports and PDF working documents follow the
+same isolation.
 Inactive workspaces remain retained while any Ogent browser tab is connected.
 After the last tab disconnects, every inactive workspace begins a fresh
 two-minute reconnect grace period.
@@ -297,7 +364,10 @@ automation process for forced cleanup if that window expires.
 | Direct-edit recovery backups | `%LOCALAPPDATA%\OgentLite\backups\` |
 | Launch-scoped session memory and canonical attachments | `%LOCALAPPDATA%\OgentLite\session-memory\` |
 | Per-run attachment copies | `%LOCALAPPDATA%\OgentLite\temporary-references\` |
+| SQLite state and migrations | `%LOCALAPPDATA%\OgentLite\ogent-state-v1.sqlite3` |
+| Content-addressed turn/index blobs | `%LOCALAPPDATA%\OgentLite\blobs\` |
 | Agent capability cache | `%LOCALAPPDATA%\OgentLite\agent-capabilities-v1.json` |
+| Rotating diagnostic log | `%LOCALAPPDATA%\OgentLite\ogent.log` |
 | Running-server record | `%LOCALAPPDATA%\OgentLite\server.json` |
 
 Recent paths and working documents stay local and are excluded from Git.
@@ -342,6 +412,15 @@ is clicked, it asks the installed CLI directly:
   cannot perform that local model-specific check, Ogent may show only the
   globally CLI-valid choices with an explicit **model-specific support
   unverified** status.
+
+The **Fast** toggle beside the selectors maps a Send to the provider's
+documented low-latency tier, validated against the live catalog: Codex uses
+its `*mini*` model with `minimal`/`low` effort, Claude Code uses its Haiku
+model with `low` effort; when no such model is discovered, the current model
+is kept and only the effort is lowered. Fast also retrieves a smaller document
+context. MCP enforcement, verification, checkpoints, and error reporting are
+identical to normal runs; the model and effort selectors are disabled while
+Fast is on.
 
 Choices can differ by account, organization policy, provider, and CLI version.
 **Automatic — CLI default** omits the effort override. A cached catalog is
@@ -425,8 +504,8 @@ dot in `#14b8a6`.
   100 MB combined, 100 files/500 MB retained per workspace, three concurrent
   uploads, and 25 pages per PDF.
 - One active document and one agent run per document workspace; provider
-  processes are fresh per turn and documents remain isolated. Chat/memory lasts
-  only for the current backend lifetime.
+  processes are fresh per turn, while canonical history remains local and
+  provider-neutral in SQLite.
 - Focused selection supports Excel cells/ranges, Word paragraphs/table cells,
   and PowerPoint shapes. Unsupported or stale paths fail closed.
 - Submitted historical focus is viewer-only. It uses one Ogent-owned gold mark,

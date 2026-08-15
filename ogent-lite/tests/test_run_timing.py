@@ -9,6 +9,7 @@ OGENT_DIR = Path(__file__).resolve().parents[1]
 if str(OGENT_DIR) not in sys.path:
     sys.path.insert(0, str(OGENT_DIR))
 
+from ogent_app.domain.run import ScopeMode  # noqa: E402
 from ogent_run_timing import RunTiming  # noqa: E402
 
 
@@ -44,8 +45,7 @@ class RunTimingTests(unittest.TestCase):
                 "item": {
                     "type": "command_execution",
                     "command": (
-                        'officecli get "C:\\Secret\\Client.docx" '
-                        '"/body/p[1]" --json'
+                        'officecli get "C:\\Secret\\Client.docx" "/body/p[1]" --json'
                     ),
                     "output": "TOP SECRET DOCUMENT TEXT",
                 },
@@ -58,8 +58,7 @@ class RunTimingTests(unittest.TestCase):
                 "item": {
                     "type": "command_execution",
                     "command": (
-                        'officecli get "C:\\Secret\\Client.docx" '
-                        '"/body/p[1]" --json'
+                        'officecli get "C:\\Secret\\Client.docx" "/body/p[1]" --json'
                     ),
                     "output": "TOP SECRET DOCUMENT TEXT",
                 },
@@ -107,6 +106,22 @@ class RunTimingTests(unittest.TestCase):
             focused=True,
         )
         self.assertIn("broad", broad.focused_scope_violation or "")
+
+    def test_whole_document_scope_allows_broad_read_even_with_selection(self) -> None:
+        timing = self.timing()
+        timing.observe_provider_event(
+            "codex",
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "officecli view report.docx text",
+                },
+            },
+            scope_mode=ScopeMode.WHOLE_DOCUMENT,
+        )
+
+        self.assertIsNone(timing.focused_scope_violation)
 
     def test_claude_mcp_calls_are_counted_without_arguments(self) -> None:
         timing = self.timing()

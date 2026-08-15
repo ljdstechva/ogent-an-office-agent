@@ -1,0 +1,35 @@
+{
+  "name": "ogent-lite-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -b --pretty false",
+    "typecheck:python": "pyright --project ../pyrightconfig.json ../ogent_app"
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "3.14.9",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.62.0",
+    "@testing-library/jest-dom": "7.0.0",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
+    "@types/node": "26.1.2",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.4",
+    "jsdom": "29.1.1",
+    "pyright": "^1.1.411",
+    "typescript": "7.0.2",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
+  }
+}

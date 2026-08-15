@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+class CapabilityManager:
+    """Coordinates live provider refresh, lazy effort probes, and validation."""
+
+    def __init__(
+        self,
+        providers: tuple[AgentProviderPort, ...],
+        cache: CapabilityCache,
+        *,
+        on_change: Callable[[], None] | None = None,
+    ) -> None:
+        self.providers = {provider.provider_id: provider for provider in providers}
+        if len(self.providers) != len(providers):
+            raise ValueError("Provider identifiers must be unique.")
+        self.cache = cache
+        self.on_change = on_change
+        self.lock = threading.RLock()
+        self.catalogs: dict[str, ProviderCatalog] = {
+            provider.provider_id: ProviderCatalog(
+                provider_id=provider.provider_id,
+                label=provider.label,
+                installed=False,
+                authenticated=False,
+                cli_path=None,
+                cli_version=None,
+                status="checking",
+                models=(),
+                refreshed_at=None,
+                stale=True,
+                warning=None,
+            )
+            for provider in providers
+        }
+        self.environments: dict[str, ProviderEnvironment] = {}
+        self.refreshing_providers: set[str] = set()
+        self.probing_models: set[tuple[str, str]] = set()
+        self.completed_model_probes: set[tuple[str, str]] = set()
+        self._shutdown = False
+
+    def _notify(self) -> None:
+        callback = self.on_change
+        if callback is not None:
+            try:
+                callback()
+            except Exception as exc:
+                LOGGER.warning(
+                    "Capability change callback failed (%s).",
+                    type(exc).__name__,
+                )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            catalogs = [
+                self.catalogs[provider_id]
+                for provider_id in self.providers
+            ]
+            refreshing = sorted(self.refreshing_providers)
+            probing_keys = set(self.probing_models)
+            probing = [
+                {"provider": provider_id, "model": model_id}
+                for provider_id, model_id in sorted(probing_keys)
+        ]
+        public_providers: list[dict[str, Any]] = []
+        for catalog in catalogs:
+            public = catalog.public_dict()
+            public["live"] = catalog.status == "ready" and not catalog.stale
+            public_providers.append(public)
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "refreshing": bool(refreshing),
+            "refreshingProviders": refreshing,
+            "probing": probing,
+            "providers": public_providers,
+        }
+
+    def get_catalog(self, provider_id: str) -> ProviderCatalog | None:
+        with self.lock:
+            return self.catalogs.get(provider_id)
+
+    def set_catalog_for_testing(self, catalog: ProviderCatalog) -> None:
+        if catalog.provider_id not in self.providers:
+            raise ValueError("Unknown provider.")
+        with self.lock:
+            self.catalogs[catalog.provider_id] = catalog
+
+    def refresh_async(self, provider_id: str | None = None) -> bool:
+        if provider_id is None:
+            provider_ids = tuple(self.providers)
+        else:
+            if provider_id not in self.providers:
+                raise SelectionValidationError("Unknown AI provider.")
+            provider_ids = (provider_id,)
+        started = False
+        for current_id in provider_ids:
+            with self.lock:
+                if self._shutdown or current_id in self.refreshing_providers:
+                    continue
+                self.refreshing_providers.add(current_id)
+                self.completed_model_probes = {
+                    key
+                    for key in self.completed_model_probes
+                    if key[0] != current_id
+                }
+                existing = self.catalogs[current_id]
+                self.catalogs[current_id] = dataclasses.replace(
+                    existing,
+                    status="refreshing",
+                    stale=True,
+                    warning=(
+                        "Using cached information while refreshing."
+                        if existing.models
+                        else existing.warning
+                    ),
+                )
+            thread = threading.Thread(
+                target=self._refresh_worker,
+                args=(current_id,),
+                name=f"ogent-catalog-{current_id}",
+                daemon=True,
+            )
+            thread.start()
+            started = True
+        if started:
+            self._notify()
+        return started
+
+    def refresh_now(self, provider_id: str) -> ProviderCatalog:
+        if provider_id not in self.providers:
+            raise SelectionValidationError("Unknown AI provider.")
+        with self.lock:
+            if self._shutdown:
+                raise RuntimeError("Capability manager is shutting down.")
+            if provider_id in self.refreshing_providers:
+                raise RuntimeError("Provider refresh is already running.")
+            self.refreshing_providers.add(provider_id)
+        self._refresh_worker(provider_id)
+        catalog = self.get_catalog(provider_id)
+        assert catalog is not None
+        return catalog
+
+    def _publish_cached(
+        self,
+        environment: ProviderEnvironment,
+    ) -> ProviderCatalog | None:
+        if not environment.cli_path or not environment.cli_version:
+            return None
+        cached = self.cache.load(
+            environment.provider_id,
+            environment.cli_path,
+            environment.cli_version,
+        )
+        if cached is None:
+            return None
+        status = "refreshing"
+        warning = "Using cached information while refreshing."
+        if not environment.authenticated:
+            status = "auth_required"
+            warning = environment.warning
+        published = dataclasses.replace(
+            cached,
+            installed=environment.installed,
+            authenticated=environment.authenticated,
+            cli_path=environment.cli_path,
+            cli_version=environment.cli_version,
+            status=status,
+            stale=True,
+            warning=warning,
+        )
+        with self.lock:
+            self.catalogs[environment.provider_id] = published
+        self._notify()
+        return published
+
+    def _refresh_worker(self, provider_id: str) -> None:
+        provider = self.providers[provider_id]
+        cached: ProviderCatalog | None = None
+        try:
+            environment = provider.inspect_environment()
+            with self.lock:
+                if self._shutdown:
+                    return
+                self.environments[provider_id] = environment
+            cached = self._publish_cached(environment)
+            if not environment.installed:
+                catalog = ProviderCatalog(
+                    provider_id=provider_id,
+                    label=provider.label,
+                    installed=False,
+                    authenticated=False,
+                    cli_path=None,
+                    cli_version=None,
+                    status="not_installed",
+                    models=(),
+                    refreshed_at=None,
+                    stale=False,
+                    warning=environment.warning,
+                )
+            elif environment.status == "catalog_error":
+                catalog = ProviderCatalog(
+                    provider_id=provider_id,
+                    label=provider.label,
+                    installed=True,
+                    authenticated=False,
+                    cli_path=environment.cli_path,
+                    cli_version=environment.cli_version,
+                    status="catalog_error",
+                    models=cached.models if cached else (),
+                    refreshed_at=cached.refreshed_at if cached else None,
+                    stale=bool(cached),
+                    warning=environment.warning,
+                )
+            elif not environment.authenticated:
+                catalog = ProviderCatalog(
+                    provider_id=provider_id,
+                    label=provider.label,
+                    installed=True,
+                    authenticated=False,
+                    cli_path=environment.cli_path,
+                    cli_version=environment.cli_version,
+                    status="auth_required",
+                    models=cached.models if cached else (),
+                    refreshed_at=cached.refreshed_at if cached else None,
+                    stale=bool(cached),
+                    warning=environment.warning,
+                )
+            else:
+                catalog = provider.discover_catalog(environment)
+                if catalog.provider_id != provider_id:
+                    raise CatalogDiscoveryError(
+                        "The provider returned a mismatched catalog."
+                    )
+                catalog = dataclasses.replace(
+                    catalog,
+                    installed=True,
+                    authenticated=True,
+                    cli_path=environment.cli_path,
+                    cli_version=environment.cli_version,
+                    status="ready",
+                    stale=False,
+                    refreshed_at=utc_now_iso(),
+                )
+                self.cache.store(catalog)
+            with self.lock:
+                if not self._shutdown:
+                    self.catalogs[provider_id] = catalog
+        except CatalogDiscoveryError as exc:
+            if cached is not None:
+                catalog = dataclasses.replace(
+                    cached,
+                    status=exc.status,
+                    stale=True,
+                    warning=str(exc),
+                )
+            else:
+                environment = self.environments.get(provider_id)
+                catalog = ProviderCatalog(
+                    provider_id=provider_id,
+                    label=provider.label,
+                    installed=bool(environment and environment.installed),
+                    authenticated=bool(
+                        environment and environment.authenticated
+                    ),
+                    cli_path=environment.cli_path if environment else None,
+                    cli_version=(
+                        environment.cli_version if environment else None
+                    ),
+                    status=exc.status,
+                    models=(),
+                    refreshed_at=None,
+                    stale=False,
+                    warning=str(exc),
+                )
+            with self.lock:
+                if not self._shutdown:
+                    self.catalogs[provider_id] = catalog
+        except Exception as exc:
+            warning = (
+                "This CLI version does not expose a compatible catalog. "
+                f"{str(exc).strip()}"
+            ).strip()
+            if cached is not None:
+                catalog = dataclasses.replace(
+                    cached,
+                    status="catalog_error",
+                    stale=True,
+                    warning=warning,
+                )
+            else:
+                environment = self.environments.get(provider_id)
+                catalog = ProviderCatalog(
+                    provider_id=provider_id,
+                    label=provider.label,
+                    installed=bool(environment and environment.installed),
+                    authenticated=bool(
+                        environment and environment.authenticated
+                    ),
+                    cli_path=environment.cli_path if environment else None,
+                    cli_version=(
+                        environment.cli_version if environment else None
+                    ),
+                    status="catalog_error",
+                    models=(),
+                    refreshed_at=None,
+                    stale=False,
+                    warning=warning,
+                )
+            with self.lock:
+                if not self._shutdown:
+                    self.catalogs[provider_id] = catalog
+        finally:
+            with self.lock:
+                self.refreshing_providers.discard(provider_id)
+            self._notify()
+
+    def ensure_model_efforts_async(
+        self,
+        provider_id: str,
+        model_id: str,
+    ) -> bool:
+        provider = self.providers.get(provider_id)
+        if provider is None:
+            raise SelectionValidationError("Unknown AI provider.")
+        if not provider.supports_model_effort_verification:
+            return False
+        key = (provider_id, model_id)
+        with self.lock:
+            catalog = self.catalogs[provider_id]
+            if (
+                self._shutdown
+                or catalog.status != "ready"
+                or catalog.stale
+                or model_id not in {model.id for model in catalog.models}
+                or key in self.probing_models
+                or key in self.completed_model_probes
+            ):
+                return False
+            model = next(item for item in catalog.models if item.id == model_id)
+            if model.efforts:
+                return False
+            environment = self.environments.get(provider_id)
+            if environment is None:
+                return False
+            self.probing_models.add(key)
+        thread = threading.Thread(
+            target=self._probe_worker,
+            args=(provider, environment, model_id),
+            name=f"ogent-efforts-{provider_id}",
+            daemon=True,
+        )
+        thread.start()
+        self._notify()
+        return True
+
+    def _probe_worker(
+        self,
+        provider: AgentProviderPort,
+        environment: ProviderEnvironment,
+        model_id: str,
+    ) -> None:
+        key = (provider.provider_id, model_id)
+        try:
+            result = provider.verify_model_efforts(environment, model_id)
+            with self.lock:
+                if self._shutdown:
+                    return
+                current_environment = self.environments.get(provider.provider_id)
+                catalog = self.catalogs[provider.provider_id]
+                if (
+                    current_environment is None
+                    or current_environment.cli_path != environment.cli_path
+                    or current_environment.cli_version
+                    != environment.cli_version
+                    or catalog.status != "ready"
+                    or catalog.stale
+                ):
+                    return
+                models: list[ModelCapability] = []
+                found = False
+                for model in catalog.models:
+                    if model.id != model_id:
+                        models.append(model)
+                        continue
+                    found = True
+                    default_effort = result.default_effort
+                    if default_effort not in result.efforts:
+                        default_effort = None
+                    models.append(
+                        dataclasses.replace(
+                            model,
+                            efforts=tuple(result.efforts),
+                            default_effort=default_effort,
+                            efforts_verified=not result.use_global_unverified,
+                        )
+                    )
+                if not found:
+                    return
+                warning = result.warning
+                if not result.efforts and not warning:
+                    warning = (
+                        "No model-specific effort control; using CLI default."
+                    )
+                updated = dataclasses.replace(
+                    catalog,
+                    models=tuple(models),
+                    warning=warning,
+                    refreshed_at=utc_now_iso(),
+                )
+                self.catalogs[provider.provider_id] = updated
+            self.cache.store(updated)
+        except Exception as exc:
+            with self.lock:
+                catalog = self.catalogs.get(provider.provider_id)
+                if catalog is not None and catalog.status == "ready":
+                    self.catalogs[provider.provider_id] = dataclasses.replace(
+                        catalog,
+                        warning=(
+                            "No model-specific effort control; using CLI "
+                            f"default. {str(exc).strip()}"
+                        ).strip(),
+                    )
+        finally:
+            with self.lock:
+                self.probing_models.discard(key)
+                self.completed_model_probes.add(key)
+            self._notify()
+
+    def validate_selection(
+        self,
+        provider_id: Any,
+        model_id: Any,
+        effort: Any,
+    ) -> AgentSelection:
+        selected_provider = str(provider_id or "").strip()
+        selected_model = str(model_id or "").strip()
+        selected_effort = str(effort or "").strip()
+        with self.lock:
+            catalog = self.catalogs.get(selected_provider)
+        if catalog is None:
+            raise SelectionValidationError("Unknown AI provider.")
+        if not catalog.installed:
+            if selected_provider == "codex":
+                raise SelectionValidationError("Codex CLI is not installed.")
+            if selected_provider == "claude":
+                raise SelectionValidationError("Claude Code is not installed.")
+            raise SelectionValidationError("The selected provider is not installed.")
+        if not catalog.authenticated:
+            if selected_provider == "codex":
+                raise SelectionValidationError(
+                    "Sign in with `codex login`, then refresh."
+                )
+            if selected_provider == "claude":
+                raise SelectionValidationError(
+                    "Sign in with `claude auth login`, then refresh."
+                )
+            raise SelectionValidationError(
+                "Sign in through the selected CLI, then refresh."
+            )
+        if catalog.status != "ready" or catalog.stale:
+            raise SelectionValidationError(
+                "This provider does not have a usable live model catalog. "
+                "Refresh and try again."
+            )
+        model = next(
+            (item for item in catalog.models if item.id == selected_model),
+            None,
+        )
+        if model is None:
+            raise SelectionValidationError(
+                "The selected model is no longer reported by this CLI. "
+                "Refresh and choose again."
+            )
+        if selected_effort != AUTOMATIC_EFFORT and selected_effort not in model.efforts:
+            raise SelectionValidationError(
+                "The selected effort is not available for this model. "
+                "Refresh and choose again."
+            )
+        return AgentSelection(
+            provider_id=selected_provider,
+            model=selected_model,
+            effort=selected_effort,
+        )
+
+    def resolve_fast_selection(
+        self,
+        provider_id: Any,
+        fallback_model: Any = None,
+        fallback_effort: Any = None,
+    ) -> AgentSelection:
+        """Map Fast mode to the provider's documented low-latency settings.
+
+        Documented mappings (validated against the live discovered catalog,
+        never invented): Codex CLI's low-latency tier is its "mini" model
+        family with "minimal"/"low" reasoning effort; Claude Code's is the
+        Haiku model family with "low" effort. When the discovered catalog has
+        no such model, the current selection (or first discovered model) is
+        kept and only the effort is lowered.
+        """
+        selected_provider = str(provider_id or "").strip()
+        with self.lock:
+            catalog = self.catalogs.get(selected_provider)
+        if catalog is None:
+            raise SelectionValidationError("Unknown AI provider.")
+        markers = FAST_MODEL_MARKERS.get(selected_provider, ())
+        model = next(
+            (
+                item
+                for item in catalog.models
+                if any(marker in item.id.casefold() for marker in markers)
+            ),
+            None,
+        )
+        if model is None:
+            fallback_id = str(fallback_model or "").strip()
+            model = next(
+                (item for item in catalog.models if item.id == fallback_id),
+                None,
+            ) or (catalog.models[0] if catalog.models else None)
+        if model is None:
+            raise SelectionValidationError(
+                "This provider does not report any live model. Refresh and try again."
+            )
+        effort = next(
+            (
+                candidate
+                for candidate in FAST_EFFORT_PREFERENCE.get(selected_provider, ())
+                if candidate in model.efforts
+            ),
+            None,
+        )
+        if effort is None:
+            fallback_choice = str(fallback_effort or "").strip()
+            if fallback_choice and fallback_choice in model.efforts:
+                effort = fallback_choice
+            else:
+                effort = model.default_effort or AUTOMATIC_EFFORT
+        return self.validate_selection(selected_provider, model.id, effort)
+
+    def shutdown(self) -> None:
+        with self.lock:
+            self._shutdown = True
+            providers = tuple(self.providers.values())
+        for provider in providers:
+            try:
+                provider.cancel_discovery()
+            except Exception as exc:
+                LOGGER.warning(
+                    "Provider discovery cancellation failed (%s).",
+                    type(exc).__name__,
+                )
+
+
+def provider_label(provider_id: str) -> str:
+    labels = {
+        "codex": "Codex",
+        "claude": "Claude Code",
+    }
+    return labels.get(provider_id, provider_id)
+
+
+def resolve_codex_command() -> list[str]:
+    """Resolve the shell-free Codex launch array for legacy Ogent callers."""
+
+    from ogent_agent_providers import resolve_codex_cli
+
+    resolution = resolve_codex_cli()
+    if resolution is None:
+        raise AgentCatalogError(
+            "Codex CLI is not installed.",
+            code="not_installed",
+        )
+    return list(resolution.command)
+
+
+class AgentCatalogManager:
+    """Compatibility facade used by the Ogent application entry point."""
+
+    def __init__(self, cache_path: Path) -> None:
+        from ogent_agent_providers import build_default_providers
+
+        self._manager = CapabilityManager(
+            build_default_providers(),
+            CapabilityCache(cache_path),
+        )
+
+    @property
+    def providers(self) -> dict[str, AgentProviderPort]:
+        return self._manager.providers
+
+    def public_snapshot(self) -> dict[str, Any]:
+        snapshot = self._manager.snapshot()
+        for provider in snapshot["providers"]:
+            provider["live"] = (
+                provider["status"] == "ready" and not provider["stale"]
+            )
+        return snapshot
+
+    @staticmethod
+    def _selection_error_code(message: str) -> str:
+        lowered = message.casefold()
+        if "unknown ai provider" in lowered:
+            return "unknown_provider"
+        if "not installed" in lowered:
+            return "not_installed"
+        if "sign in" in lowered:
+            return "auth_required"
+        if "model is no longer" in lowered:
+            return "unsupported_model"
+        if "selected effort" in lowered:
+            return "unsupported_effort"
+        if "usable live model catalog" in lowered:
+            return "not_checked"
+        return "catalog_error"
+
+    def validate_selection(
+        self,
+        provider_id: Any,
+        model_id: Any,
+        effort: Any,
+    ) -> AgentSelection:
+        try:
+            return self._manager.validate_selection(
+                provider_id,
+                model_id,
+                effort,
+            )
+        except SelectionValidationError as exc:
+            raise AgentCatalogError(
+                str(exc),
+                code=self._selection_error_code(str(exc)),
+            ) from exc
+
+    def refresh_async(self, provider_id: str | None = None) -> bool:
+        try:
+            return self._manager.refresh_async(provider_id)
+        except SelectionValidationError as exc:
+            raise AgentCatalogError(
+                str(exc),
+                code="unknown_provider",
+            ) from exc
+
+    def verify_efforts(self, provider_id: str, model_id: str) -> bool:
+        if provider_id != "claude":
+            raise AgentCatalogError(
+                "Model-specific effort verification is unavailable for this provider.",
+                code="unsupported_provider",
+            )
+        catalog = self._manager.get_catalog(provider_id)
+        if catalog is None or catalog.status != "ready" or catalog.stale:
+            raise AgentCatalogError(
+                "Claude Code does not have a usable live model catalog.",
+                code="not_checked",
+            )
+        if model_id not in {model.id for model in catalog.models}:
+            raise AgentCatalogError(
+                "The selected model is no longer reported by this CLI. "
+                "Refresh and choose again.",
+                code="unsupported_model",
+            )
+        return self._manager.ensure_model_efforts_async(provider_id, model_id)
+
+    def shutdown(self) -> None:
+        self._manager.shutdown()

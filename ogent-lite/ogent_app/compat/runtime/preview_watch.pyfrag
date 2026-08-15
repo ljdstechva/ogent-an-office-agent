@@ -1,0 +1,603 @@
+def _cleanup_watch_resources(
+    document: Path | None,
+    process: subprocess.Popen[str] | None,
+    port: int | None,
+) -> None:
+    if process and process.poll() is None:
+        terminate_process_tree(process)
+    if document:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            run_quiet(
+                ["officecli", "unwatch", str(document)],
+                cwd=document.parent,
+                timeout=12,
+            )
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            run_quiet(
+                ["officecli", "close", str(document)],
+                cwd=document.parent,
+                timeout=12,
+            )
+    wait_for_port_closed(port)
+
+
+def retire_watch(
+    session: SessionState,
+    document: Path | None,
+    process: subprocess.Popen[str] | None,
+    port: int | None,
+) -> None:
+    if process is None and document is None and port is None:
+        return
+    retired = (document, process, port)
+    with session.lock:
+        session.retired_watches.append(retired)
+
+    def cleanup_retired() -> None:
+        try:
+            _cleanup_watch_resources(document, process, port)
+        finally:
+            with session.lock:
+                with contextlib.suppress(ValueError):
+                    session.retired_watches.remove(retired)
+
+    threading.Thread(
+        target=cleanup_retired,
+        name=f"ogent-watch-retire-{session.session_id}",
+        daemon=True,
+    ).start()
+
+
+def stop_watch(
+    session: SessionState,
+    *,
+    clear_document: bool = False,
+    release_port: bool = False,
+) -> None:
+    with session.watch_lock:
+        with session.lock:
+            selection_broker = session.selection_broker
+            session.selection_broker = None
+        if selection_broker is not None:
+            selection_broker.stop()
+        with session.lock:
+            document = session.active_doc
+            process = session.watch_process
+            port = session.watch_port
+            retired_watches = list(session.retired_watches)
+            session.retired_watches.clear()
+            session.watch_process = None
+        if clear_document:
+            STATE.clear_document(session)
+
+        _cleanup_watch_resources(document, process, port)
+        for retired_document, retired_process, retired_port in retired_watches:
+            _cleanup_watch_resources(
+                retired_document,
+                retired_process,
+                retired_port,
+            )
+        if release_port:
+            STATE.release_watch_port(session, port)
+        if process or port:
+            session.emit("watch", {"status": "stopped", "port": port})
+        if clear_document and not session.closed:
+            session.emit(
+                "snapshot",
+                STATE.snapshot_for(session, include_watch_probe=False),
+            )
+    STATE.broadcast_sessions()
+
+
+def _resolve_preview_nodes(
+    session: SessionState,
+    paths: list[str],
+    *,
+    expected_document: Path,
+    expected_revision: int,
+) -> list[dict[str, Any]]:
+    """Resolve only the selected OfficeCLI paths; never read the whole document."""
+    resolved: list[dict[str, Any]] = []
+    for path in paths:
+        with session.lock:
+            if (
+                session.closed
+                or session.active_doc is None
+                or session.active_doc.resolve() != expected_document.resolve()
+                or session.document_revision != expected_revision
+            ):
+                raise PreviewSelectionError(
+                    "The document changed while selection context was resolved."
+                )
+        try:
+            result = run_quiet(
+                [
+                    "officecli",
+                    "get",
+                    str(expected_document),
+                    path,
+                    "--json",
+                ],
+                cwd=expected_document.parent,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PreviewSelectionError(
+                "OfficeCLI could not resolve the selected target."
+            ) from exc
+        if result.returncode != 0:
+            raise PreviewSelectionError(
+                "The selected Office element no longer exists."
+            )
+        try:
+            payload = json.loads(result.stdout)
+            results = payload["data"]["results"]
+            node = results[0]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise PreviewSelectionError(
+                "OfficeCLI returned invalid selected-target metadata."
+            ) from exc
+        if not isinstance(node, dict) or len(results) != 1:
+            raise PreviewSelectionError(
+                "The selected OfficeCLI path did not resolve to one target."
+            )
+        # Range nodes expose their bounded values as children. Build the
+        # excerpt server-side without trusting any watch-page label or HTML.
+        if not node.get("text") and isinstance(node.get("children"), list):
+            child_text = " | ".join(
+                str(child.get("text") or child.get("preview") or "")
+                for child in node["children"][:40]
+                if isinstance(child, dict)
+            )
+            node = {**node, "text": child_text}
+        resolved.append(node)
+    return resolved
+
+
+def emit_preview_selection(
+    session: SessionState,
+    *,
+    expected_generation: int | None = None,
+) -> None:
+    if not session.closed:
+        session.emit(
+            "preview_selection",
+            preview_selection_public(session),
+            expected_generation=expected_generation,
+        )
+
+
+def preview_selection_public(session: SessionState) -> dict[str, Any]:
+    value = session.preview_selection.public_state()
+    with session.lock:
+        value["multi_select_mode"] = session.selection_multi_mode
+    return value
+
+
+def post_session_watch_selection(
+    session: SessionState,
+    port: int,
+    paths: list[str],
+) -> None:
+    """Update the watch while preventing its SSE echo from becoming a click."""
+    with session.lock:
+        broker = session.selection_broker
+    if broker is not None and broker.port == port:
+        broker.post_selection(paths)
+        return
+    post_watch_selection(port, paths)
+
+
+def advance_document_revision(
+    session: SessionState,
+    document: Path,
+    package_fingerprint: str,
+    *,
+    watch_event_fingerprint: str | None = None,
+) -> tuple[int, bool]:
+    """Advance once per watch event, or once for an unobserved package change."""
+    with session.lock:
+        if (
+            session.closed
+            or session.active_doc is None
+            or session.active_doc.resolve() != document.resolve()
+        ):
+            raise PreviewSyncError(
+                "The preview mutation belongs to a stale document."
+            )
+        advanced = (
+            session.document_package_sha256 != package_fingerprint
+        )
+        if watch_event_fingerprint is not None:
+            session.document_watch_event_fingerprint = (
+                watch_event_fingerprint
+            )
+        session.document_package_sha256 = package_fingerprint
+        if not advanced:
+            return session.document_revision, False
+        invalidate_word_snapshot_locked(session)
+        source = session.active_source
+        mode = session.document_mode
+
+    if DOCUMENT_INTELLIGENCE is not None:
+        try:
+            _observed, indexed_advanced = observe_session_document_index(
+                session,
+                document,
+                source_path=source,
+                mode=mode,
+                package_fingerprint=package_fingerprint,
+            )
+            with session.lock:
+                return session.document_revision, indexed_advanced
+        except Exception as index_error:
+            record_document_index_failure(
+                session,
+                index_error,
+                role="active",
+            )
+            session.add_activity(
+                "index",
+                "The changed document could not be reindexed "
+                f"({type(index_error).__name__}).",
+            )
+
+    with session.lock:
+        session.document_revision += 1
+        if session.memory is not None:
+            state = dict(session.memory.active_document)
+            state["revision"] = session.document_revision
+            session.memory.set_active_document(**state)
+        return session.document_revision, True
+
+
+def start_selection_broker(
+    session: SessionState,
+    *,
+    invalidate_existing: bool = False,
+) -> None:
+    with session.lock:
+        port = session.watch_port
+        document = session.active_doc
+        document_id = session.document_id
+        previous = session.selection_broker
+        session.selection_broker = None
+    if previous is not None:
+        previous.stop()
+    if port is None or document is None or not document_id:
+        return
+    if invalidate_existing:
+        session.preview_selection.restart_watch()
+        emit_preview_selection(session)
+    expected_watch_id = session.preview_selection.watch_id
+
+    def on_selection(paths: list[str]) -> None:
+        try:
+            with session.lock:
+                current_revision = session.document_revision
+                multi_mode = session.selection_multi_mode
+            if multi_mode and len(paths) == 1:
+                with session.preview_selection.lock:
+                    existing_paths = [
+                        item.path for item in session.preview_selection.targets
+                    ]
+                clicked = paths[0]
+                merged_paths = (
+                    [
+                        item
+                        for item in existing_paths
+                        if item != clicked
+                    ]
+                    if clicked in existing_paths
+                    else [*existing_paths, clicked]
+                )
+                if merged_paths != paths:
+                    post_session_watch_selection(session, port, merged_paths)
+                paths = merged_paths
+            targets = session.preview_selection.apply_paths(
+                paths,
+                lambda selected: _resolve_preview_nodes(
+                    session,
+                    selected,
+                    expected_document=document,
+                    expected_revision=current_revision,
+                ),
+                expected_watch_id=expected_watch_id,
+                expected_document_id=document_id,
+                expected_revision=current_revision,
+            )
+            accepted_paths = [item.path for item in targets]
+            if accepted_paths != paths:
+                post_session_watch_selection(session, port, accepted_paths)
+            session.add_activity(
+                "selection",
+                f"Selected {len(targets)} focused preview target(s).",
+            )
+            emit_preview_selection(session)
+        except PreviewSelectionError as exc:
+            session.add_activity("selection", str(exc))
+
+    def on_document_event(event: dict[str, Any]) -> None:
+        watch_fingerprint = event_fingerprint(event)
+        try:
+            fingerprint = package_sha256(document)
+        except OSError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview revision observation failed: {exc}",
+            )
+            return
+        with session.lock:
+            if (
+                session.active_doc is None
+                or session.active_doc.resolve() != document.resolve()
+                or session.closed
+            ):
+                return
+            document_id = session.document_id
+            watch_generation = session.watch_generation
+        try:
+            new_revision, advanced = advance_document_revision(
+                session,
+                document,
+                fingerprint,
+                watch_event_fingerprint=watch_fingerprint,
+            )
+            mutation = session.preview_sync.observe_mutation(
+                event,
+                document_id=document_id,
+                watch_generation=watch_generation,
+                package_sha256=fingerprint,
+            )
+            if mutation is not None:
+                session.add_activity(
+                    "preview",
+                    (
+                        f"Watch version {mutation.version} observed for "
+                        f"document revision {new_revision}."
+                    ),
+                )
+        except PreviewSyncError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview revision observation failed: {exc}",
+            )
+            return
+        session.preview_selection.advance_revision(new_revision)
+        emit_preview_selection(session)
+        if advanced:
+            session.emit(
+                "document_revision",
+                {"revision": new_revision},
+            )
+
+    broker = OfficeCLISelectionBroker(
+        port,
+        on_selection=on_selection,
+        on_document_event=on_document_event,
+        on_error=lambda detail: session.add_activity("selection", detail),
+    )
+    with session.lock:
+        if session.closed or session.watch_port != port:
+            return
+        session.selection_broker = broker
+    broker.start()
+
+
+def _watch_output_reader(
+    session: SessionState,
+    process: subprocess.Popen[str],
+    ready_queue: queue.Queue[tuple[str, str]],
+    port: int,
+) -> None:
+    assert process.stdout is not None
+    for raw in iter(process.stdout.readline, ""):
+        line = raw.rstrip()
+        if not line:
+            continue
+        with session.lock:
+            session.watch_tail.append(line)
+        session.add_activity("watch", line)
+        ready_queue.put(("line", line))
+        if "http://" in line or "https://" in line or "watching" in line.casefold():
+            ready_queue.put(("ready", line))
+    code = process.wait()
+    ready_queue.put(("exit", str(code)))
+    with session.lock:
+        is_current = session.watch_process is process
+        if is_current:
+            session.watch_process = None
+        closed = session.closed
+    if is_current and not STATE.shutdown_requested and not closed:
+        session.emit("watch", {"status": "dead", "exit_code": code, "port": port})
+        STATE.broadcast_sessions()
+
+
+def start_watch(session: SessionState, document: Path) -> None:
+    with session.watch_lock:
+        if not document.exists():
+            raise UserFacingError(f"The working document no longer exists: {document}", 404)
+        ensure_officecli_compatible()
+
+        with session.lock:
+            previous_document = session.active_doc
+            previous_process = session.watch_process
+            previous_port = session.watch_port
+        same_document = (
+            previous_document is not None
+            and previous_document.resolve() == document.resolve()
+        )
+        if (
+            same_document
+            and previous_process is not None
+            and previous_process.poll() is None
+        ):
+            stop_watch(session, clear_document=False, release_port=False)
+            previous_process = None
+            previous_port = None
+        retired_document = None if same_document else previous_document
+        replacing = previous_process is not None or previous_port is not None
+        port = STATE.allocate_watch_port(session, replace=replacing)
+        if not port_available(port):
+            STATE.release_watch_port(session, port)
+            port = STATE.allocate_watch_port(session, replace=True)
+
+        ready_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        process = subprocess.Popen(
+            ["officecli", "watch", str(document), "--port", str(port)],
+            cwd=str(document.parent),
+            env=command_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
+        )
+        with session.lock:
+            if session.closed:
+                terminate_process_tree(process)
+                raise UserFacingError("This Ogent session has closed.", 410)
+            session.watch_process = process
+            session.watch_tail.clear()
+
+        def restore_previous_watch() -> None:
+            previous_alive = (
+                previous_process is not None
+                and previous_process.poll() is None
+            )
+            with session.lock:
+                if session.closed:
+                    return
+                if (
+                    session.watch_process is process
+                    or session.watch_process is None
+                ):
+                    session.watch_process = (
+                        previous_process if previous_alive else None
+                    )
+                    session.watch_port = (
+                        previous_port if previous_alive else None
+                    )
+
+        reader = threading.Thread(
+            target=_watch_output_reader,
+            args=(session, process, ready_queue, port),
+            name=f"ogent-watch-{session.session_id}",
+            daemon=True,
+        )
+        reader.start()
+
+        def publish_watch_ready() -> None:
+            generation = uuid.uuid4().hex
+            with session.lock:
+                if session.watch_process is not process or session.closed:
+                    raise UserFacingError(
+                        "The OfficeCLI watch changed before it became ready.",
+                        409,
+                    )
+                session.watch_generation = generation
+                session.historical_focus.marks = ()
+                session.historical_focus.selection_id = None
+                active_document_matches = (
+                    session.active_doc is not None
+                    and session.active_doc.resolve() == document.resolve()
+                )
+                document_id = session.document_id
+            if active_document_matches and document_id:
+                session.preview_sync.activate_watch(document_id, generation)
+            session.emit(
+                "watch",
+                {
+                    "status": "ready",
+                    "port": port,
+                    "document": str(document),
+                    "watch_generation": generation,
+                    "watch_url": stable_watch_url(port, generation),
+                    "preview_identity": (
+                        preview_identity_public(session)
+                        if active_document_matches
+                        else None
+                    ),
+                },
+            )
+            STATE.broadcast_sessions()
+
+        deadline = time.monotonic() + 18
+        last_line = ""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                kind, value = ready_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            last_line = value or last_line
+            if kind == "exit":
+                terminate_process_tree(process)
+                restore_previous_watch()
+                if "port" in last_line.casefold() and "use" in last_line.casefold():
+                    raise UserFacingError(
+                        f"Preview port {port} was claimed by another process. Try again.",
+                        409,
+                    )
+                raise UserFacingError(
+                    f"OfficeCLI watch exited before it became ready (exit {value}). "
+                    f"{last_line}",
+                    500,
+                )
+            if kind == "ready":
+                retire_watch(
+                    session,
+                    retired_document,
+                    previous_process,
+                    previous_port,
+                )
+                publish_watch_ready()
+                if same_document:
+                    start_selection_broker(
+                        session,
+                        invalidate_existing=True,
+                    )
+                return
+
+        if watch_http_alive(port):
+            retire_watch(
+                session,
+                retired_document,
+                previous_process,
+                previous_port,
+            )
+            publish_watch_ready()
+            if same_document:
+                start_selection_broker(
+                    session,
+                    invalidate_existing=True,
+                )
+            return
+        terminate_process_tree(process)
+        restore_previous_watch()
+        raise UserFacingError(f"OfficeCLI watch did not become ready. {last_line}", 504)
+
+
+def ensure_watch(session: SessionState) -> None:
+    with session.watch_lock:
+        with session.lock:
+            document = session.active_doc
+            port = session.watch_port
+        if not document:
+            raise UserFacingError("Open an Office document first.", 409)
+        if not document.exists():
+            stop_watch(session, clear_document=True, release_port=True)
+            raise UserFacingError(
+                "The active working file was moved or deleted. Paste its new path and open it again.",
+                404,
+            )
+        if watch_http_alive(port):
+            return
+        session.emit("watch", {"status": "restarting", "port": port})
+        start_watch(session, document)
+
+

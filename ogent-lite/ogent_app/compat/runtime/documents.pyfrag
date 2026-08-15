@@ -1,0 +1,829 @@
+def make_working_copy(session: SessionState, source: Path) -> Path:
+    session_root = WORK_ROOT / session.session_id
+    session_root.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    digest = hashlib.sha256(str(source).casefold().encode("utf-8")).hexdigest()[:8]
+    nonce = uuid.uuid4().hex[:6]
+    filename = (
+        f"{safe_name(source.stem)}-ogent-{stamp}-{digest}-{nonce}"
+        f"{source.suffix.lower()}"
+    )
+    destination = session_root / filename
+    shutil.copy2(source, destination)
+    return destination
+
+
+def normalize_existing_path(raw_path: str) -> Path:
+    try:
+        return WORKSPACE_PATH_POLICY.normalize_existing_file(raw_path)
+    except PathPolicyError as exc:
+        raise UserFacingError(str(exc), exc.status) from exc
+
+
+def detect_complex_layout(document: Path) -> tuple[bool, str | None]:
+    if document.suffix.lower() != ".docx":
+        return False, None
+    try:
+        depth_result = run_quiet(
+            ["officecli", "get", str(document), "/body", "--depth", "1"],
+            cwd=document.parent,
+            timeout=45,
+        )
+        depth_text = f"{depth_result.stdout}\n{depth_result.stderr}".casefold()
+        markers = ("[textbox]", "[shape]", "[drawing]", "(textbox)", "(shape)", "(drawing)")
+        if depth_result.returncode == 0 and any(marker in depth_text for marker in markers):
+            return True, "Floating textboxes, shapes, or anchored drawings were detected."
+
+        # OfficeCLI 1.0.141 does not surface nested fallback shapes in a depth-1
+        # body listing, so use its structured query as an honest fallback.
+        query_result = run_quiet(
+            [
+                "officecli",
+                "query",
+                str(document),
+                "textbox, shape, drawing",
+                "--compact",
+            ],
+            cwd=document.parent,
+            timeout=45,
+        )
+        query_text = f"{query_result.stdout}\n{query_result.stderr}"
+        matches = re.findall(r"\[(textbox|shape|drawing)\]", query_text, re.IGNORECASE)
+        if query_result.returncode != 0:
+            return True, "Layout inspection was inconclusive; Word view is recommended."
+        if matches:
+            counts = collections.Counter(item.casefold() for item in matches)
+            plural = {"textbox": "textboxes", "shape": "shapes", "drawing": "drawings"}
+            detail = ", ".join(
+                f"{counts[name]} {name if counts[name] == 1 else plural[name]}"
+                for name in ("textbox", "shape", "drawing")
+                if counts[name]
+            )
+            return True, f"Detected {detail}."
+        return False, None
+    except (OSError, subprocess.TimeoutExpired):
+        return True, "Layout inspection was inconclusive; Word view is recommended."
+
+
+def open_document(
+    session: SessionState,
+    raw_path: str,
+    *,
+    make_copy: bool = True,
+    state_source: Path | None = None,
+    preserve_transcript: bool = False,
+    remember_source: bool = True,
+    announce: bool = False,
+    reset_run: bool = True,
+    document_mode: str | None = None,
+) -> dict[str, Any]:
+    source = normalize_existing_path(raw_path)
+    extension = source.suffix.lower()
+    if extension == ".pdf":
+        raise UserFacingError(
+            "PDFs open via the pipeline. Ask me in chat to edit one and I will produce a working DOCX.",
+            415,
+        )
+    if extension not in SUPPORTED_OFFICE:
+        raise UserFacingError("Supported document types are .docx, .xlsx, and .pptx.", 415)
+    source_was_empty = source.stat().st_size == 0
+
+    # The make_copy argument remains for compatibility with v0.9 callers, but
+    # v0.10 chooses an explicit trust boundary. Local paths are edited directly
+    # only after a verified recovery backup. Browser imports and PDF-derived
+    # DOCX files are already Ogent-owned copies and never claim direct editing.
+    del make_copy
+    if document_mode is None:
+        if path_is_within(source, IMPORT_ROOT / session.session_id):
+            document_mode = "browser_import"
+        elif (
+            state_source is not None
+            and state_source.suffix.casefold() == ".pdf"
+            and path_is_within(source, WORK_ROOT / session.session_id)
+        ):
+            document_mode = "pdf_conversion"
+        else:
+            document_mode = "local_direct"
+    if document_mode not in {
+        "local_direct",
+        "browser_import",
+        "pdf_conversion",
+    }:
+        raise UserFacingError("Invalid Ogent document-open mode.", 500)
+    if document_mode == "browser_import" and not path_is_within(
+        source,
+        IMPORT_ROOT / session.session_id,
+    ):
+        raise UserFacingError(
+            "The browser upload is not inside this Ogent session's import store.",
+            500,
+        )
+    if document_mode == "pdf_conversion" and not path_is_within(
+        source,
+        WORK_ROOT / session.session_id,
+    ):
+        raise UserFacingError(
+            "The PDF-derived working document escaped its Ogent workspace.",
+            500,
+        )
+
+    working = source
+    recovery_backup: BackupRecord | None = None
+    blank_initialized = False
+    if document_mode == "local_direct":
+        try:
+            initialize_owned_stores()
+            recovery_backup = BACKUP_STORE.create_backup(source)
+        except (BackupError, OSError) as exc:
+            raise UserFacingError(
+                f"Direct editing was not started because a verified recovery "
+                f"backup could not be created. {exc}",
+                409,
+            ) from exc
+
+    with session.lock:
+        previous_document = session.active_doc
+        previous_source = session.active_source
+        previous_complex_layout = session.complex_layout
+        previous_complex_detail = session.complex_layout_detail
+    try:
+        if source_was_empty and document_mode in {
+            "local_direct",
+            "browser_import",
+        }:
+            initialize_blank_office_document(working)
+            blank_initialized = True
+        if extension == ".docx":
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                layout_future = executor.submit(detect_complex_layout, working)
+                start_watch(session, working)
+                complex_layout, complex_detail = layout_future.result()
+        else:
+            start_watch(session, working)
+            complex_layout, complex_detail = False, None
+        protected_source = state_source.resolve() if state_source else source
+        STATE.commit_document(
+            session,
+            protected_source,
+            working,
+            preserve_transcript=preserve_transcript,
+            reset_run=reset_run,
+            complex_layout=complex_layout,
+            complex_layout_detail=complex_detail,
+            document_mode=document_mode,
+            recovery_backup=recovery_backup,
+        )
+        try:
+            observe_session_document_index(
+                session,
+                working,
+                source_path=protected_source,
+                mode=document_mode,
+                package_fingerprint=package_sha256(working),
+            )
+        except Exception as index_error:
+            record_document_index_failure(
+                session,
+                index_error,
+                role="active",
+            )
+            session.add_activity(
+                "index",
+                "Document indexing could not start; the open document "
+                f"remains available ({type(index_error).__name__}).",
+            )
+    except Exception as open_error:
+        stop_watch(session, clear_document=False, release_port=previous_document is None)
+        restore_error: Exception | None = None
+        if (
+            blank_initialized
+            and document_mode == "local_direct"
+            and recovery_backup is not None
+        ):
+            try:
+                BACKUP_STORE.restore_backup(
+                    recovery_backup.backup_id,
+                    source,
+                    replace_existing=True,
+                )
+            except (BackupError, OSError) as exc:
+                restore_error = exc
+        if previous_document and previous_document.exists():
+            try:
+                start_watch(session, previous_document)
+            except Exception as watch_error:
+                backend_log(
+                    "previous_document_watch_restore_failed",
+                    session_id=session.session_id,
+                    error_type=type(watch_error).__name__,
+                )
+            with session.lock:
+                session.active_doc = previous_document
+                session.active_source = previous_source
+                session.complex_layout = previous_complex_layout
+                session.complex_layout_detail = previous_complex_detail
+        if restore_error is not None:
+            raise UserFacingError(
+                "The blank document could not be opened, and Ogent could not "
+                f"restore its original zero-byte placeholder: {restore_error}",
+                500,
+            ) from open_error
+        raise
+    start_selection_broker(session)
+
+    if remember_source:
+        STATE.remember(source)
+    if announce:
+        if blank_initialized and document_mode == "local_direct":
+            announcement = (
+                f"Blank {extension[1:].upper()} initialized \u00b7 editing "
+                f"original \u00b7 recovery backup created: {working.name}."
+            )
+        elif document_mode == "local_direct":
+            announcement = (
+                f"Editing original \u00b7 recovery backup created: "
+                f"{working.name}."
+            )
+        elif document_mode == "browser_import":
+            announcement = (
+                "Browser upload \u00b7 editing an imported copy. "
+                "Save or copy the finished file when done."
+            )
+        else:
+            announcement = (
+                "The original PDF remains unchanged; editing its Ogent-owned "
+                "working DOCX."
+            )
+        session.add_message("assistant", announcement)
+    session.emit(
+        "document",
+        {
+            "session_id": session.session_id,
+            "source": str(protected_source),
+            "working": str(working),
+            "watch_url": stable_watch_url(
+                session.watch_port,
+                session.watch_generation,
+            ),
+            "watch_port": session.watch_port,
+            "watch_generation": session.watch_generation,
+            "document_revision": session.document_revision,
+            "document_id": session.document_id,
+            "document_index": (
+                dict(session.document_index)
+                if session.document_index is not None
+                else None
+            ),
+            "preview_identity": preview_identity_public(session),
+            "complex_layout": complex_layout,
+            "complex_layout_detail": complex_detail,
+            "document_mode": document_mode,
+            "blank_initialized": blank_initialized,
+            "recovery_backup": (
+                recovery_backup.public_metadata()
+                if recovery_backup is not None
+                else None
+            ),
+        },
+    )
+    return {
+        "message": (
+            f"Blank {extension[1:].upper()} initialized \u00b7 editing original"
+            if blank_initialized and document_mode == "local_direct"
+            else f"Blank {extension[1:].upper()} initialized \u00b7 editing an imported copy"
+            if blank_initialized and document_mode == "browser_import"
+            else "Editing original \u00b7 recovery backup created"
+            if document_mode == "local_direct"
+            else "Browser upload \u00b7 editing an imported copy"
+            if document_mode == "browser_import"
+            else "Protected PDF working DOCX opened"
+        ),
+        "session_id": session.session_id,
+        "source": str(protected_source),
+        "active_document": str(working),
+        "watch_url": stable_watch_url(
+            session.watch_port,
+            session.watch_generation,
+        ),
+        "watch_port": session.watch_port,
+        "watch_generation": session.watch_generation,
+        "document_revision": session.document_revision,
+        "document_id": session.document_id,
+        "document_index": (
+            dict(session.document_index)
+            if session.document_index is not None
+            else None
+        ),
+        "preview_identity": preview_identity_public(session),
+        "complex_layout": complex_layout,
+        "complex_layout_detail": complex_detail,
+        "document_mode": document_mode,
+        "blank_initialized": blank_initialized,
+        "recovery_backup": (
+            recovery_backup.public_metadata()
+            if recovery_backup is not None
+            else None
+        ),
+    }
+
+
+def extract_pdf_path(message: str) -> Path | None:
+    stripped = message.strip().strip('"').strip("'")
+    candidates: list[str] = []
+    if stripped.lower().endswith(".pdf"):
+        candidates.append(stripped)
+    candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r'([A-Za-z]:[\\/][^\r\n"]*?\.pdf)', message, re.IGNORECASE)
+    )
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.is_absolute() and path.exists() and path.is_file():
+            return path.resolve()
+    return None
+
+
+def _stream_plain_process(
+    session: SessionState,
+    process: subprocess.Popen[str],
+    *,
+    stream_name: str,
+) -> tuple[int, list[str]]:
+    lines: list[str] = []
+    assert process.stdout is not None
+    for raw in iter(process.stdout.readline, ""):
+        line = raw.rstrip()
+        if not line:
+            continue
+        lines.append(line)
+        session.add_activity(stream_name, line)
+    return process.wait(), lines
+
+
+def _finish_session_run(
+    session: SessionState,
+    run_id: str,
+    status: str,
+    *,
+    process: subprocess.Popen[str] | None = None,
+    expected_generation: int | None = None,
+    **extra: Any,
+) -> bool:
+    with session.lock:
+        if (
+            session.run_id != run_id
+            or (
+                expected_generation is not None
+                and session.conversation_generation != expected_generation
+            )
+        ):
+            return False
+    if session.workspace_actor is not None:
+        try:
+            durable_state = session.workspace_actor.dispatch(
+                GetWorkspaceState()
+            )
+            durable_run = durable_state.active_run
+            if durable_run is not None and durable_run.run_id == run_id:
+                if status in {
+                    "completed",
+                    "analysis_completed",
+                    "edit_completed",
+                    "no_change",
+                }:
+                    ordered = (
+                        RunState.ACCEPTED,
+                        RunState.CAPABILITY_BOOTSTRAP,
+                        RunState.DOCUMENT_REFRESH,
+                        RunState.SCOPE_RESOLVED,
+                        RunState.PLAN_READY,
+                        RunState.EXECUTING,
+                        RunState.VERIFYING,
+                        RunState.PREVIEW_SYNC,
+                        RunState.COMPLETED,
+                    )
+                    current_index = ordered.index(durable_run.state)
+                    for target in ordered[current_index + 1 :]:
+                        durable_run = session.workspace_actor.dispatch(
+                            TransitionRun(
+                                run_id,
+                                target,
+                                verification=(
+                                    {
+                                        "outcome": status,
+                                        **{
+                                            key: value
+                                            for key, value in extra.items()
+                                            if key not in {"stderr", "stdout"}
+                                        },
+                                    }
+                                    if target == RunState.COMPLETED
+                                    else None
+                                ),
+                            )
+                        )
+                else:
+                    target = (
+                        RunState.CANCELLED
+                        if status == "stopped"
+                        else RunState.FAILED
+                    )
+                    session.workspace_actor.dispatch(
+                        TransitionRun(
+                            run_id,
+                            target,
+                            verification={
+                                "outcome": status,
+                                **{
+                                    key: value
+                                    for key, value in extra.items()
+                                    if key not in {"stderr", "stdout"}
+                                },
+                            },
+                        )
+                    )
+        except Exception as exc:
+            backend_log(
+                "durable_run_finish_failed",
+                session_id=session.session_id,
+                run_id=run_id,
+                status=status,
+                error_type=type(exc).__name__,
+            )
+            status = "error"
+    outcome = (
+        "completed"
+        if status in {"completed", "idle"}
+        else status
+        if status in {"analysis_completed", "edit_completed", "no_change"}
+        else "error"
+        if status == "error"
+        else "stopped"
+        if status == "stopped"
+        else "neutral"
+    )
+    backend_status = (
+        "idle"
+        if status
+        in {
+            "completed",
+            "analysis_completed",
+            "edit_completed",
+            "no_change",
+        }
+        else status
+    )
+    with session.lock:
+        if (
+            session.run_id != run_id
+            or (
+                expected_generation is not None
+                and session.conversation_generation != expected_generation
+            )
+        ):
+            return False
+        if process is None or session.run_process is process:
+            session.run_process = None
+        if session.run_thread is threading.current_thread():
+            session.run_thread = None
+        session.stop_requested = False
+        session.run_status = backend_status
+        session.last_run_outcome = outcome
+        session.run_conversation_generation = None
+        session.run_client_id = None
+        session.owned_cancel_events.pop(run_id, None)
+        session.run_complete.set()
+        if session.sse_clients == 0:
+            # A tab may close while an agent is working. Never consume the user's
+            # reconnect grace while that run is protected from reaping.
+            session.orphan_since = time.time()
+    session.emit(
+        "run",
+        {
+            "status": backend_status,
+            "outcome": outcome,
+            "run_id": run_id,
+            **extra,
+        },
+        expected_generation=expected_generation,
+    )
+    STATE.broadcast_sessions()
+    return True
+
+
+def _pdf_import_worker(
+    session: SessionState,
+    source: Path,
+    request_text: str,
+    run_id: str,
+    browser_upload: bool = False,
+) -> None:
+    work_dir = (
+        WORK_ROOT
+        / session.session_id
+        / f"pdf-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    )
+    copied_pdf = work_dir / f"{safe_name(source.stem)}-source-copy.pdf"
+    working_docx = work_dir / f"{safe_name(source.stem)}-working.docx"
+    process: subprocess.Popen[str] | None = None
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, copied_pdf)
+        try:
+            observe_session_document_index(
+                session,
+                copied_pdf,
+                source_path=source,
+                mode="pdf_source_copy",
+                package_fingerprint=package_sha256(copied_pdf),
+                role="source",
+            )
+        except Exception as index_error:
+            record_document_index_failure(
+                session,
+                index_error,
+                role="source",
+            )
+            session.add_activity(
+                "index",
+                "Searchable PDF indexing could not start "
+                f"({type(index_error).__name__}).",
+            )
+        with session.lock:
+            if session.closed or session.stop_requested or session.run_id != run_id:
+                session.add_message("assistant", "PDF conversion stopped.")
+                _finish_session_run(session, run_id, "stopped", kind="pdf")
+                return
+            session.run_status = "working"
+        session.emit(
+            "run",
+            {
+                "status": "working",
+                "kind": "pdf",
+                "run_id": run_id,
+                "label": "Converting a protected PDF copy",
+            },
+        )
+        STATE.broadcast_sessions()
+        with session.lock:
+            if session.closed or session.stop_requested or session.run_id != run_id:
+                session.add_message("assistant", "PDF conversion stopped.")
+                _finish_session_run(session, run_id, "stopped", kind="pdf")
+                return
+            process = subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(PDF_TO_DOCX),
+                    "-Pdf",
+                    str(copied_pdf),
+                    "-OutDocx",
+                    str(working_docx),
+                ],
+                cwd=str(REPO_ROOT),
+                env=command_env(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
+            )
+            session.run_process = process
+        code, lines = _stream_plain_process(session, process, stream_name="pdf")
+        with session.lock:
+            stopped = session.stop_requested or session.run_id != run_id
+        if stopped:
+            session.add_message("assistant", "PDF conversion stopped.")
+            _finish_session_run(
+                session,
+                run_id,
+                "stopped",
+                process=process,
+                kind="pdf",
+            )
+            return
+        if code != 0 or not working_docx.exists():
+            tail = "\n".join(lines[-8:])
+            if "SCANNED_PDF" in tail:
+                message = "This PDF is image-only and needs OCR before it can be edited."
+            else:
+                message = f"PDF conversion failed with exit code {code}. {tail}".strip()
+            with session.lock:
+                session.last_error = message
+            session.add_message("assistant", message)
+            _finish_session_run(
+                session,
+                run_id,
+                "error",
+                process=process,
+                kind="pdf",
+                exit_code=code,
+            )
+            return
+        open_document(
+            session,
+            str(working_docx),
+            make_copy=False,
+            state_source=source,
+            preserve_transcript=True,
+            remember_source=False,
+            announce=False,
+            reset_run=False,
+            document_mode="pdf_conversion",
+        )
+        with session.lock:
+            stopped = (
+                session.closed
+                or session.stop_requested
+                or session.run_id != run_id
+            )
+        if stopped:
+            session.add_message("assistant", "PDF preparation stopped.")
+            _finish_session_run(
+                session,
+                run_id,
+                "stopped",
+                process=process,
+                kind="pdf",
+            )
+            return
+        session.add_message(
+            "assistant",
+            (
+                "Browser PDF upload \u00b7 editing an imported DOCX copy. "
+                "Save or copy the finished file when done."
+                if browser_upload
+                else "The source PDF was preserved, its working DOCX is open "
+                "on the left, and it is ready for your edit request."
+            ),
+        )
+        _finish_session_run(
+            session,
+            run_id,
+            "idle",
+            process=process,
+            kind="pdf",
+            exit_code=0,
+        )
+    except Exception as exc:
+        with session.lock:
+            session.last_error = str(exc)
+        session.add_message("assistant", f"PDF preparation failed: {exc}")
+        _finish_session_run(
+            session,
+            run_id,
+            "error",
+            process=process,
+            kind="pdf",
+        )
+    finally:
+        STATE.release_claim(session, source)
+
+
+def start_pdf_import(
+    session: SessionState,
+    source: Path,
+    request_text: str,
+    *,
+    browser_upload: bool = False,
+) -> str:
+    with session.lock:
+        if session.closed:
+            raise UserFacingError("This Ogent session has closed.", 410)
+        if session.run_status in ACTIVE_RUN_STATUSES:
+            raise UserFacingError("Ogent is still working. Stop that run or wait for it to finish.", 409)
+        if session.snapshot_in_progress:
+            raise UserFacingError("Word view is still being generated. Wait for it to finish.", 409)
+        session.run_status = "starting"
+        session.run_id = uuid.uuid4().hex
+        session.stop_requested = False
+        session.run_complete.clear()
+        session.pending_pdf = False
+        run_id = session.run_id
+    session.emit("run", {"status": "starting", "kind": "pdf", "run_id": run_id})
+    STATE.broadcast_sessions()
+    thread = threading.Thread(
+        target=_pdf_import_worker,
+        args=(session, source, request_text, run_id, browser_upload),
+        name=f"ogent-pdf-{session.session_id}-{run_id[:8]}",
+        daemon=True,
+    )
+    with session.lock:
+        session.run_thread = thread
+    thread.start()
+    return run_id
+
+
+def dispatch_open_path(
+    session: SessionState,
+    raw_path: str,
+    *,
+    origin: str = "local_path",
+    target_session: SessionState | None = None,
+    target_created: bool = False,
+) -> dict[str, Any]:
+    source = normalize_existing_path(raw_path)
+    if origin not in {"local_path", "browser_upload"}:
+        raise UserFacingError("Invalid document-open origin.", 500)
+    if source.suffix.lower() not in {*SUPPORTED_OFFICE, ".pdf"}:
+        raise UserFacingError(
+            "Supported document types are .docx, .xlsx, .pptx, and .pdf.",
+            415,
+        )
+    existing = STATE.find_document_session(source)
+    if existing is not None:
+        if existing is session:
+            return {
+                "action": "document_already_open",
+                "session_id": existing.session_id,
+                "message": "That document is already open in this workspace.",
+                "url": f"/?s={existing.session_id}",
+            }
+        return {
+            "action": "focus_session",
+            "session_id": existing.session_id,
+            "message": "That document is already open. Switched to its Ogent workspace.",
+            "url": f"/?s={existing.session_id}",
+        }
+    if target_session is None:
+        target_session, target_created = STATE.allocate_document_session(session)
+    target = target_session
+    deduped = STATE.claim_source(target, source)
+    if deduped is not None:
+        if target_created:
+            close_session(target)
+        if deduped is session:
+            return {
+                "action": "document_already_open",
+                "session_id": deduped.session_id,
+                "message": "That document is already open in this workspace.",
+                "url": f"/?s={deduped.session_id}",
+            }
+        return {
+            "action": "focus_session",
+            "session_id": deduped.session_id,
+            "message": "That document is already open. Switched to its Ogent workspace.",
+            "url": f"/?s={deduped.session_id}",
+        }
+    if source.suffix.lower() == ".pdf":
+        try:
+            run_id = start_pdf_import(
+                target,
+                source,
+                f"Open this PDF in Ogent: {source}",
+                browser_upload=origin == "browser_upload",
+            )
+            message = (
+                "Preparing a browser-imported PDF working DOCX copy."
+                if origin == "browser_upload"
+                else "Preparing a protected PDF working copy. "
+                "The original PDF will remain untouched."
+            )
+            return {
+                "action": (
+                    "focus_session"
+                    if target is not session
+                    else "pdf_import"
+                ),
+                "session_id": target.session_id,
+                "message": message,
+                "source": str(source),
+                "run_id": run_id,
+                "url": f"/?s={target.session_id}",
+            }
+        except Exception:
+            STATE.release_claim(target, source)
+            if target_created:
+                close_session(target)
+            raise
+    try:
+        result = open_document(
+            target,
+            str(source),
+            document_mode=(
+                "browser_import"
+                if origin == "browser_upload"
+                else "local_direct"
+            ),
+            remember_source=origin == "local_path",
+            announce=False,
+        )
+        result["action"] = (
+            "focus_session"
+            if target is not session
+            else "document_opened"
+        )
+        result["url"] = f"/?s={target.session_id}"
+        return result
+    except Exception:
+        STATE.release_claim(target, source)
+        if target_created:
+            close_session(target)
+        raise
+
+

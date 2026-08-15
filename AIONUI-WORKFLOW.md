@@ -66,7 +66,12 @@ Replace bracketed placeholder text after replay, then run `officecli validate '<
 
 ## Live preview and handoff
 
-- `officecli watch '<file>'` starts a live browser preview. One watch is allowed per file, and it stops after an idle timeout; restart it when needed.
+- **Live updates in AionUi's preview panel:** `OFFICECLI_RESIDENT_FLUSH=each` is set as a user
+  environment variable on this workstation (verified 2026-07-23: without it, edits reach disk only
+  after a few seconds of idle; with it, immediately). Every officecli mutation now hits the disk
+  file at once, so AionUi's file-watching preview refreshes per edit. Restart AionUi/terminals
+  after changing this variable — running processes keep their old environment.
+- `officecli watch '<file>'` starts a live browser preview. One watch is allowed per file, and it stops after an idle timeout; restart it when needed. It reads through the officecli resident, so it is always live even when disk flushing is deferred — the richest "watch the agent work" view (click-to-select, `officecli goto` to follow along).
 - Run `officecli close '<file>'` before opening the file in Word, Excel, PowerPoint, or another non-OfficeCLI reader. This flushes resident edits and releases the file.
 - For a Word TOC or page-number fields, close the resident and run `officecli refresh '<file.docx>'` on Windows before final review.
 - Always validate the final artifact and inspect its text or issues. Render at most once, only when the user requests a final visual check.

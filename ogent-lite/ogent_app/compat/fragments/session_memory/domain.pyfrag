@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Provider-neutral, launch-scoped workspace memory for Ogent Lite."""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import threading
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+
+MEMORY_SCHEMA_VERSION = 1
+LAST_CONVERSATIONAL_TURNS = 12
+RELEVANT_OLDER_TURNS = 6
+MAX_TURN_TEXT_CHARS = 24_000
+MAX_CONTEXT_BYTES = 64 * 1024
+MAX_ATTACHMENT_CATALOG_ITEMS = 100
+MEMORY_FILENAME = "memory.json"
+SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{8,32}$")
+ATTACHMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,63}")
+PREFERENCE_PATTERN = re.compile(
+    r"\b(?:i prefer|please always|always use|keep using|from now on|"
+    r"do not .* (?:again|in future)|remember that)\b",
+    re.IGNORECASE,
+)
+STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "with",
+    "you",
+}
+
+
+class SessionMemoryError(RuntimeError):
+    """A safe, actionable session-memory error."""
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def utc_iso(value: dt.datetime) -> str:
+    if value.tzinfo is None:
+        raise SessionMemoryError("Session-memory timestamps must be timezone-aware.")
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _bounded_text(value: Any, maximum: int = MAX_TURN_TEXT_CHARS) -> str:
+    text = str(value or "").replace("\x00", "").strip()
+    return text[:maximum]
+
+
+def _canonical_turn_text(value: Any) -> str:
+    """Return lossless canonical turn text without applying prompt limits."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def _context_turn_text(value: str) -> str:
+    if len(value) <= MAX_TURN_TEXT_CHARS:
+        return value
+    omitted = len(value) - MAX_TURN_TEXT_CHARS
+    return (
+        value[:MAX_TURN_TEXT_CHARS]
+        + "\n"
+        + (
+            f"[Context projection omitted {omitted:,} characters from this "
+            "turn; the canonical turn remains complete and retrievable.]"
+        )
+    )
+
+
+def _fit_utf8_with_disclosure(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return value
+    notice = (
+        "\n\n[Provider context projection reached its configured byte budget; "
+        "canonical turns remain complete and retrievable.]"
+    )
+    notice_bytes = notice.encode("utf-8")
+    available = max(0, maximum_bytes - len(notice_bytes))
+    low = 0
+    high = len(value)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        if len(value[:midpoint].encode("utf-8")) <= available:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return value[:low] + notice
+
+
+def _safe_dict(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    # JSON round-tripping prevents callers from retaining mutable references and
+    # limits the canonical memory format to data, not executable objects.
+    encoded = json.dumps(value, ensure_ascii=False, default=str)
+    decoded = json.loads(encoded)
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _safe_list(value: Iterable[Any] | None, *, maximum: int = 100) -> list[Any]:
+    if value is None:
+        return []
+    result: list[Any] = []
+    for item in value:
+        if len(result) >= maximum:
+            break
+        encoded = json.dumps(item, ensure_ascii=False, default=str)
+        result.append(json.loads(encoded))
+    return result
+
+
+def _tokens(value: str) -> set[str]:
+    return {
+        token.casefold()
+        for token in TOKEN_PATTERN.findall(value)
+        if token.casefold() not in STOP_WORDS
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class MemoryTurn:
+    sequence: int
+    role: str
+    text: str
+    timestamp: str
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    document: dict[str, Any] = dataclasses.field(default_factory=dict)
+    attachment_ids: tuple[str, ...] = ()
+    attachments: tuple[dict[str, Any], ...] = ()
+    preview_selections: tuple[dict[str, Any], ...] = ()
+    decisions: tuple[str, ...] = ()
+    completed_actions: tuple[str, ...] = ()
+    run_outcome: str | None = None
+    verification: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "role": self.role,
+            "text": self.text,
+            "time": self.timestamp,
+            "provider": self.provider,
+            "model": self.model,
+            "effort": self.effort,
+            "attachments": [dict(item) for item in self.attachments],
+            "preview_selections": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key
+                    in {
+                        "selection_id",
+                        "document_name",
+                        "document_format",
+                        "path",
+                        "kind",
+                        "label",
+                        "order",
+                        "primary",
+                        "watch_id",
+                        "revision",
+                        "selected_at",
+                        "stale",
+                    }
+                }
+                for item in self.preview_selections
+            ],
+            "run_outcome": self.run_outcome,
+            "verification": dict(self.verification),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class MemoryAttachment:
+    attachment_id: str
+    filename: str
+    detected_type: str
+    kind: str
+    byte_size: int
+    uploaded_at: str
+    status: str
+    ocr_or_vision: bool
+    processing: dict[str, Any] = dataclasses.field(default_factory=dict)
+    canonical_path: str | None = None
+    forgotten_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "id": self.attachment_id,
+            "filename": self.filename,
+            "detected_type": self.detected_type,
+            "kind": self.kind,
+            "size": self.byte_size,
+            "uploaded_at": self.uploaded_at,
+            "status": self.status,
+            "ocr_or_vision": self.ocr_or_vision,
+            "processing": dict(self.processing),
+            "available_in_session": self.forgotten_at is None,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ContextSnapshot:
+    text: str
+    mode: str
+    provider: str
+    model: str
+    effort: str
+    sequence_from: int
+    sequence_to: int
+    included_sequences: tuple[int, ...]
+    attachment_ids: tuple[str, ...]
+    prompt_bytes: int
+
+

@@ -10,14 +10,26 @@ import threading
 import time
 from typing import Any, Callable
 
+from ogent_app.domain.run import ScopeMode
+
 
 MAX_TIMING_EVENTS = 256
 MAX_SAFE_LABEL = 120
 OFFICECLI_PATTERN = re.compile(r"(?i)(?:^|[\\/\"'\s])officecli(?:\.exe)?(?:\s|$)")
+QUOTED_OR_BARE_ARGUMENT = r"(?:\"[^\"]+\"|'[^']+'|\S+)"
 BROAD_READ_PATTERNS = (
-    re.compile(r"(?i)\bofficecli(?:\.exe)?\s+view\s+\S+\s+text(?:\s|$)"),
-    re.compile(r"(?i)\bofficecli(?:\.exe)?\s+get\s+\S+\s+[\"']?/[\"']?(?:\s|$)"),
-    re.compile(r"(?i)\bofficecli(?:\.exe)?\s+query\s+\S+\s+[\"']?(?:\*|all)\b"),
+    re.compile(
+        rf"(?i)\bofficecli(?:\.exe)?\s+view\s+"
+        rf"{QUOTED_OR_BARE_ARGUMENT}\s+text(?:\s|$)"
+    ),
+    re.compile(
+        rf"(?i)\bofficecli(?:\.exe)?\s+get\s+"
+        rf"{QUOTED_OR_BARE_ARGUMENT}\s+[\"']?/[\"']?(?:\s|$)"
+    ),
+    re.compile(
+        rf"(?i)\bofficecli(?:\.exe)?\s+query\s+"
+        rf"{QUOTED_OR_BARE_ARGUMENT}\s+[\"']?(?:\*|all)\b"
+    ),
 )
 
 
@@ -125,8 +137,25 @@ class RunTiming:
         event: dict[str, Any],
         *,
         focused: bool = False,
+        scope_mode: ScopeMode | str | None = None,
     ) -> None:
         """Observe structure only; never persist event payload or tool arguments."""
+        if scope_mode is None:
+            resolved_scope = (
+                ScopeMode.SELECTED_ONLY
+                if focused
+                else ScopeMode.WHOLE_DOCUMENT
+            )
+        else:
+            resolved_scope = ScopeMode(scope_mode)
+        restricts_broad_reads = resolved_scope in {
+            ScopeMode.SELECTED_ONLY,
+            ScopeMode.LOCAL_REGION,
+            ScopeMode.SPECIFIED_SECTIONS,
+            ScopeMode.SPECIFIED_SHEETS,
+            ScopeMode.SPECIFIED_SLIDES,
+            ScopeMode.ATTACHMENTS_ONLY,
+        }
         with self.lock:
             if not self._first_provider_event:
                 self._first_provider_event = True
@@ -150,7 +179,7 @@ class RunTiming:
                     self.officecli_call_count += 1
                     self._officecli_started.append(self.clock())
                 self.mark("officecli_call_start")
-                if focused and any(
+                if restricts_broad_reads and any(
                     pattern.search(command) for pattern in BROAD_READ_PATTERNS
                 ):
                     with self.lock:
@@ -166,7 +195,7 @@ class RunTiming:
                 normalized_command = (
                     f"officecli {command}" if command else ""
                 )
-                if focused and normalized_command and any(
+                if restricts_broad_reads and normalized_command and any(
                     pattern.search(normalized_command)
                     for pattern in BROAD_READ_PATTERNS
                 ):

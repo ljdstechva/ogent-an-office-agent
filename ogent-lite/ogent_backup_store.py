@@ -218,8 +218,6 @@ class BackupStore:
 
             initial_metadata = self._source_metadata(source)
             byte_size = initial_metadata[0]
-            if byte_size <= 0:
-                raise BackupError("The selected document is empty.")
             try:
                 free = self.disk_usage(self.root).free
             except OSError as exc:
@@ -557,7 +555,13 @@ class BackupStore:
             except OSError as exc:
                 raise BackupError("Windows Explorer could not open the folder.") from exc
 
-    def restore_backup(self, backup_id: str, destination: Path) -> Path:
+    def restore_backup(
+        self,
+        backup_id: str,
+        destination: Path,
+        *,
+        replace_existing: bool = False,
+    ) -> Path:
         """Copy one verified recovery item to an explicit destination."""
         with self.lock:
             if not BACKUP_ID_PATTERN.fullmatch(backup_id):
@@ -565,9 +569,21 @@ class BackupStore:
             record = self._record_from_directory(self.root / backup_id)
             if self._hash_file(record.backup_path) != record.sha256:
                 raise BackupError("The recovery backup failed SHA-256 verification.")
-            target = Path(destination).expanduser().resolve(strict=False)
-            if target.exists():
+            requested_target = Path(destination).expanduser()
+            if requested_target.is_symlink():
+                raise BackupError(
+                    "The recovery destination cannot be a symbolic link."
+                )
+            target = requested_target.resolve(strict=False)
+            if target.exists() and not replace_existing:
                 raise BackupError("The recovery destination already exists.")
+            if target.exists() and (
+                not target.is_file()
+                or target.is_symlink()
+            ):
+                raise BackupError(
+                    "The recovery destination is not a safe regular file."
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.partial")
             try:

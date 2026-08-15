@@ -1,0 +1,12 @@
+{
+  "include": ["ogent_app"],
+  "exclude": [
+    "ogent_app/compat",
+    "ogent_app/api/http_foundation.py",
+    "ogent_app/api/http_get_routes.py",
+    "ogent_app/api/http_handler.py",
+    "ogent_app/api/http_post_routes.py"
+  ],
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "standard"
+}

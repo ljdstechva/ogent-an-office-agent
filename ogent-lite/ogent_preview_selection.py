@@ -601,6 +601,43 @@ class PreviewSelectionState:
                 self.limit_message = None
             return snapshot
 
+    def restore_after_failed_send(
+        self,
+        snapshot: PreviewSelectionSnapshot | None,
+    ) -> bool:
+        """Restore a claimed selection when Send acceptance did not commit."""
+        if snapshot is None:
+            return True
+        with self.lock:
+            if (
+                snapshot.session_id != self.session_id
+                or snapshot.document_id != self.document_id
+                or snapshot.watch_id != self.watch_id
+                or snapshot.revision != self.revision
+            ):
+                return False
+            existing_ids = {
+                target.selection_id for target in self.targets
+            }
+            restored = [
+                *(
+                    target
+                    for target in snapshot.targets
+                    if target.selection_id not in existing_ids
+                ),
+                *self.targets,
+            ][:MAX_PREVIEW_SELECTION_TARGETS]
+            self.targets = [
+                dataclasses.replace(
+                    target,
+                    order=index,
+                    primary=(index == 0),
+                )
+                for index, target in enumerate(restored)
+            ]
+            self.limit_message = None
+            return True
+
 
 def post_watch_selection(port: int, paths: Iterable[str]) -> None:
     """Update OfficeCLI's native visual selection without exposing a token."""

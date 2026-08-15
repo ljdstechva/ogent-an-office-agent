@@ -1,0 +1,586 @@
+class OgentState:
+    def __init__(self) -> None:
+        self.registry_lock = threading.RLock()
+        self.recent_lock = threading.RLock()
+        self.pick_lock = threading.Lock()
+        self.pick_process: subprocess.Popen[str] | None = None
+        self.sessions: dict[str, SessionState] = {}
+        self.closed_session_ids: set[str] = set()
+        self.path_index: dict[str, str] = {}
+        self.recent = load_recent()
+        self.server_port = BASE_PORT
+        self.token = secrets.token_urlsafe(32)
+        self.shutdown_requested = False
+        self.cleanup_started = False
+        self.empty_since: float | None = time.time()
+        self.session_grace_seconds = DEFAULT_SESSION_GRACE_SECONDS
+        self.reaper_tick_seconds = DEFAULT_REAPER_TICK_SECONDS
+        self.idle_exit_minutes = DEFAULT_IDLE_EXIT_MINUTES
+        self.shutdown_callback: Callable[[], None] | None = None
+        self.enforce_capability_contract = False
+
+    @staticmethod
+    def path_key(path: Path) -> str:
+        return os.path.normcase(str(path.resolve()))
+
+    @staticmethod
+    def _durable_session(
+        session_id: str,
+        memory: SessionMemory,
+    ) -> SessionState:
+        if (
+            WORKSPACE_ACTORS is None
+            or TURN_REPOSITORY is None
+            or EVENT_REPOSITORY is None
+        ):
+            raise RuntimeError("Durable Ogent services are unavailable.")
+        actor = WORKSPACE_ACTORS.get_or_create(session_id)
+        conversation = DurableConversation(
+            session_id,
+            TURN_REPOSITORY,
+            actor,
+        )
+        return SessionState(
+            session_id,
+            memory=memory,
+            workspace_actor=actor,
+            durable_conversation=conversation,
+            event_repository=EVENT_REPOSITORY,
+        )
+
+    def create_session(self) -> SessionState:
+        initialize_owned_stores()
+        with self.registry_lock:
+            if self.shutdown_requested:
+                raise UserFacingError("Ogent is shutting down. Launch it again in a moment.", 503)
+            while True:
+                session_id = uuid.uuid4().hex[:8]
+                durable_exists = (
+                    WORKSPACE_REPOSITORY.get(session_id) is not None
+                    if WORKSPACE_REPOSITORY is not None
+                    else False
+                )
+                if session_id not in self.sessions and not durable_exists:
+                    break
+            try:
+                memory = SESSION_MEMORY_STORE.create(session_id)
+                session = self._durable_session(session_id, memory)
+            except (SessionMemoryError, RetainedAttachmentError) as exc:
+                try:
+                    SESSION_MEMORY_STORE.delete_session(session_id)
+                except Exception as cleanup_error:
+                    backend_log(
+                        "failed_session_initialization_cleanup_failed",
+                        session_id=session_id,
+                        error_type=type(cleanup_error).__name__,
+                    )
+                raise UserFacingError(
+                    f"Session memory could not be initialized: {exc}",
+                    500,
+                ) from exc
+            self.sessions[session_id] = session
+            self.empty_since = None
+        self.broadcast_sessions()
+        return session
+
+    def get_session(self, session_id: str) -> SessionState:
+        with self.registry_lock:
+            session = self.sessions.get(session_id)
+        if session is None:
+            session = self._restore_session(session_id)
+        if session is None or session.closed:
+            raise UserFacingError("This Ogent session no longer exists.", 410)
+        return session
+
+    def _restore_session(self, session_id: str) -> SessionState | None:
+        if not re.fullmatch(r"[0-9a-f]{8,32}", str(session_id)):
+            return None
+        with self.registry_lock:
+            if session_id in self.closed_session_ids:
+                return None
+        initialize_owned_stores()
+        if WORKSPACE_REPOSITORY is None:
+            return None
+        workspace = WORKSPACE_REPOSITORY.get(session_id)
+        if workspace is None:
+            return None
+        with self.registry_lock:
+            existing = self.sessions.get(session_id)
+            if existing is not None:
+                return existing
+            try:
+                memory = SESSION_MEMORY_STORE.create(session_id)
+                session = self._durable_session(session_id, memory)
+                if session.workspace_actor is not None:
+                    interrupted = session.workspace_actor.dispatch(
+                        RecoverInterruptedRun()
+                    )
+                    if interrupted is not None:
+                        session.run_status = "error"
+                        session.last_run_outcome = "error"
+                        session.last_error = (
+                            "The prior run was interrupted by a backend restart."
+                        )
+                        session.sequence = max(
+                            session.sequence,
+                            session.workspace_actor.dispatch(
+                                GetWorkspaceState()
+                            ).last_event_sequence,
+                        )
+            except (SessionMemoryError, RetainedAttachmentError):
+                try:
+                    SESSION_MEMORY_STORE.delete_session(session_id)
+                except Exception as cleanup_error:
+                    backend_log(
+                        "failed_session_restore_cleanup_failed",
+                        session_id=session_id,
+                        error_type=type(cleanup_error).__name__,
+                    )
+                return None
+            self.sessions[session_id] = session
+            self.empty_since = None
+            return session
+
+    @staticmethod
+    def session_is_pristine(session: SessionState) -> bool:
+        with session.reference_lock:
+            has_references = bool(
+                session.pending_references
+                or session.retained_references
+                or session.active_references
+                or session.reference_operations
+            )
+        with session.lock:
+            return not (
+                session.closed
+                or session.active_doc is not None
+                or session.active_source is not None
+                or session.opening_source is not None
+                or session.transcript_count() > 0
+                or has_references
+                or session.run_status in ACTIVE_RUN_STATUSES
+                or session.run_id is not None
+                or session.pending_pdf
+                or session.codex_thread_id
+                or session.claude_session_id
+                or session.preview_selection.targets
+            )
+
+    def allocate_document_session(
+        self,
+        requested: SessionState,
+    ) -> tuple[SessionState, bool]:
+        """Use a truly empty workspace or allocate a clean document workspace."""
+        if self.session_is_pristine(requested):
+            return requested, False
+        return self.create_session(), True
+
+    def find_document_session(self, source: Path) -> SessionState | None:
+        key = self.path_key(source)
+        with self.registry_lock:
+            existing_id = self.path_index.get(key)
+            existing = self.sessions.get(existing_id) if existing_id else None
+            if existing is not None and existing.closed:
+                raise UserFacingError(
+                    "That document's previous workspace is still closing. Try again.",
+                    409,
+                )
+            return existing
+
+    def select_shell_session(self) -> tuple[SessionState, bool]:
+        """Return the browser workspace Explorer should open into.
+
+        Shell opens reuse the most recently focused connected workspace so its
+        SSE stream updates immediately and its busy guard remains authoritative.
+        If the backend is resident without a workspace, create one.
+        """
+        with self.registry_lock:
+            sessions = [
+                session
+                for session in self.sessions.values()
+                if not session.closed
+            ]
+        if not sessions:
+            return self.create_session(), True
+
+        def shell_priority(session: SessionState) -> tuple[bool, float, float]:
+            with session.lock:
+                return (
+                    session.sse_clients > 0,
+                    session.last_browser_activity,
+                    session.created_at,
+                )
+
+        return max(sessions, key=shell_priority), False
+
+    def summaries(self) -> list[dict[str, Any]]:
+        with self.registry_lock:
+            sessions = list(self.sessions.values())
+        summaries: list[dict[str, Any]] = []
+        for session in sorted(sessions, key=lambda item: item.created_at):
+            with session.lock:
+                source = session.active_source
+                document = session.active_doc
+                summaries.append(
+                    {
+                        "id": session.session_id,
+                        "document_name": (
+                            source.name
+                            if source
+                            else document.name
+                            if document
+                            else "New workspace"
+                        ),
+                        "run_status": session.run_status,
+                        "watch_port": session.watch_port,
+                        "created_at": session.created_at_iso,
+                        "sse_clients": session.sse_clients,
+                    }
+                )
+        return summaries
+
+    def snapshot_for(
+        self,
+        session: SessionState,
+        *,
+        include_watch_probe: bool = True,
+    ) -> dict[str, Any]:
+        snapshot = session.public_snapshot(include_watch_probe=include_watch_probe)
+        with self.recent_lock:
+            recent = list(self.recent)
+        snapshot.update(
+            {
+                "app": APP_NAME,
+                "version": APP_VERSION,
+                "server_port": self.server_port,
+                "recent": recent,
+                "sessions": self.summaries(),
+                "idle_exit_minutes": self.idle_exit_minutes,
+                "session_grace_seconds": self.session_grace_seconds,
+                "agent_capabilities": AGENT_CATALOG.snapshot(),
+                "features": FEATURE_FLAGS.public(),
+                "quotas": RESOURCE_QUOTAS.public(),
+                "recovery": BACKUP_STORE.summary(),
+            }
+        )
+        return snapshot
+
+    def global_snapshot(self) -> dict[str, Any]:
+        with self.recent_lock:
+            recent = list(self.recent)
+        return {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "server_port": self.server_port,
+            "recent": recent,
+            "sessions": self.summaries(),
+            "idle_exit_minutes": self.idle_exit_minutes,
+            "session_grace_seconds": self.session_grace_seconds,
+            "agent_capabilities": AGENT_CATALOG.snapshot(),
+            "features": FEATURE_FLAGS.public(),
+            "quotas": RESOURCE_QUOTAS.public(),
+            "storage": {
+                **STORAGE_RESOURCES.forecast(0).public(),
+                "last_cleanup": dict(LAST_STORAGE_CLEANUP),
+            },
+            "recovery": BACKUP_STORE.summary()
+            if SERVICES_INITIALIZED
+            else {
+                "folder": str(BACKUP_ROOT),
+                "retention_days": 30,
+                "count": 0,
+                "total_size": 0,
+                "oldest_created_at": None,
+                "newest_created_at": None,
+                "pending_delete": 0,
+                "last_cleanup": None,
+            },
+        }
+
+    def broadcast_sessions(self) -> None:
+        summaries = self.summaries()
+        with self.registry_lock:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            with session.lock:
+                if session.closed:
+                    continue
+            session.emit("sessions", {"items": summaries})
+
+    def remember(self, source: Path) -> None:
+        value = str(source)
+        with self.recent_lock:
+            self.recent = [
+                item for item in self.recent if item.casefold() != value.casefold()
+            ]
+            self.recent.insert(0, value)
+            self.recent = self.recent[:12]
+            recent = list(self.recent)
+            save_recent(recent)
+            if METADATA_REPOSITORY is not None:
+                METADATA_REPOSITORY.remember_document(source)
+        with self.registry_lock:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            session.emit("recent", {"items": recent})
+
+    def claim_source(
+        self,
+        session: SessionState,
+        source: Path,
+    ) -> SessionState | None:
+        key = self.path_key(source)
+        with self.registry_lock:
+            existing_id = self.path_index.get(key)
+            existing = self.sessions.get(existing_id) if existing_id else None
+            if existing:
+                if existing.closed:
+                    raise UserFacingError(
+                        "That document's previous session is still closing. Try again.",
+                        409,
+                    )
+                return existing
+            with session.lock:
+                if session.closed:
+                    raise UserFacingError("This Ogent session has closed.", 410)
+                if session.opening_source is not None:
+                    raise UserFacingError(
+                        "This Ogent session is already opening a document. "
+                        "Wait for it to finish.",
+                        409,
+                    )
+                self.path_index[key] = session.session_id
+                session.opening_source = source
+        return None
+
+    def release_claim(self, session: SessionState, source: Path) -> None:
+        key = self.path_key(source)
+        with self.registry_lock:
+            with session.lock:
+                if session.opening_source and self.path_key(session.opening_source) == key:
+                    session.opening_source = None
+                if (
+                    self.path_index.get(key) == session.session_id
+                    and (
+                        session.active_source is None
+                        or self.path_key(session.active_source) != key
+                    )
+                ):
+                    self.path_index.pop(key, None)
+
+    def clear_document(self, session: SessionState) -> None:
+        with self.registry_lock:
+            for key, owner in list(self.path_index.items()):
+                if owner == session.session_id:
+                    self.path_index.pop(key, None)
+            with session.lock:
+                session.active_doc = None
+                session.active_source = None
+                session.opening_source = None
+                session.document_mode = "none"
+                session.document_id = ""
+                session.document_revision = 0
+                session.document_package_sha256 = ""
+                session.document_index = None
+                session.source_document_index = None
+                session.document_watch_event_fingerprint = ""
+                session.recovery_backup = None
+                session.selection_multi_mode = False
+                session.watch_generation = ""
+                session.historical_focus.marks = ()
+                session.historical_focus.selection_id = None
+                session.pending_pdf = False
+                invalidate_word_snapshot_locked(session)
+                session.complex_layout = False
+                session.complex_layout_detail = None
+                session.preview_selection.clear()
+                if session.memory is not None:
+                    session.memory.set_active_document()
+
+    def commit_document(
+        self,
+        session: SessionState,
+        source: Path,
+        working: Path,
+        *,
+        preserve_transcript: bool,
+        reset_run: bool,
+        complex_layout: bool,
+        complex_layout_detail: str | None,
+        document_mode: str = "local_direct",
+        recovery_backup: BackupRecord | None = None,
+    ) -> None:
+        source_key = self.path_key(source)
+        working_key = self.path_key(working)
+        with self.registry_lock:
+            if session.closed or self.sessions.get(session.session_id) is not session:
+                raise UserFacingError("This Ogent session has closed.", 410)
+            for key, owner in list(self.path_index.items()):
+                if owner == session.session_id and key not in {source_key, working_key}:
+                    self.path_index.pop(key, None)
+            self.path_index[source_key] = session.session_id
+            self.path_index[working_key] = session.session_id
+            with session.lock:
+                session.active_source = source
+                session.active_doc = working
+                session.opening_source = None
+                session.document_mode = document_mode
+                session.document_index = None
+                if document_mode != "pdf_conversion":
+                    session.source_document_index = None
+                session.document_id = hashlib.sha256(
+                    (
+                        f"{session.session_id}|"
+                        f"{self.path_key(working)}"
+                    ).encode("utf-8")
+                ).hexdigest()[:24]
+                session.document_revision = max(1, session.document_revision + 1)
+                session.document_package_sha256 = package_sha256(working)
+                session.document_watch_event_fingerprint = ""
+                session.recovery_backup = recovery_backup
+                session.selection_multi_mode = False
+                session.pending_pdf = False
+                session.last_error = None
+                session.complex_layout = complex_layout
+                session.complex_layout_detail = complex_layout_detail
+                invalidate_word_snapshot_locked(session)
+                if session.sse_clients == 0:
+                    # Opening can outlast the original orphan grace (notably
+                    # PDF conversion and large DOCX inspection). Give the
+                    # completed workspace a full reconnect window.
+                    session.orphan_since = time.time()
+                if reset_run:
+                    session.run_status = "idle"
+                    session.run_id = None
+                    session.stop_requested = False
+                session.preview_selection.reset_for_watch(
+                    document_id=session.document_id,
+                    document_name=working.name,
+                    document_format=working.suffix,
+                    revision=session.document_revision,
+                )
+                session.historical_focus.marks = ()
+                session.historical_focus.selection_id = None
+                if session.memory is not None:
+                    session.memory.set_active_document(
+                        document_id=session.document_id,
+                        source_name=source.name,
+                        active_name=working.name,
+                        format=working.suffix.casefold().lstrip("."),
+                        mode=document_mode,
+                        revision=session.document_revision,
+                        backup_id=(
+                            recovery_backup.backup_id
+                            if recovery_backup is not None
+                            else None
+                        ),
+                    )
+            if session.document_id and session.watch_generation:
+                session.preview_sync.activate_watch(
+                    session.document_id,
+                    session.watch_generation,
+                )
+        session.emit("snapshot", self.snapshot_for(session, include_watch_probe=False))
+        self.broadcast_sessions()
+
+    def allocate_watch_port(
+        self,
+        session: SessionState,
+        *,
+        replace: bool = False,
+    ) -> int:
+        with self.registry_lock:
+            with session.lock:
+                if session.watch_port is not None and not replace:
+                    return session.watch_port
+                previous_port = session.watch_port
+            used = {
+                item.watch_port
+                for item in self.sessions.values()
+                if item.watch_port is not None and item is not session
+            }
+            if previous_port is not None:
+                used.add(previous_port)
+            for port in range(WATCH_PORT_FIRST, WATCH_PORT_LAST + 1):
+                if port in used or not port_available(port):
+                    continue
+                with session.lock:
+                    session.watch_port = port
+                return port
+        raise UserFacingError(
+            f"No free OfficeCLI preview port is available from "
+            f"{WATCH_PORT_FIRST} through {WATCH_PORT_LAST}.",
+            503,
+        )
+
+    def release_watch_port(self, session: SessionState, port: int | None = None) -> None:
+        with self.registry_lock:
+            with session.lock:
+                if port is None or session.watch_port == port:
+                    session.watch_port = None
+
+    def begin_session_close(
+        self,
+        session: SessionState,
+        *,
+        require_reapable_at: float | None = None,
+    ) -> bool:
+        with self.registry_lock:
+            if self.sessions.get(session.session_id) is not session:
+                return False
+            if (
+                require_reapable_at is not None
+                and any(
+                    not candidate.closed and candidate.sse_clients > 0
+                    for candidate in self.sessions.values()
+                )
+            ):
+                # One browser window navigates between document sessions, so
+                # inactive workspaces have no SSE of their own. Retain the
+                # whole launch-scoped workspace set while any Ogent tab is
+                # attached, and begin a fresh grace period only after the last
+                # attached workspace disconnects.
+                with session.lock:
+                    if not session.closed and session.sse_clients == 0:
+                        session.orphan_since = require_reapable_at
+                return False
+            with session.reference_lock:
+                with session.lock:
+                    if session.closed:
+                        return False
+                    if require_reapable_at is not None:
+                        if (
+                            session.orphan_since is None
+                            or session.sse_clients != 0
+                            or session.run_status not in REAPABLE_RUN_STATUSES
+                            or session.opening_source is not None
+                            or session.snapshot_in_progress
+                            or session.reference_operations != 0
+                            or require_reapable_at - session.orphan_since
+                            < self.session_grace_seconds
+                        ):
+                            return False
+                    session.closed = True
+                    session.condition.notify_all()
+        return True
+
+    def finish_session_close(self, session: SessionState) -> None:
+        removed = False
+        with self.registry_lock:
+            if self.sessions.get(session.session_id) is session:
+                self.sessions.pop(session.session_id, None)
+                self.closed_session_ids.add(session.session_id)
+                for key, owner in list(self.path_index.items()):
+                    if owner == session.session_id:
+                        self.path_index.pop(key, None)
+                if not self.sessions:
+                    self.empty_since = time.time()
+                removed = True
+        session.close_complete.set()
+        if removed:
+            self.broadcast_sessions()
+
+
+STATE = OgentState()
+
+

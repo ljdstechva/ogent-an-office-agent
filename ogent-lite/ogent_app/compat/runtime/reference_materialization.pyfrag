@@ -1,0 +1,331 @@
+def prepare_run_references(
+    session: SessionState,
+    run_id: str,
+    attachments: list[ReferenceAttachment],
+    run_root: Path,
+    user_message: str,
+) -> tuple[list[ReferenceAttachment], Path]:
+    if not attachments:
+        raise UserFacingError("No references were claimed for preparation.", 500)
+    if not reference_path_is_within(run_root, REFERENCE_ROOT):
+        raise UserFacingError(
+            "The temporary run directory failed path-containment validation.",
+            500,
+        )
+    with session.reference_lock:
+        for attachment in attachments:
+            attachment.status = "Preparing"
+            attachment.error_message = None
+    emit_references(session)
+
+    agent_derived = run_root / "agent-derived"
+    if not path_is_within(agent_derived, run_root):
+        raise UserFacingError(
+            "The temporary derivative directory failed containment validation.",
+            500,
+        )
+    agent_derived.mkdir(parents=False, exist_ok=True)
+    if agent_derived.is_symlink() or not agent_derived.is_dir():
+        raise UserFacingError(
+            "The temporary derivative directory is unsafe.",
+            500,
+        )
+    manifest_path = run_root / "preparation-manifest.json"
+    result_path = run_root / "preparation-result.json"
+    manifest = {
+        "run_root": str(run_root),
+        "visual_requested": visual_analysis_requested(user_message),
+        "office_visual_helper": str(OFFICE_REFERENCE_TO_PDF),
+        "references": [
+            attachment.preparation_manifest_item()
+            for attachment in attachments
+        ],
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    process: subprocess.Popen[str] | None = None
+    try:
+        with session.lock:
+            if session.stop_requested or session.run_id != run_id or session.closed:
+                raise UserFacingError("Reference preparation stopped.", 409)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(REFERENCE_PREPARER),
+                    "prepare",
+                    "--manifest",
+                    str(manifest_path),
+                    "--result",
+                    str(result_path),
+                ],
+                cwd=str(run_root),
+                env=command_env(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=WINDOWS_CHILD_FLAGS if os.name == "nt" else 0,
+            )
+            session.run_process = process
+        stdout, stderr = process.communicate()
+        with session.lock:
+            stopped = (
+                session.stop_requested
+                or session.run_id != run_id
+                or session.closed
+            )
+            if session.run_process is process:
+                session.run_process = None
+        if stopped:
+            raise UserFacingError("Reference preparation stopped.", 409)
+        if process.returncode != 0 or not result_path.is_file():
+            detail = _redact_reference_detail(
+                stderr or stdout or "The preparation helper returned no details.",
+                attachments=attachments,
+                max_characters=1600,
+            )
+            raise UserFacingError(
+                f"Reference preparation failed. {detail}".strip()
+            )
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            prepared_items = result["references"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise UserFacingError(
+                "Reference preparation returned an invalid result.",
+                500,
+            ) from exc
+        by_id = {
+            str(item.get("id", "")): item
+            for item in prepared_items
+            if isinstance(item, dict)
+        }
+        with session.reference_lock:
+            for attachment in attachments:
+                item = by_id.get(attachment.attachment_id)
+                if item is None:
+                    raise UserFacingError(
+                        f"Preparation did not return a result for "
+                        f"{attachment.original_name}.",
+                        500,
+                    )
+                extracted_raw = item.get("extracted_text_path")
+                extracted = Path(str(extracted_raw)) if extracted_raw else None
+                images = [
+                    Path(str(path))
+                    for path in item.get("image_paths", [])
+                ]
+                for candidate in ([extracted] if extracted else []) + images:
+                    if (
+                        candidate is None
+                        or not candidate.is_file()
+                        or not reference_path_is_within(candidate, REFERENCE_ROOT)
+                        or not path_is_within(candidate, run_root)
+                    ):
+                        raise UserFacingError(
+                            "A prepared artifact failed path-containment validation.",
+                            500,
+                        )
+                attachment.extracted_text_path = extracted
+                attachment.image_paths = images
+                attachment.status = str(item.get("status") or "Ready")
+                attachment.error_message = None
+        emit_references(session)
+        return attachments, agent_derived
+    except Exception as exc:
+        with session.reference_lock:
+            for attachment in attachments:
+                attachment.status = "Failed"
+                attachment.error_message = _redact_reference_detail(
+                    str(exc),
+                    attachments=[attachment],
+                    max_characters=1600,
+                )
+        emit_references(session)
+        raise
+    finally:
+        if process is not None and process.poll() is None:
+            terminate_process_tree(process)
+        _terminate_tracked_reference_office_processes(run_root)
+        with contextlib.suppress(OSError):
+            manifest_path.unlink()
+
+
+def cleanup_run_references(session: SessionState, run_id: str) -> bool:
+    """Clean one run exactly once after child processes have released its files."""
+    with session.reference_lock:
+        attachments = session.active_references.pop(run_id, [])
+        retained_ids = session.run_retained_ids.pop(run_id, set())
+        run_root = session.reference_run_roots.pop(run_id, None)
+        if run_root is None and attachments:
+            run_root = attachments[0].source_path.parent.parent
+        if run_root is None:
+            return False
+        try:
+            _terminate_tracked_reference_office_processes(run_root)
+            cleanup_reference_path(run_root, REFERENCE_ROOT)
+        except (ReferenceError, UserFacingError, OSError) as exc:
+            session.active_references[run_id] = attachments
+            session.reference_run_roots[run_id] = run_root
+            session.run_retained_ids[run_id] = retained_ids
+            raise UserFacingError(
+                "Temporary reference deletion failed; the run directory was "
+                "retained for a safe retry.",
+                exc.status
+                if isinstance(exc, (ReferenceError, UserFacingError))
+                else 500,
+            ) from exc
+    emit_references(session)
+    return bool(attachments)
+
+
+def remove_pending_reference(session: SessionState, attachment_id: str) -> None:
+    with session.reference_lock:
+        attachment = next(
+            (
+                item
+                for item in session.pending_references
+                if item.attachment_id == attachment_id
+            ),
+            None,
+        )
+    if attachment is None:
+        raise UserFacingError("Reference attachment not found.", 404)
+    cancel_reference_index(session, attachment_id)
+    with session.reference_lock:
+        current = session.retained_references.get(
+            attachment_id,
+            attachment,
+        )
+        session.pending_references = [
+            item
+            for item in session.pending_references
+            if item.attachment_id != attachment_id
+        ]
+        session.retained_references.pop(attachment_id, None)
+        try:
+            if session.attachment_store is None:
+                raise RetainedAttachmentError(
+                    "Retained attachment storage is unavailable."
+                )
+            session.attachment_store.forget(current)
+            if session.memory is not None:
+                session.memory.forget_attachment(attachment_id)
+        except (RetainedAttachmentError, SessionMemoryError, OSError) as exc:
+            session.pending_references.append(current)
+            session.retained_references[attachment_id] = current
+            queue_reference_index(session, current)
+            raise UserFacingError(
+                "The pending attachment could not be removed safely.",
+                500,
+            ) from exc
+    emit_references(session)
+
+
+def clear_pending_references(session: SessionState) -> int:
+    failure: UserFacingError | None = None
+    with session.reference_lock:
+        attachments = list(session.pending_references)
+    for attachment in attachments:
+        cancel_reference_index(session, attachment.attachment_id)
+    with session.reference_lock:
+        removed = 0
+        for attachment in attachments:
+            try:
+                if session.attachment_store is None:
+                    raise RetainedAttachmentError(
+                        "Retained attachment storage is unavailable."
+                    )
+                session.attachment_store.forget(attachment)
+                if session.memory is not None:
+                    session.memory.forget_attachment(attachment.attachment_id)
+            except (
+                RetainedAttachmentError,
+                SessionMemoryError,
+                OSError,
+            ):
+                queue_reference_index(session, attachment)
+                failure = UserFacingError(
+                    "One or more pending attachments could not be deleted.",
+                    500,
+                )
+                continue
+            session.pending_references = [
+                item
+                for item in session.pending_references
+                if item.attachment_id != attachment.attachment_id
+            ]
+            session.retained_references.pop(attachment.attachment_id, None)
+            removed += 1
+    emit_references(session)
+    if failure is not None:
+        raise failure
+    return removed
+
+
+def forget_retained_reference(
+    session: SessionState,
+    attachment_id: str,
+) -> None:
+    with session.reference_lock:
+        attachment = session.retained_references.get(attachment_id)
+        if attachment is None:
+            raise UserFacingError("Retained attachment not found.", 404)
+        if any(
+            attachment_id in identifiers
+            for identifiers in session.run_retained_ids.values()
+        ):
+            raise UserFacingError(
+                "That attachment is in use by the active run. "
+                "Wait for it to finish or stop the run first.",
+                409,
+            )
+    cancel_reference_index(session, attachment_id)
+    with session.reference_lock:
+        try:
+            if session.attachment_store is None:
+                raise RetainedAttachmentError(
+                    "Retained attachment storage is unavailable."
+                )
+            session.attachment_store.forget(attachment)
+            if session.memory is not None:
+                session.memory.forget_attachment(attachment_id)
+        except (RetainedAttachmentError, SessionMemoryError, OSError) as exc:
+            raise UserFacingError(
+                "The retained attachment could not be forgotten safely.",
+                500,
+            ) from exc
+        session.retained_references.pop(attachment_id, None)
+        session.pending_references = [
+            item
+            for item in session.pending_references
+            if item.attachment_id != attachment_id
+        ]
+    emit_references(session)
+
+
+def cleanup_session_references(session: SessionState) -> None:
+    if REFERENCE_INDEX_COORDINATOR is not None:
+        REFERENCE_INDEX_COORDINATOR.cancel_workspace(session.session_id)
+    with session.reference_lock:
+        session_root = _reference_session_root(session)
+        for run_root in list(session.reference_run_roots.values()):
+            _terminate_tracked_reference_office_processes(run_root)
+        if session_root.exists():
+            try:
+                cleanup_reference_path(session_root, REFERENCE_ROOT)
+            except (ReferenceError, OSError) as exc:
+                raise UserFacingError(
+                    "The session's temporary references could not be deleted.",
+                    exc.status if isinstance(exc, ReferenceError) else 500,
+                ) from exc
+        session.pending_references.clear()
+        session.retained_references.clear()
+        session.active_references.clear()
+        session.reference_run_roots.clear()
+        session.run_retained_ids.clear()
+
+

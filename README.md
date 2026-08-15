@@ -12,12 +12,12 @@ beside a Codex or Claude Code chat and runs on `127.0.0.1`. Files opened by
 local path are edited directly after Ogent creates and verifies a physical
 recovery backup. Browser uploads and PDFs remain copy-based.
 
-This source tree is **Ogent Lite 0.10.2**. It uses the selected CLI's existing
+This source tree is **Ogent Lite 1.0.0**. It uses the selected CLI's existing
 sign-in and never asks you to enter an OpenAI or Anthropic API key. Ogent is
 open source under the [MIT License](LICENSE). See the
-[v0.10.2 release notes](ogent-lite/RELEASE-NOTES-v0.10.2.md) for
-document-scoped chats, safe New Chat behavior, the verified live-preview
-revision handshake, and the temporary OfficeCLI dependency.
+[v1.0.0 release notes](ogent-lite/RELEASE-NOTES-v1.0.0.md) for durable
+workspaces, revision-aware document intelligence, deterministic OfficeCLI
+verification, whole-document checkpoints, and the React workspace.
 
 ## Install Ogent
 
@@ -27,7 +27,7 @@ Copy and paste this one sentence into Codex or another local AI agent that can
 run PowerShell:
 
 ```text
-Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; preserve unrelated files and reuse compatible tools already installed; install or update Git, Python 3, and at least one supported agent CLI—OpenAI Codex CLI, Anthropic Claude Code, or both—only from official sources; install OfficeCLI 1.0.143 or later, using the checksum-verified Ogent viewer fork prerelease documented below only while the compatible upstream release is unavailable; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete unavoidable Windows elevation or interactive provider sign-in without asking me to paste secrets into chat; verify py -3, git, officecli, and every installed agent CLI; discover the live models and effort choices for my signed-in account instead of hard-coding names; register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut, launch Ogent, and verify that health reports version 0.10.2; exercise direct local DOCX/XLSX/PPTX edits and confirm each recovery backup matches the pre-edit hash; demonstrate that two documents retain separate chats, attachments, selections, and provider-neutral memory; verify accessible Cancel, Escape, focus trapping, and confirmation for New Chat and prove that it preserves document and backup hashes; confirm completed Word edits report Preview updated only after the live viewer acknowledges the exact document revision, without reloading or losing the semantic viewport; click submitted selection tags and verify that each exact target centers with a temporary gold highlight without changing the Office package or composer selection; confirm browser uploads and PDF edits remain copy-based; verify Codex and Claude readiness, run status icons, Settings recovery controls, Stop followed by a successful edit, tab cleanup, and right-click integration; validate every edited Office file with OfficeCLI and report measured performance, security checks, remaining limitations, and exact paths without pushing unless I explicitly request it.
+Install and configure Ogent on this Windows 11 PC from https://github.com/ljdstechva/ogent-an-office-agent: read the repository README and AGENTS.md first; preserve unrelated files and reuse compatible tools already installed; install or update Git, Python 3, and at least one supported agent CLI—OpenAI Codex CLI, Anthropic Claude Code, or both—only from official sources; install OfficeCLI 1.0.143 or later, using the checksum-verified Ogent viewer fork prerelease documented below only while the compatible upstream release is unavailable; verify downloaded installers or scripts before running them; clone or fast-forward the repository into a folder I control; install the pinned packages from ogent-lite\requirements.txt; let me complete unavoidable Windows elevation or interactive provider sign-in without asking me to paste secrets into chat; verify py -3, git, officecli, and every installed agent CLI; discover the live models and effort choices for my signed-in account instead of hard-coding names; register the per-user Open in Ogent shell command, create or refresh an Ogent desktop shortcut, launch Ogent, and verify that health reports version 1.0.0; exercise direct local DOCX/XLSX/PPTX edits and confirm each recovery backup matches the pre-edit hash; demonstrate that two documents retain separate chats, attachments, selections, and provider-neutral memory; verify accessible Cancel, Escape, focus trapping, and confirmation for New Chat and prove that it preserves document and backup hashes; confirm completed Word edits report Preview updated only after the live viewer acknowledges the exact document revision, without reloading or losing the semantic viewport; click submitted selection tags and verify that each exact target centers with a temporary gold highlight without changing the Office package or composer selection; confirm browser uploads and PDF edits remain copy-based; verify Codex and Claude readiness, run status icons, Settings recovery controls, Stop followed by a successful edit, tab cleanup, and right-click integration; validate every edited Office file with OfficeCLI and report measured performance, security checks, remaining limitations, and exact paths without pushing unless I explicitly request it.
 ```
 
 The prompt deliberately leaves sign-in and elevation with the human and never
@@ -89,7 +89,7 @@ asks for a password, token, or API key.
    officecli --version
    ```
 
-   Ogent 0.10.2 requires OfficeCLI 1.0.143 or later. If the official installer
+   Ogent 1.0.0 requires OfficeCLI 1.0.143 or later. If the official installer
    still reports an older version, Windows x64 users can install the temporary,
    public [1.0.143 Ogent viewer preview fork prerelease](https://github.com/ljdstechva/OfficeCLI/releases/tag/v1.0.143-ogent-preview):
 
@@ -642,7 +642,7 @@ for the complete agent workflow.
 
 ## Visio note
 
-OfficeCLI 1.0.143 or later is required for Ogent v0.10.2. It supports `.docx`,
+OfficeCLI 1.0.143 or later is required for Ogent v1.0.0. It supports `.docx`,
 `.xlsx`, and `.pptx`, but not `.vsdx`. Ogent demonstrates a native editable
 Word drawing as the current alternative. A future OfficeCLI format-handler
 plugin or a separate Python `vsdx` workflow could add real Visio output.

@@ -1,0 +1,265 @@
+def set_preview_update_status(
+    session: SessionState,
+    status: str,
+    message: str,
+    *,
+    confirmation: PreviewConfirmation | None = None,
+    expected_generation: int,
+) -> bool:
+    with session.lock:
+        if (
+            session.closed
+            or session.conversation_generation != expected_generation
+        ):
+            return False
+        session.preview_update_status = status
+        session.preview_update_message = message
+        session.preview_confirmation = (
+            confirmation.public_metadata()
+            if confirmation is not None
+            else None
+        )
+    session.emit(
+        "preview_status",
+        {
+            "status": status,
+            "message": message,
+            "confirmation": (
+                confirmation.public_metadata()
+                if confirmation is not None
+                else None
+            ),
+        },
+        expected_generation=expected_generation,
+    )
+    return True
+
+
+def confirm_word_preview(
+    session: SessionState,
+    document: Path,
+    baseline: PreviewRunBaseline,
+    package_fingerprint: str,
+    *,
+    expected_generation: int,
+) -> PreviewConfirmation:
+    set_preview_update_status(
+        session,
+        "waiting",
+        "Confirming preview…",
+        expected_generation=expected_generation,
+    )
+    if FAULT_INJECTOR.consume("preview_mismatch"):
+        direct = PreviewConfirmation(
+            confirmed=False,
+            status="degraded",
+            message=PREVIEW_DEGRADED_MESSAGE,
+            recovery="injected_preview_mismatch",
+        )
+    else:
+        direct = session.preview_sync.wait_for_mutation_confirmation(
+            baseline,
+            package_fingerprint,
+            timeout=3.0,
+        )
+    if direct.confirmed:
+        set_preview_update_status(
+            session,
+            "updated",
+            "Preview updated",
+            confirmation=direct,
+            expected_generation=expected_generation,
+        )
+        return direct
+
+    mutation = direct.mutation or session.preview_sync.matching_mutation(
+        baseline,
+        package_fingerprint,
+    )
+    if baseline.client_id is None:
+        degraded = PreviewConfirmation(
+            confirmed=False,
+            status="degraded",
+            message=PREVIEW_DEGRADED_MESSAGE,
+            mutation=mutation,
+            recovery="no_initiating_client",
+        )
+        set_preview_update_status(
+            session,
+            "degraded",
+            PREVIEW_DEGRADED_MESSAGE,
+            confirmation=degraded,
+            expected_generation=expected_generation,
+        )
+        return degraded
+
+    if baseline.client_id is not None:
+        set_preview_update_status(
+            session,
+            "recovering",
+            "Recovering preview…",
+            expected_generation=expected_generation,
+        )
+        try:
+            control = session.preview_sync.enqueue_control(
+                client_id=baseline.client_id,
+                document_id=baseline.document_id,
+                watch_generation=baseline.watch_generation,
+                action="full",
+                package_sha256=package_fingerprint,
+                version=mutation.version if mutation is not None else 0,
+                event_fingerprint_value=(
+                    mutation.event_fingerprint
+                    if mutation is not None
+                    else None
+                ),
+            )
+            recovery = session.preview_sync.wait_for_control_ack(
+                baseline,
+                package_fingerprint,
+                control_id=str(control["_ogent"]["control_id"]),
+                kind="refresh",
+                timeout=6.0,
+            )
+            if recovery.confirmed:
+                recovered = dataclasses.replace(
+                    recovery,
+                    mutation=mutation,
+                    recovery="full_refresh",
+                )
+                set_preview_update_status(
+                    session,
+                    "updated",
+                    "Preview updated",
+                    confirmation=recovered,
+                    expected_generation=expected_generation,
+                )
+                return recovered
+        except PreviewSyncError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview refresh request was unavailable: {exc}",
+                expected_generation=expected_generation,
+            )
+
+    viewport_path: str | None = None
+    if baseline.client_id is not None:
+        try:
+            capture = session.preview_sync.enqueue_control(
+                client_id=baseline.client_id,
+                document_id=baseline.document_id,
+                watch_generation=baseline.watch_generation,
+                action="ogent-capture",
+                package_sha256=package_fingerprint,
+            )
+            captured = session.preview_sync.wait_for_control_ack(
+                baseline,
+                package_fingerprint,
+                control_id=str(capture["_ogent"]["control_id"]),
+                kind="viewport",
+                timeout=2.0,
+            )
+            if captured.ack is not None:
+                viewport_path = captured.ack.viewport_path
+        except PreviewSyncError as exc:
+            session.add_activity(
+                "preview",
+                f"Preview position capture was unavailable: {exc}",
+                expected_generation=expected_generation,
+            )
+
+    set_preview_update_status(
+        session,
+        "recovering",
+        "Restarting preview…",
+        expected_generation=expected_generation,
+    )
+    try:
+        with session.lock:
+            if (
+                session.closed
+                or session.conversation_generation != expected_generation
+                or session.active_doc is None
+                or session.active_doc.resolve() != document.resolve()
+                or session.document_id != baseline.document_id
+                or session.watch_generation != baseline.watch_generation
+            ):
+                raise PreviewSyncError(
+                    "The document or conversation changed during preview recovery."
+                )
+        start_watch(session, document)
+        with session.lock:
+            document_id = session.document_id
+            watch_generation = session.watch_generation
+        initial = (
+            session.preview_sync.wait_for_initial_ack(
+                client_id=baseline.client_id,
+                document_id=document_id,
+                watch_generation=watch_generation,
+                package_sha256=package_fingerprint,
+                timeout=8.0,
+            )
+            if baseline.client_id is not None
+            else None
+        )
+        if initial is not None:
+            if viewport_path:
+                restored = run_quiet(
+                    [
+                        "officecli",
+                        "watch",
+                        "goto",
+                        str(document),
+                        viewport_path,
+                        "--json",
+                    ],
+                    cwd=document.parent,
+                    timeout=15,
+                )
+                if restored.returncode != 0:
+                    session.add_activity(
+                        "preview",
+                        "The preview restarted, but its prior semantic position "
+                        "could not be restored.",
+                        expected_generation=expected_generation,
+                    )
+            recovered = PreviewConfirmation(
+                confirmed=True,
+                status="recovered",
+                message="Preview updated",
+                mutation=mutation,
+                ack=initial,
+                recovery="watch_restart",
+            )
+            set_preview_update_status(
+                session,
+                "updated",
+                "Preview updated",
+                confirmation=recovered,
+                expected_generation=expected_generation,
+            )
+            return recovered
+    except (OSError, PreviewSyncError, UserFacingError) as exc:
+        session.add_activity(
+            "preview",
+            f"Preview restart failed: {exc}",
+            expected_generation=expected_generation,
+        )
+
+    degraded = PreviewConfirmation(
+        confirmed=False,
+        status="degraded",
+        message=PREVIEW_DEGRADED_MESSAGE,
+        mutation=mutation,
+        recovery="failed",
+    )
+    set_preview_update_status(
+        session,
+        "degraded",
+        PREVIEW_DEGRADED_MESSAGE,
+        confirmation=degraded,
+        expected_generation=expected_generation,
+    )
+    return degraded
+
+

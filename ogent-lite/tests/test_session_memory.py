@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 OGENT_DIR = Path(__file__).resolve().parents[1]
@@ -42,6 +43,30 @@ class SessionMemoryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_append_turn_rolls_back_in_memory_state_when_persistence_fails(
+        self,
+    ) -> None:
+        before_file = self.memory.memory_path.read_bytes()
+        before_sequence = self.memory.sequence
+        before_turns = list(self.memory.turns)
+        before_preferences = [dict(item) for item in self.memory.preferences]
+
+        with mock.patch.object(
+            self.memory,
+            "_persist",
+            side_effect=OSError("disk unavailable"),
+        ):
+            with self.assertRaisesRegex(OSError, "disk unavailable"):
+                self.memory.append_turn(
+                    "user",
+                    "Please always use Times New Roman.",
+                )
+
+        self.assertEqual(self.memory.sequence, before_sequence)
+        self.assertEqual(self.memory.turns, before_turns)
+        self.assertEqual(self.memory.preferences, before_preferences)
+        self.assertEqual(self.memory.memory_path.read_bytes(), before_file)
 
     def test_memory_survives_provider_model_effort_and_document_switches(self) -> None:
         self.memory.set_active_document(
@@ -132,12 +157,34 @@ class SessionMemoryTests(unittest.TestCase):
         self.assertEqual(len(transcript), 240)
         self.assertEqual(transcript[0]["text"], "turn-000")
         self.assertEqual(transcript[-1]["text"], "turn-239")
-        persisted = json.loads(
-            self.memory.memory_path.read_text(encoding="utf-8")
-        )
+        persisted = json.loads(self.memory.memory_path.read_text(encoding="utf-8"))
         self.assertEqual(len(persisted["turns"]), 240)
 
-    def test_bounded_context_uses_last_12_and_deterministic_relevant_older(self) -> None:
+    def test_200k_turn_round_trips_losslessly_while_context_is_disclosed(self) -> None:
+        middle = "áβ🙂line\r\n" * 30_000
+        text = "  BEGIN\n" + middle[:199_987] + "END  "
+        self.assertEqual(len(text), 200_000)
+
+        turn = self.memory.append_turn("user", text)
+        persisted = json.loads(self.memory.memory_path.read_text(encoding="utf-8"))
+        transcript = self.memory.public_transcript()
+        context = self.memory.build_provider_context(
+            "Continue from the large pasted requirements.",
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort="automatic",
+            fresh_context=True,
+        )
+
+        self.assertEqual(turn.text, text)
+        self.assertEqual(persisted["turns"][0]["text"], text)
+        self.assertEqual(transcript[0]["text"], text)
+        self.assertLessEqual(context.prompt_bytes, MAX_CONTEXT_BYTES)
+        self.assertIn("canonical turn remains complete", context.text)
+
+    def test_bounded_context_uses_last_12_and_deterministic_relevant_older(
+        self,
+    ) -> None:
         self.memory.append_turn("user", "Alpha budget decision lives here.")
         for index in range(18):
             self.memory.append_turn("assistant", f"unrelated assistant output {index}")
@@ -188,7 +235,9 @@ class SessionMemoryTests(unittest.TestCase):
         self.assertEqual(fresh_other_model.mode, "full")
         self.assertIn("first result", fresh_other_model.text)
 
-    def test_attachment_and_selection_snapshots_are_immutable_public_memory(self) -> None:
+    def test_attachment_and_selection_snapshots_are_immutable_public_memory(
+        self,
+    ) -> None:
         attachment_root = self.memory.root / "attachments" / ("c" * 32)
         attachment_root.mkdir(parents=True)
         canonical = attachment_root / "source.txt"
@@ -217,9 +266,7 @@ class SessionMemoryTests(unittest.TestCase):
             "user",
             "Edit these.",
             attachment_ids=["c" * 32],
-            attachment_snapshots=[
-                self.memory.attachments["c" * 32].public_metadata()
-            ],
+            attachment_snapshots=[self.memory.attachments["c" * 32].public_metadata()],
             preview_selections=[selection],
         )
         selection["label"] = "MUTATED"
@@ -266,7 +313,9 @@ class SessionMemoryTests(unittest.TestCase):
             snapshot.text,
         )
 
-    def test_clear_memory_preserves_document_but_removes_conversation_catalog(self) -> None:
+    def test_clear_memory_preserves_document_but_removes_conversation_catalog(
+        self,
+    ) -> None:
         self.memory.set_active_document(basename="report.docx", revision=3)
         self.memory.append_turn("user", "Please always use Calibri.")
         attachment_root = self.memory.root / "attachments" / ("d" * 32)

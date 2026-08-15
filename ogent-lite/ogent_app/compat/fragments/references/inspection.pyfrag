@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Validation, preparation, and deletion helpers for temporary Ogent references.
+
+This module deliberately has no dependency on the Ogent HTTP server.  The server
+uses the validation and cleanup functions directly, while potentially expensive
+Office/PDF/image preparation runs through this file as a killable child process.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+import warnings
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+from ogent_app.settings import DEFAULT_SETTINGS
+
+
+_REFERENCE_QUOTAS = DEFAULT_SETTINGS.quotas
+MAX_REFERENCE_BYTES = _REFERENCE_QUOTAS.max_reference_file_bytes
+MAX_REFERENCES_PER_SEND = _REFERENCE_QUOTAS.max_references_per_turn
+MAX_COMBINED_BYTES_PER_SEND = _REFERENCE_QUOTAS.max_reference_turn_bytes
+MAX_SESSION_REFERENCE_COUNT = _REFERENCE_QUOTAS.max_session_reference_count
+MAX_SESSION_REFERENCE_BYTES = _REFERENCE_QUOTAS.max_session_reference_bytes
+MAX_CONCURRENT_REFERENCE_UPLOADS = (
+    _REFERENCE_QUOTAS.max_concurrent_reference_uploads
+)
+# Compatibility aliases for older integrations. New code and UI use the
+# explicit send-scoped names above.
+MAX_REFERENCES_PER_RUN = MAX_REFERENCES_PER_SEND
+MAX_COMBINED_BYTES = MAX_COMBINED_BYTES_PER_SEND
+MAX_PDF_PAGES = 25
+MAX_IMAGE_FRAMES = 25
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_TOTAL_IMAGE_PIXELS = 100_000_000
+MAX_RENDERED_PAGE_PIXELS = 20_000_000
+MAX_RENDERED_RUN_PIXELS = 100_000_000
+MAX_IMAGE_DIMENSION = 10_000
+NORMALIZED_IMAGE_MAX_DIMENSION = 6_000
+MAX_OFFICE_ENTRIES = 10_000
+MAX_OFFICE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_OFFICE_CONTENT_TYPES_BYTES = 4 * 1024 * 1024
+MAX_EXTRACTED_TEXT_BYTES = 100 * 1024 * 1024
+MIN_SEARCHABLE_PAGE_CHARACTERS = 40
+REFERENCE_ROOT_NAME = "temporary-references"
+SUPPORTED_REFERENCE_EXTENSIONS = {
+    ".docx",
+    ".xlsx",
+    ".pptx",
+    ".pdf",
+    ".txt",
+    ".md",
+    ".csv",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+}
+IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+}
+TEXT_EXTENSIONS = {".txt", ".md", ".csv"}
+OFFICE_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
+
+OFFICE_EXPECTATIONS = {
+    ".docx": (
+        "word/document.xml",
+        "application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.document.main+xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    ".xlsx": (
+        "xl/workbook.xml",
+        "application/vnd.openxmlformats-officedocument."
+        "spreadsheetml.sheet.main+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    ".pptx": (
+        "ppt/presentation.xml",
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.presentation.main+xml",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+}
+
+IMAGE_FORMATS_BY_EXTENSION = {
+    ".png": {"PNG"},
+    ".jpg": {"JPEG"},
+    ".jpeg": {"JPEG"},
+    ".webp": {"WEBP"},
+    ".bmp": {"BMP"},
+    ".tif": {"TIFF"},
+    ".tiff": {"TIFF"},
+}
+
+VISUAL_REQUEST_PATTERN = re.compile(
+    r"\b("
+    r"layout|visual|diagram|drawing|signature|stamp|photograph|photo|image|"
+    r"figure|chart|graph|map|plan|blueprint|schematic|appearance|formatting|"
+    r"design|slide|screenshot|handwrit(?:ing|ten)|ocr"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+class ReferenceError(RuntimeError):
+    """An actionable reference error safe to show in the local UI."""
+
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass
+class ReferenceInspection:
+    kind: str
+    detected_type: str
+    page_count: int | None = None
+    frame_count: int | None = None
+
+
+@dataclass
+class ReferenceAttachment:
+    attachment_id: str
+    original_name: str
+    source_path: Path
+    detected_type: str
+    kind: str
+    byte_size: int
+    uploaded_at: str
+    status: str = "Ready"
+    extracted_text_path: Path | None = None
+    image_paths: list[Path] = field(default_factory=list)
+    owning_run_id: str | None = None
+    error_message: str | None = None
+    page_count: int | None = None
+    frame_count: int | None = None
+    ocr_or_vision: bool = False
+    available_in_session: bool = True
+    sent_sequence: int | None = None
+    canonical_attachment_id: str | None = None
+
+    def public_metadata(self) -> dict[str, Any]:
+        """Return browser-safe metadata.  Filesystem paths are intentionally absent."""
+        return {
+            "id": self.attachment_id,
+            "filename": self.original_name,
+            "size": self.byte_size,
+            "kind": self.kind,
+            "detected_type": self.detected_type,
+            "status": self.status,
+            "error": self.error_message,
+            "ocr_or_vision": self.ocr_or_vision,
+            "available_in_session": self.available_in_session,
+            "pending": self.sent_sequence is None and self.owning_run_id is None,
+        }
+
+    def preparation_manifest_item(self) -> dict[str, Any]:
+        return {
+            "id": self.attachment_id,
+            "filename": self.original_name,
+            "source_path": str(self.source_path),
+            "detected_type": self.detected_type,
+            "kind": self.kind,
+            "size": self.byte_size,
+            "page_count": self.page_count,
+            "frame_count": self.frame_count,
+        }
+
+
+def sanitize_reference_filename(value: str) -> str:
+    """Return a safe display/storage leaf while retaining useful Unicode."""
+    normalized = unicodedata.normalize("NFKC", value or "")
+    leaf = normalized.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    suffix = Path(leaf).suffix.casefold()
+    if suffix not in SUPPORTED_REFERENCE_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_REFERENCE_EXTENSIONS))
+        raise ReferenceError(
+            f"Unsupported reference type. Choose one of: {supported}.",
+            415,
+        )
+    stem = leaf[: -len(suffix)] if suffix else leaf
+    stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "-", stem).strip(" .")
+    if not stem:
+        stem = "reference"
+    if stem.casefold() in {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }:
+        stem = f"_{stem}"
+    maximum_stem = max(1, 180 - len(suffix))
+    return f"{stem[:maximum_stem]}{suffix}"
+
+
+def _load_pdfium() -> Any:
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise ReferenceError(
+            "PDF references require pypdfium2. Run "
+            "`py -3 -m pip install -r ogent-lite\\requirements.txt`, then restart Ogent.",
+            500,
+        ) from exc
+    return pdfium
+
+
+def _load_pillow() -> tuple[Any, Any]:
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise ReferenceError(
+            "Image references require Pillow. Run "
+            "`py -3 -m pip install -r ogent-lite\\requirements.txt`, then restart Ogent.",
+            500,
+        ) from exc
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    return Image, ImageOps
+
+
+def decode_text_file(path: Path) -> str:
+    data = path.read_bytes()
+    if not data:
+        raise ReferenceError("The reference file is empty.")
+    if data.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    else:
+        if b"\x00" in data:
+            raise ReferenceError(
+                "This text reference appears to be binary. Save it as UTF-8 text."
+            )
+        encoding = "utf-8"
+    try:
+        text = data.decode(encoding, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReferenceError(
+            "Text references must be UTF-8, or UTF-16 with a byte-order mark."
+        ) from exc
+    controls = sum(
+        1
+        for character in text
+        if ord(character) < 32 and character not in "\t\r\n\f"
+    )
+    if controls > max(8, len(text) // 200):
+        raise ReferenceError(
+            "This text reference contains unsupported binary control characters."
+        )
+    return text
+
+
+def _validate_office(path: Path, suffix: str) -> ReferenceInspection:
+    try:
+        with path.open("rb") as stream:
+            if stream.read(4) not in {b"PK\x03\x04", b"PK\x05\x06"}:
+                raise ReferenceError(
+                    "Modern Office references must begin with a valid ZIP signature."
+                )
+    except OSError as exc:
+        raise ReferenceError(f"Could not read the Office reference: {exc}") from exc
+    if not zipfile.is_zipfile(path):
+        raise ReferenceError(
+            f"{suffix.upper()[1:]} references must be valid modern Office ZIP packages."
+        )
+    expected_main, expected_content_type, detected_type = OFFICE_EXPECTATIONS[suffix]
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > MAX_OFFICE_ENTRIES:
+                raise ReferenceError(
+                    "The Office reference has an invalid or excessive package structure."
+                )
+            total_uncompressed = 0
+            names: set[str] = set()
+            for info in infos:
+                if info.flag_bits & 0x1:
+                    raise ReferenceError("Encrypted Office references are not supported.")
+                pure_name = PurePosixPath(info.filename.replace("\\", "/"))
+                if (
+                    pure_name.is_absolute()
+                    or ".." in pure_name.parts
+                    or not pure_name.parts
+                ):
+                    raise ReferenceError(
+                        "The Office reference contains an unsafe package path."
+                    )
+                normalized_name = str(pure_name).casefold()
+                if normalized_name in names:
+                    raise ReferenceError(
+                        "The Office reference contains duplicate package members."
+                    )
+                names.add(normalized_name)
+                dangerous_suffixes = {
+                    ".exe",
+                    ".dll",
+                    ".com",
+                    ".bat",
+                    ".cmd",
+                    ".ps1",
+                    ".vbs",
+                    ".js",
+                    ".jse",
+                    ".scr",
+                    ".msi",
+                    ".jar",
+                    ".hta",
+                }
+                member_suffix = PurePosixPath(normalized_name).suffix
+                if (
+                    member_suffix in dangerous_suffixes
+                    or "vbaproject.bin" in normalized_name
+                    or "/activex/" in f"/{normalized_name}"
+                    or "/embeddings/" in f"/{normalized_name}"
+                ):
+                    raise ReferenceError(
+                        "The Office reference contains executable, macro, ActiveX, "
+                        "or embedded binary content that Ogent will not inspect."
+                    )
+                total_uncompressed += max(0, info.file_size)
+                if total_uncompressed > MAX_OFFICE_UNCOMPRESSED_BYTES:
+                    raise ReferenceError(
+                        "The Office reference expands beyond Ogent's safe inspection limit."
+                    )
+                if (
+                    info.compress_size > 0
+                    and info.file_size > 32 * 1024 * 1024
+                    and info.file_size / info.compress_size > 250
+                ):
+                    raise ReferenceError(
+                        "The Office reference has a suspicious compression ratio."
+                    )
+            required = {
+                "[content_types].xml",
+                "_rels/.rels",
+                expected_main.casefold(),
+            }
+            if not required.issubset(names):
+                raise ReferenceError(
+                    f"The file extension does not match a valid {suffix.upper()[1:]} package."
+                )
+            try:
+                content_types_info = archive.getinfo("[Content_Types].xml")
+                if content_types_info.file_size > MAX_OFFICE_CONTENT_TYPES_BYTES:
+                    raise ReferenceError(
+                        "The Office reference has an excessively large content-type "
+                        "manifest."
+                    )
+                content_types = archive.read("[Content_Types].xml")
+            except KeyError as exc:
+                raise ReferenceError(
+                    "The Office reference is missing [Content_Types].xml."
+                ) from exc
+            if expected_content_type.encode("ascii") not in content_types:
+                raise ReferenceError(
+                    f"The file contents do not match the {suffix.upper()[1:]} extension."
+                )
+            bad_member = archive.testzip()
+            if bad_member:
+                raise ReferenceError(
+                    "The Office reference is malformed or truncated."
+                )
+    except ReferenceError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+        raise ReferenceError("The Office reference is malformed or truncated.") from exc
+    return ReferenceInspection(
+        kind="Office",
+        detected_type=detected_type,
+    )
+
+
+def _validate_pdf(path: Path) -> ReferenceInspection:
+    try:
+        with path.open("rb") as stream:
+            signature = stream.read(8)
+    except OSError as exc:
+        raise ReferenceError(f"Could not read the PDF reference: {exc}") from exc
+    if not re.match(rb"^%PDF-\d\.\d", signature):
+        raise ReferenceError(
+            "The file extension does not match a PDF with a valid %PDF signature."
+        )
+    pdfium = _load_pdfium()
+    try:
+        with pdfium.PdfDocument(path) as pdf:
+            page_count = len(pdf)
+    except Exception as exc:
+        raise ReferenceError(
+            "The PDF reference is malformed, truncated, encrypted, or unreadable."
+        ) from exc
+    if page_count <= 0:
+        raise ReferenceError("The PDF reference contains no pages.")
+    if page_count > MAX_PDF_PAGES:
+        raise ReferenceError(
+            f"The PDF has {page_count} pages; the limit is {MAX_PDF_PAGES}. "
+            "Split it into smaller references and attach only the needed pages.",
+            413,
+        )
+    return ReferenceInspection(
+        kind="PDF",
+        detected_type="application/pdf",
+        page_count=page_count,
+    )
+
+
+def _validate_image(path: Path, suffix: str) -> ReferenceInspection:
+    Image, _ = _load_pillow()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as verifier:
+                detected_format = str(verifier.format or "").upper()
+                verifier.verify()
+            if detected_format not in IMAGE_FORMATS_BY_EXTENSION[suffix]:
+                raise ReferenceError(
+                    "The image contents do not match the filename extension."
+                )
+            with Image.open(path) as image:
+                frame_count = int(getattr(image, "n_frames", 1))
+                if frame_count <= 0 or frame_count > MAX_IMAGE_FRAMES:
+                    raise ReferenceError(
+                        f"The image contains {frame_count} frames; the limit is "
+                        f"{MAX_IMAGE_FRAMES}. Export only the needed frames."
+                    )
+                total_pixels = 0
+                for frame_index in range(frame_count):
+                    image.seek(frame_index)
+                    width, height = image.size
+                    if (
+                        width <= 0
+                        or height <= 0
+                        or width > MAX_IMAGE_DIMENSION
+                        or height > MAX_IMAGE_DIMENSION
+                        or width * height > MAX_IMAGE_PIXELS
+                    ):
+                        raise ReferenceError(
+                            "The image dimensions exceed Ogent's safe 40-megapixel "
+                            "and 10,000-pixel-per-side limits."
+                        )
+                    total_pixels += width * height
+                    if total_pixels > MAX_TOTAL_IMAGE_PIXELS:
+                        raise ReferenceError(
+                            "The image frames exceed Ogent's combined pixel limit."
+                        )
+                    image.load()
+    except ReferenceError:
+        raise
+    except Exception as exc:
+        raise ReferenceError(
+            "The image is malformed, truncated, or cannot be decoded safely."
+        ) from exc
+    mime = {
+        "JPEG": "image/jpeg",
+        "TIFF": "image/tiff",
+    }.get(detected_format, f"image/{detected_format.casefold()}")
+    return ReferenceInspection(
+        kind="Image",
+        detected_type=mime,
+        frame_count=frame_count,
+    )
+
+
+def validate_reference_file(path: Path, original_name: str) -> ReferenceInspection:
+    """Validate extension, signature/structure, size, and safe decodability."""
+    sanitized = sanitize_reference_filename(original_name)
+    suffix = Path(sanitized).suffix.casefold()
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ReferenceError(f"Could not inspect the reference file: {exc}") from exc
+    if size <= 0:
+        raise ReferenceError("The reference file is empty.")
+    if size > MAX_REFERENCE_BYTES:
+        raise ReferenceError(
+            f"The reference exceeds the {MAX_REFERENCE_BYTES // (1024 * 1024)} MB "
+            "per-file limit.",
+            413,
+        )
+    if suffix in OFFICE_EXTENSIONS:
+        return _validate_office(path, suffix)
+    if suffix == ".pdf":
+        return _validate_pdf(path)
+    if suffix in IMAGE_EXTENSIONS:
+        return _validate_image(path, suffix)
+    if suffix in TEXT_EXTENSIONS:
+        text = decode_text_file(path)
+        if not text:
+            raise ReferenceError("The text reference contains no readable text.")
+        detected_type = {
+            ".txt": "text/plain; charset=utf-8",
+            ".md": "text/markdown; charset=utf-8",
+            ".csv": "text/csv; charset=utf-8",
+        }[suffix]
+        return ReferenceInspection(kind="Text", detected_type=detected_type)
+    raise ReferenceError("Unsupported reference type.", 415)
+
+
