@@ -6,3 +6,12 @@
 *.pptx binary
 *.png binary
 *.exe binary
+
+# Keep the packaged frontend byte-stable across platforms: CI rebuilds dist
+# on Windows and compares with git diff --check, so checkout must be LF.
+ogent-lite/web/** text eol=lf
+ogent-lite/web/**/*.png binary
+ogent-lite/web/**/*.ico binary
+
+# Windows launchers stay CRLF.
+*.cmd text eol=crlf
