@@ -53,6 +53,22 @@ jobs:
         run: npx playwright install chromium
         working-directory: ogent-lite\web
 
+      - name: Install OfficeCLI (pinned fork prerelease)
+        shell: pwsh
+        run: |
+          $uri = 'https://github.com/ljdstechva/OfficeCLI/releases/download/v1.0.143-ogent-preview/officecli-win-x64.exe'
+          $expected = 'F32C6AF1B1AA1ACC70E4128B5E0BED9CA3EF01565DD986DCFD23E704FB0AE6E1'
+          $dir = Join-Path $env:RUNNER_TEMP 'officecli'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $exe = Join-Path $dir 'officecli.exe'
+          Invoke-WebRequest -Uri $uri -OutFile $exe
+          $actual = (Get-FileHash $exe -Algorithm SHA256).Hash
+          if ($actual -ne $expected) {
+              throw "OfficeCLI SHA-256 verification failed: $actual"
+          }
+          Add-Content $env:GITHUB_PATH $dir
+          & $exe --version
+
       - name: Run unit and regression tests
         run: python -m coverage run --branch --source=ogent_app -m pytest -q
         working-directory: ogent-lite
