@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -322,20 +323,61 @@ class CapabilityLayerTests(unittest.TestCase):
             stable_paths=("/body/p[1]",),
         )
 
+    @staticmethod
+    def _write_minimal_docx(document: Path) -> None:
+        """Author a schema-valid one-paragraph package with the stdlib.
+
+        The pinned CI OfficeCLI fork prerelease cannot run ``create`` (its
+        viewer-focused build trimmed that path), so the fixture is written
+        directly and then OfficeCLI-validated.
+        """
+        wordml = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        content_types = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType='
+            '"application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" ContentType='
+            '"application/vnd.openxmlformats-officedocument'
+            '.wordprocessingml.document.main+xml"/>'
+            "</Types>"
+        )
+        rels = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns='
+            '"http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type='
+            '"http://schemas.openxmlformats.org/officeDocument/2006/'
+            'relationships/officeDocument" Target="word/document.xml"/>'
+            "</Relationships>"
+        )
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<w:document xmlns:w="{wordml}"><w:body>'
+            f"<w:p><w:r><w:t>Capability preflight fixture.</w:t></w:r></w:p>"
+            f'<w:sectPr/></w:body></w:document>'
+        )
+        with zipfile.ZipFile(document, "w", zipfile.ZIP_DEFLATED) as package:
+            package.writestr("[Content_Types].xml", content_types)
+            package.writestr("_rels/.rels", rels)
+            package.writestr("word/document.xml", body)
+
     @unittest.skipUnless(shutil.which("officecli"), "OfficeCLI is not installed")
     def test_real_officecli_skill_and_stats_preflight(self) -> None:
         document = self.root / "real.docx"
         environment = os.environ.copy()
         environment["OFFICECLI_NO_AUTO_RESIDENT"] = "1"
-        created = subprocess.run(
-            ["officecli", "create", str(document)],
+        self._write_minimal_docx(document)
+        validated = subprocess.run(
+            ["officecli", "validate", str(document)],
             check=False,
             capture_output=True,
             text=True,
             env=environment,
             timeout=60,
         )
-        self.assertEqual(created.returncode, 0, created.stderr)
+        self.assertEqual(validated.returncode, 0, validated.stderr)
         run_id = self.create_run()
         executor = OfficeCliExecutor()
         bootstrap = DocumentCapabilityBootstrap(
